@@ -23,7 +23,7 @@ const home = os.homedir();
 const MODELS_PATH = path.join(home, '.pi', 'agent', 'models.json');
 // 工具根目录 = 本脚本所在目录(套件仓库根);环境变量可覆盖。
 const SUITE_ROOT = process.env.AI_CONNECT_SUITE_ROOT
-  ?? path.dirname(path.dirname(fileURLToPath(import.meta.url)));
+  ?? path.dirname(fileURLToPath(import.meta.url));
 const TRAE_DIR = path.join(SUITE_ROOT, 'zcode-trae-connect');
 const WB_DIR = path.join(SUITE_ROOT, 'zcode-workbuddy-connect');
 const QODER_DIR = path.join(SUITE_ROOT, 'zcode-qoder-connect');
