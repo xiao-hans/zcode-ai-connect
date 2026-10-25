@@ -1,0 +1,7 @@
+{
+  "name": "pi-connect-services",
+  "version": "1.0.0",
+  "description": "Ensure the local connect endpoints (qoder/workbuddy/trae) are running when pi starts",
+  "main": "index.js",
+  "type": "module"
+}

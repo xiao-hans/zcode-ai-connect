@@ -1,0 +1,248 @@
+# zcode-workbuddy-connect
+
+Use the models inside the **WorkBuddy desktop app** from ZCode (or any
+OpenAI-compatible client), with zero configuration.
+
+A port of [corrinehu/dsh-workbuddy-connect](https://github.com/corrinehu/dsh-workbuddy-connect)
+(MIT) from the DeepSeek Harness plugin API to ZCode's, keeping the original's
+wire behaviour and discarding the parts that have no ZCode equivalent.
+
+```
+ZCode ──(OpenAI chat-completions)──▶ 127.0.0.1:39271 ──▶ copilot.tencent.com
+                                       local endpoint        (WorkBuddy)
+```
+
+## Why this shape
+
+The upstream plugin registered models into DSH's own provider registry and drew
+a settings card in DSH's UI. ZCode has **no "register an LLM provider" plugin
+slot**, so a literal port is impossible. What ZCode *does* have is native
+support for third-party models configured as
+`api.type: "openai-chat-completions"` with a `baseUrl` and API key — and the
+original plugin already contained a loopback OpenAI-compatible shim
+(`src/shim.ts`). Extracting that shim into a standalone service and pointing a
+ZCode provider at it yields something the original could not give: the models
+appear as first-class entries in ZCode's model selector, driving the normal agent
+loop with tool calls, images and streaming.
+
+The discarded parts are the ones with no ZCode surface: the settings card, the
+Composer probe control, and the reasoning-level detection feature. Reasoning
+levels now use the efforts the upstream catalog declares, with no probing
+requests (which would have consumed credit with nowhere to show the result).
+
+## Layout
+
+```
+.zcode-plugin/plugin.json      plugin manifest (skills + SessionStart hook)
+skills/workbuddy-models/       operational skill for the agent
+hooks/service-ensure.mjs       starts the endpoint at session start
+src/                           the service (no dependencies; Node >= 18)
+  upstream.js                  WorkBuddy wire client: chat, refresh, catalog, billing
+  auth.js                      reads the desktop app's sign-in; refreshes into our own copy
+  catalog.js                   model roster + static fallback
+  server.js                    the loopback OpenAI-compatible endpoint
+  loopback.js                  Host/Origin guards
+  client-identity.js           desktop-shaped chat User-Agent
+  app-version.js               installed-App version resolution
+  config.js                    runtime paths
+  cli.js                       command-line interface
+bin/cli.mjs                    entry point
+```
+
+## Commands
+
+```sh
+node bin/cli.mjs serve              # run the endpoint (foreground)
+node bin/cli.mjs status             # sign-in, credit, model roster
+node bin/cli.mjs doctor             # diagnose credentials/upstream/endpoint
+node bin/cli.mjs refresh            # re-pull the roster
+node bin/cli.mjs setup              # (re)write the ZCode provider entry
+node bin/cli.mjs service-status     # is it reachable; is autostart registered
+node bin/cli.mjs install-service    # register a logon autostart launcher
+node bin/cli.mjs uninstall-service  # remove it
+node bin/cli.mjs logout             # drop our token copy (desktop app untouched)
+node bin/cli.mjs token              # print the endpoint bearer
+```
+
+## Install
+
+1. Put this directory anywhere and add its **path** to ZCode's
+   `plugins.dirs` in `%USERPROFILE%\.zcode\cli\config.json`:
+
+   ```json
+   { "plugins": { "dirs": ["<absolute-path-to-this-repo>"] } }
+   ```
+
+   Plugins found this way get the marketplace id `inline` and are enabled by
+   default. The listed directory **is** the plugin root — do not nest it.
+
+2. Write the provider entries (one per signed-in region):
+
+   ```sh
+   node bin/cli.mjs setup
+   ```
+
+   `setup` refuses to guess: it writes the roster the upstream actually reports,
+   including each model's real context window, output ceiling and vision
+   support. It also **validates before writing** — the document is serialised to
+   a temp file and run through `docs/validate-provider-config.mjs`, and is only
+   renamed into place if it passes. See the strict-schema note below for why
+   that gate is not optional.
+
+3. Restart ZCode. The `SessionStart` hook starts the endpoint; the models appear
+   in the model selector under **WorkBuddy** (CN) and **WorkBuddy AI**
+   (international).
+
+### WorkBuddy 5.6 encrypted credentials
+
+Since 5.6 the desktop app no longer writes its sign-in as plain JSON: both
+token fields arrive sealed in a `{$wbEncrypted:1, envelope}` wrapper opened with
+AES-256-GCM. The at-rest key lives in the app's own (Electron-modified) process,
+so the plugin unlocks a sealed file by running **the app's own Electron binary
+once as plain Node** (`ELECTRON_RUN_AS_NODE=1`) and asking its private
+`workbuddyStorage` binding for the sealed secret. The key is derived with
+`sha256(atRestSecretKey)`, cached in memory only, and never written anywhere.
+
+This is automatic on Windows and macOS for the CN app, whose install locations
+are the platform defaults:
+
+| Platform | CN (`WorkBuddy`) | International (`WorkBuddy AI`) |
+|---|---|---|
+| Windows | `C:\Program Files\WorkBuddy\WorkBuddy.exe` | `C:\Program Files\WorkBuddyAI\WorkBuddyAI.exe` |
+| macOS | `/Applications/WorkBuddy.app/Contents/MacOS/Electron`, falling back to a Spotlight search for the CN bundle id | none — `WORKBUDDY_ELECTRON_BIN` only |
+| Linux | none — `WORKBUDDY_ELECTRON_BIN` only | none — `WORKBUDDY_ELECTRON_BIN` only |
+
+**Overriding the binary.** If your app lives somewhere else, point the plugin at
+it:
+
+```sh
+set WORKBUDDY_ELECTRON_BIN=C:\path\to\WorkBuddy.exe
+```
+
+The variable must be set in the environment the **service** starts in — for the
+ZCode `SessionStart` hook, that means ZCode's own environment, so restart ZCode
+after setting it. Setting it only in a terminal does nothing.
+
+There is deliberately **no automatic search on Linux**, and **none at all for
+the international app on macOS/Linux**: upstream restricts auto-discovery to the
+one product and platform whose encrypted-credential chain has been verified
+live, and executing a binary that has not been identified is not something a
+credential reader should do on a guess.
+
+`node bin/cli.mjs doctor` reports what it found — the file's format
+(`encrypted` is the healthy state for a current install), which Electron binary
+the unlock would use, and, when the unlock fails, a reason naming sizes, key ids
+and exit codes only.
+
+The reasoning behind this — and where it deliberately differs from upstream's
+discovery policy — is in `docs/adr/0004-workbuddy-56-at-rest-credentials.md`.
+
+### Two regions, two mounts
+
+Both regions are served from one endpoint, told apart by the URL the client
+uses — not by renaming models:
+
+| Region | Provider | Base URL |
+|---|---|---|
+| CN | `workbuddy` | `http://127.0.0.1:39271/v1` |
+| International ("WorkBuddy AI") | `workbuddy-ai` | `http://127.0.0.1:39271/ai/v1` |
+
+Seven model ids exist in both regions (`glm-5.3`, `glm-5.2`, `hy3`,
+`hy4-preview`, `deepseek-v4.1-flash`, `kimi-k2.8-preview`, `kimi-k2.6`) with
+different windows and rates. They are kept apart by the mount rather than by an
+id prefix, because ZCode's picker renders the **raw model id and nothing else**
+in each row while grouping rows under a provider header — so `glm-5.3` under
+"WorkBuddy" and `glm-5.3` under "WorkBuddy AI" are already unambiguous to the
+user, while a `wbai:` prefix was pure noise in the one string they read. A
+leading `wbai:` on a chat request is still *accepted* and wins over the mount, so
+an older config keeps routing correctly. See `docs/adr/0003-region-by-url-path.md`.
+
+### Limits written into ZCode
+
+Both limits are taken at their **maximum**:
+
+| ZCode field | Source | Why not the alternative |
+|---|---|---|
+| `properties.contextWindow` | upstream `maxInputTokens` | `contextWindow.defaultLength` is a softer tier the UI offers and can be up to 3.3× smaller; declaring it makes ZCode compact the conversation early and waste the window. Verified by probe: 312,856 tokens accepted, 1,294,869 rejected. |
+| `optionSpecs.maxOutputTokens.max` | upstream `maxOutputTokens` | This is the ceiling on the value a user may select. There is no `maxTokens` property — see below. |
+
+`map` is deliberately left out of `optionSpecs.maxOutputTokens`: the shipped
+`openai-chat-completions` API rule already supplies
+`{'max_completion_tokens': maxOutputTokens}`, so restating it would only add an
+expression-language failure mode. `serve` reports the same window through
+`/v1/models`; `--default-context-window` reverts to the softer number.
+
+### The strict-schema trap
+
+ZCode parses `provider_config.json` with zod schemas that are `.strict()`, and
+its failure mode is brutal: **one unrecognised key anywhere makes ZCode discard
+the entire personal provider config** and fall back to an empty one — taking
+every other provider you had configured (OpenRouter, DeepSeek, …) with it, and
+surfacing no error. Two keys are easy to get wrong:
+
+- **`maxTokens` is not a property.** Output limits live in
+  `optionSpecs.maxOutputTokens.max`.
+- **`provider: []` is not a config key.** It belongs to the legacy CLI registry
+  in `config.json`, a different document.
+
+Both mistakes existed in this codebase and were caught by the validator's first
+run. After any hand-edit, check it yourself:
+
+```sh
+node docs/validate-provider-config.mjs
+```
+
+## Design decisions
+
+| Decision | Why |
+|---|---|
+| Standalone loopback service, not an MCP server | An MCP tool cannot drive ZCode's agent loop; a provider can. Native streaming, tool calls and images come for free. |
+| Zero runtime dependencies | Node 18+ has `fetch`, `AbortSignal.timeout` and `http`. Fewer moving parts to break, and no install step. |
+| Dual region, one service | CN and international (WorkBuddy AI) variants share one endpoint, separated by URL mount: the root (`/v1`) serves CN and `/ai/v1` serves the international region. The mount is what keeps the 7 shared ids (glm-5.3, hy3…) distinct, so the region never has to be encoded into the model id a client displays. A region whose app is not signed in is skipped at `setup` and exposes no models. |
+| Fixed port + persisted bearer | The client records the bearer in its own config, so it must survive restarts. A per-process secret would break on every restart. |
+| Credential copy kept separate from the desktop app | The app's sign-in file is read-only input. Refreshes go to our own state dir, so the plugin can never break the app's login. |
+| Startup folder for autostart | `schtasks` needs elevation on this host (it fails outright); the Startup folder is per-user and needs none. |
+| Heartbeats during silence | Reasoning models think for minutes; the upstream pads that with SSE comments. Dropping them (as the first port did) leaves the client seeing zero bytes and timing out on a working request. |
+| Validate before writing provider config | A stray key does not fail one model, it silently deletes every provider. A temp file plus a schema mirror turns that into a loud error. |
+| Decrypt WorkBuddy 5.6 credentials inside the plugin | Since 5.6 the desktop app seals `accessToken`/`refreshToken` at rest, so the file is no longer readable as plain JSON. The plugin opens them by running the app's own Electron once as Node and reading its private storage binding — never by copying the tokens anywhere new. |
+
+## Notes
+
+- **Never write to WorkBuddy's own files.** The sign-in file is input only.
+- **No credential ever reaches ZCode's config** other than the local endpoint's
+  own bearer. The WorkBuddy token stays in the state directory, in memory, or on
+  the wire to WorkBuddy.
+- **Prices are informational.** Rates come from the upstream roster and are
+  cached; an expired promotion is dropped (`rateUnknown`) rather than left
+  claiming a discount.
+- State lives in `%USERPROFILE%\.zcode-workbuddy-connect\`
+  (`ZCODE_WORKBUDDY_CONNECT_HOME` overrides it).
+
+## A note on what this talks to
+
+The endpoint forwards to WorkBuddy's own internal API (`copilot.tencent.com`),
+using the WorkBuddy desktop app's existing login. That API is **undocumented and
+unofficial** — it is not a public integration surface, and it can change or break
+without notice. This project therefore:
+
+- makes **no stability promise** on the wire format, and
+- inherits any terms the WorkBuddy service imposes on its own client.
+
+It reads only the app's own sign-in file, never writes to it, and reuses session
+the user already established — there is no bypass, no credential harvesting, and no
+traffic to any host the desktop app does not already talk to. Use it with your own
+account. This is a port of a project that already does the same thing publicly; the
+caveats above are the original's, restated because they matter more than the
+feature list.
+
+**Never committed:** the credential copy, the endpoint bearer, and all runtime
+state. See `.gitignore` — state lives in `%USERPROFILE%\.zcode-workbuddy-connect\`, and
+`endpoint.json` there holds a bearer that would let a reader call *your* endpoint.
+
+## Licence
+
+MIT, following the original. The wire behaviour is itself ported by the original
+project from [Sliverkiss/workbuddy2api](https://github.com/Sliverkiss/workbuddy2api) (MIT).
+
+See [NOTICE.md](./NOTICE.md) for exactly which parts were carried over from the
+upstream and which were rewritten for this port.

@@ -1,0 +1,39 @@
+{
+  "name": "zcode-qoder-connect",
+  "version": "1.0.0",
+  "description": "Bring Qoder CN models (DeepSeek-V4-Pro, Qwen3.8-Max, GLM-5.3 …) into ZCode as an OpenAI-compatible provider, reusing the Qoder desktop sign-in — zero configuration.",
+  "description_i18n": {
+    "en": "Bring Qoder CN models into ZCode as an OpenAI-compatible provider, reusing the Qoder desktop sign-in.",
+    "zh-CN": "把 Qoder 国内版的模型(DeepSeek-V4-Pro、Qwen3.8-Max、GLM-5.3 等)复用桌面登录零配置接入 ZCode 的模型供应商。"
+  },
+  "author": {
+    "name": "a port of masknull/dsh-qoder-connect (MIT), protocol verified live"
+  },
+  "license": "MIT",
+  "keywords": [
+    "qoder",
+    "openai-compatible",
+    "provider",
+    "deepseek",
+    "qwen",
+    "glm"
+  ],
+  "skills": "skills",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "C:/nvm4w/nodejs/node.exe",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/service-ensure.mjs"
+            ],
+            "timeoutMs": 60000,
+            "statusMessage": "Starting the Qoder endpoint"
+          }
+        ]
+      }
+    ]
+  }
+}
