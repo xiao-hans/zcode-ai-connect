@@ -261,59 +261,19 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 		...(Array.isArray(input.tools) ? { tools: toLlmTools(input.tools) } : {}),
 		...(typeof input.reasoning_effort === 'string' && input.reasoning_effort !== '' ? { reasoning_effort: input.reasoning_effort } : {}),
 	}
-	let response
-	try {
-		response = await fetch(`${hostOf(baseUrl)}${LLM_CHAT_PATH}`, {
-			method: 'POST',
-			headers: llmHeaders(credential, identity),
-			body: JSON.stringify(wire),
-			signal: signal ?? AbortSignal.timeout(120_000),
-		})
-	} catch (error) {
-		return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
-	}
-	if (!response.ok) {
-		const text = await response.text().catch(() => '')
-		const kind = response.status === 401 || response.status === 403 ? 'authentication' : response.status === 429 ? 'soft_rate' : response.status >= 500 ? 'server' : 'client'
-		return { ok: false, status: response.status, kind, message: text.slice(0, 400) }
-	}
 
 	const encoder = new TextEncoder()
-	let controllerRef = null
-	let responseRef = null
-	const openStream = () => {
-		const stream = new ReadableStream({
-			start(c) {
-				controllerRef = c
-			},
-		})
-		responseRef = new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } })
-	}
-	const send = (payload) => {
-		if (!controllerRef) return
-		controllerRef.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`))
-	}
-	const sendRaw = (text) => {
-		if (!controllerRef) return
-		controllerRef.enqueue(encoder.encode(`data: ${text}\n\n`))
-	}
-	const closeStream = () => {
-		if (!controllerRef) return
-		try { controllerRef.close() } catch {}
-	}
 
-	let sawOutput = false
-	let errored = null
-	let finishReason = 'stop'
-	let buffer = ''
-	let eventName = ''
-
-	try {
+	/** Frame reader over the gateway SSE. Resumable: the caller may hand the
+	 * generator to a background pump and keep pulling it later. */
+	async function* gatewayFrames(response) {
 		const reader = response.body.getReader()
 		const decoder = new TextDecoder()
+		let buffer = ''
+		let eventName = ''
 		for (;;) {
 			const { done, value } = await reader.read()
-			if (done) break
+			if (done) return
 			buffer += decoder.decode(value, { stream: true })
 			let index
 			while ((index = buffer.indexOf('\n')) >= 0) {
@@ -325,63 +285,116 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 				}
 				if (!line.startsWith('data:')) continue
 				const raw = line.slice(5).trim()
-				if (raw === '' || raw === '[DONE]') continue
+				if (raw === '' || raw === '[DONE]') return
 				let record
 				try { record = JSON.parse(raw) } catch { continue }
-
-				const isError = eventName === 'error' ||
-					(record.code !== undefined && record.message !== undefined && record.response === undefined && !Array.isArray(record.tool_calls))
-				if (isError) {
-					errored = { code: record.code, message: record.message ?? '', extra: record.extra }
-					if (!responseRef) return { ok: false, ...classifyLlmError(errored) }
-					continue
-				}
-				if (eventName === 'token_usage') {
-					if (!responseRef) openStream()
-					send({ choices: [], usage: { prompt_tokens: record.prompt_tokens, completion_tokens: record.completion_tokens, total_tokens: record.total_tokens } })
-					continue
-				}
-				if (eventName === 'done') {
-					if (typeof record.finish_reason === 'string' && record.finish_reason !== '') finishReason = record.finish_reason
-					continue
-				}
-				if (eventName === 'output' || record.response !== undefined || record.reasoning_content !== undefined) {
-					if (!responseRef) openStream()
-					sawOutput = true
-					const reasoning = typeof record.reasoning_content === 'string' && record.reasoning_content !== '' ? record.reasoning_content : undefined
-					const text = typeof record.response === 'string' && record.response !== '' ? record.response : undefined
-					if (reasoning !== undefined) send({ choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }] })
-					if (text !== undefined) send({ choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })
-					if (Array.isArray(record.tool_calls)) {
-						for (const call of record.tool_calls) {
-							const fn = call.function_call ?? call.function ?? {}
-							send({
-								choices: [{
-									index: 0,
-									delta: { tool_calls: [{ index: call.index ?? 0, ...(call.id ? { id: call.id } : {}), type: 'function', function: { ...(call.id ? { name: fn.name ?? '' } : {}), arguments: fn.arguments ?? '' } }] },
-									finish_reason: null,
-								}],
-							})
-						}
-					}
-				}
+				yield { eventName, record }
 			}
 		}
-	} catch (error) {
-		closeStream()
-		if (!sawOutput) return { ok: false, status: 502, kind: 'server', message: `trae llm stream failed: ${String(error)}` }
-		return { ok: true, response: responseRef }
 	}
 
-	if (errored && !sawOutput) {
-		closeStream()
-		return { ok: false, ...classifyLlmError(errored) }
+	const deltaChunks = (record) => {
+		const chunks = []
+		const reasoning = typeof record.reasoning_content === 'string' && record.reasoning_content !== '' ? record.reasoning_content : undefined
+		const text = typeof record.response === 'string' && record.response !== '' ? record.response : undefined
+		if (reasoning !== undefined) chunks.push({ choices: [{ index: 0, delta: { reasoning_content: reasoning }, finish_reason: null }] })
+		if (text !== undefined) chunks.push({ choices: [{ index: 0, delta: { content: text }, finish_reason: null }] })
+		if (Array.isArray(record.tool_calls)) {
+			for (const call of record.tool_calls) {
+				const fn = call.function_call ?? call.function ?? {}
+				chunks.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: call.index ?? 0, ...(call.id ? { id: call.id } : {}), type: 'function', function: { ...(call.id ? { name: fn.name ?? '' } : {}), arguments: fn.arguments ?? '' } }] }, finish_reason: null }] })
+			}
+		}
+		return chunks
 	}
-	if (!responseRef) {
-		return { ok: false, status: 502, kind: 'server', message: 'llm_utils_chat stream ended before any output' }
+
+	for (let attempt = 0; attempt < 4; attempt++) {
+		if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
+		let response
+		try {
+			response = await fetch(`${hostOf(baseUrl)}${LLM_CHAT_PATH}`, {
+				method: 'POST',
+				headers: llmHeaders(credential, identity),
+				body: JSON.stringify(wire),
+				signal: signal ?? AbortSignal.timeout(120_000),
+			})
+		} catch (error) {
+			return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+		}
+		if (!response.ok) {
+			const text = await response.text().catch(() => '')
+			if (response.status === 403 && /10605|isQueued/.test(text) && attempt < 3) continue
+			const kind = response.status === 401 || response.status === 403 ? 'authentication' : response.status === 429 ? 'soft_rate' : response.status >= 500 ? 'server' : 'client'
+			return { ok: false, status: response.status, kind, message: text.slice(0, 400) }
+		}
+
+		const frames = gatewayFrames(response)
+		for (;;) {
+			const next = await frames.next()
+			if (next.done) break
+			const { eventName, record } = next.value
+
+			// Refusal envelopes (statusCodeValue !== 200) before the first
+			// output frame are real failures; a 403/10605 here is the queue
+			// answer → retry with a fresh request.
+			if (typeof record.statusCodeValue === 'number' && record.statusCodeValue !== 200) {
+				const bodyText = String(record.body ?? '')
+				if (record.statusCodeValue === 403 && /10605|isQueued/.test(bodyText) && attempt < 3) break
+				frames.return?.()
+				const kind = record.statusCodeValue === 401 || record.statusCodeValue === 403 ? 'authentication' : 'server'
+				return { ok: false, status: 502, kind, message: `upstream ${record.statusCodeValue}: ${bodyText.slice(0, 240)}` }
+			}
+			const isError = eventName === 'error' ||
+				(record.code !== undefined && record.message !== undefined && record.response === undefined && !Array.isArray(record.tool_calls))
+			if (isError) {
+				frames.return?.()
+				return { ok: false, ...classifyLlmError({ code: record.code, message: record.message ?? '', extra: record.extra }) }
+			}
+			if (eventName === 'done') {
+				frames.return?.()
+				return { ok: false, status: 502, kind: 'server', message: 'llm_utils_chat ended before any output' }
+			}
+			if (eventName !== 'output' && record.response === undefined && record.reasoning_content === undefined) continue
+
+			// First output frame: hand the response back NOW and keep pumping
+			// the remaining gateway frames from inside the stream's start().
+			// Returning only after the upstream finished would deliver reasoning
+			// and content in one burst instead of streaming them.
+			const firstChunks = deltaChunks(record)
+			const stream = new ReadableStream({
+				async start(controller) {
+					try {
+						for (const chunk of firstChunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+						for (;;) {
+							const next = await frames.next()
+							if (next.done) break
+							const { eventName: ev, record: rec } = next.value
+							if (typeof rec.statusCodeValue === 'number' && rec.statusCodeValue !== 200) break
+							if (ev === 'error') break
+							if (ev === 'token_usage') {
+								controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: rec.prompt_tokens, completion_tokens: rec.completion_tokens, total_tokens: rec.total_tokens } })}\n\n`))
+								continue
+							}
+							if (ev === 'done') {
+								const fr = typeof rec.finish_reason === 'string' && rec.finish_reason !== '' ? rec.finish_reason : 'stop'
+								controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: fr }] })}\n\n`))
+								controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+								break
+							}
+							for (const chunk of deltaChunks(rec)) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+						}
+						controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+						controller.close()
+					} catch (error) {
+						controller.error(error)
+					}
+				},
+				cancel() {
+					try { frames.return() } catch {}
+				},
+			})
+			return { ok: true, response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }) }
+		}
 	}
-	send({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })
-	sendRaw('[DONE]')
-	closeStream()
-	return { ok: true, response: responseRef }
+	return { ok: false, status: 429, kind: 'soft_rate', message: 'llm_utils_chat kept queueing (10605) after 4 attempts' }
 }

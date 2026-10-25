@@ -380,8 +380,8 @@ export class QoderUpstreamClient {
     // Either shape retries with a fresh request id (dsh rides a queue-status
     // poll; a timed retry is the pragmatic equivalent).
     const isQueueBody = (text) => /10605|isQueued|queueCount/.test(String(text))
-    let result = null
-    for (let attempt = 0; attempt < 4 && result === null; attempt++) {
+    const encoder = new TextEncoder()
+    for (let attempt = 0; attempt < 4; attempt++) {
       if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
       const encoded = buildBody()
       let response
@@ -410,101 +410,142 @@ export class QoderUpstreamClient {
         return { ok: false, ...classifyStatus(response.status, text), message: `qoder chat [${response.status}]: ${text.slice(0, 300)}` }
       }
 
-      // Translate Qoder's two-layer SSE into OpenAI-shaped SSE lazily. The
-      // first data frame decides: a queue envelope retries, anything else
-      // opens the stream for real.
+      // Two-layer SSE: data frames hold outer {statusCodeValue?, body:string};
+      // body carries the inner OpenAI chunk (choices[].delta.{content,
+      // reasoning_content, tool_calls}, usage). The 10605 queue envelope is a
+      // REPLAY signal: the gateway closes the SSE for a queued request and
+      // the client must wait and replay (dsh rides its queue-status poll; a
+      // timed replay is the pragmatic equivalent). The first real output
+      // chunk hands the response to the caller immediately, and the rest is
+      // pumped from inside the stream.
       const encoder = new TextEncoder()
-      let controllerRef = null
-      let opened = false
-      const open = () => {
-        if (opened) return
-        opened = true
-        bodyStream = new ReadableStream({ start(c) { controllerRef = c } })
+      const emitFrom = (controller, inner) => {
+        const choice = Array.isArray(inner.choices) ? inner.choices[0] : undefined
+        if (!choice) return null
+        const delta = choice.delta ?? {}
+        const carry = {}
+        if (typeof delta.content === 'string' && delta.content !== '') carry.content = delta.content
+        if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') carry.reasoning_content = delta.reasoning_content
+        if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
+          carry.tool_calls = delta.tool_calls.map((call, i) => ({
+            index: call.index ?? i,
+            ...(call.id ? { id: call.id } : {}),
+            type: 'function',
+            function: { ...(call.id ? { name: call.function?.name ?? '' } : {}), arguments: call.function?.arguments ?? '' },
+          }))
+        }
+        const finish = typeof choice.finish_reason === 'string' && choice.finish_reason !== '' ? choice.finish_reason : null
+        if (Object.keys(carry).length > 0 || finish) {
+          controller.enqueue(encoder.encode('data: ' + JSON.stringify({ choices: [{ index: 0, delta: carry, finish_reason: finish }] }) + '\n\n'))
+        }
+        return finish
       }
-      let bodyStream = null
-      const send = (payload) => { if (controllerRef) controllerRef.enqueue(encoder.encode(`data: ${JSON.stringify(payload)}\n\n`)) }
+      for (let attempt = 0; attempt < 4; attempt++) {
+        if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
+        const encoded = buildBody()
+        let response
+        try {
+          response = await fetch(chatUrl, {
+            method: 'POST',
+            headers: {
+              'content-type': 'application/json',
+              accept: 'text/event-stream',
+              'cache-control': 'no-cache',
+              'accept-encoding': 'identity',
+              'x-model-key': modelKey,
+              'x-model-source': 'system',
+              'user-agent': USER_AGENT,
+              ...buildCosyHeaders({ body: encoded, url: chatUrl, credential }),
+            },
+            body: encoded,
+            signal: signal ?? AbortSignal.timeout(300_000),
+          })
+        } catch (error) {
+          return { ok: false, kind: 'server', status: 0, message: `transport error: ${String(error).slice(0, 160)}` }
+        }
+        if (!response.ok) {
+          const text = await response.text().catch(() => '')
+          if (isQueueBody(text) && attempt < 3) continue
+          return { ok: false, ...classifyStatus(response.status, text), message: `qoder chat [${response.status}]: ${text.slice(0, 300)}` }
+        }
 
-      const reader = response.body.getReader()
-      const decoder = new TextDecoder()
-      let buffer = ''
-      let sawDone = false
-      let earlyError = null
-      let queuedFrame = false
-      try {
-        while (!sawDone) {
-          const { done, value } = await reader.read()
-          if (done) break
-          buffer += decoder.decode(value, { stream: true })
-          let index
-          while ((index = buffer.indexOf('\n')) >= 0) {
-            let line = buffer.substring(0, index)
-            buffer = buffer.substring(index + 1)
-            if (line.endsWith('\r')) line = line.slice(0, -1)
-            line = line.trim()
-            if (!line.startsWith('data:')) continue
-            const rawData = line.substring(5).trim()
-            if (!rawData) continue
-            if (rawData === '[DONE]') { sawDone = true; break }
-            let outer
-            try { outer = JSON.parse(rawData) } catch { continue }
-            if (typeof outer.statusCodeValue === 'number' && outer.statusCodeValue !== 200) {
-              if (!opened && isQueueBody(outer.body)) {
-                queuedFrame = true
-                sawDone = true
-                break
+        async function* iterateFrames() {
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          for (;;) {
+            const { done, value } = await reader.read()
+            if (done) return
+            buffer += decoder.decode(value, { stream: true })
+            let index
+            while ((index = buffer.indexOf('\n')) >= 0) {
+              let line = buffer.substring(0, index)
+              buffer = buffer.substring(index + 1)
+              if (line.endsWith('\r')) line = line.slice(0, -1)
+              line = line.trim()
+              if (!line.startsWith('data:')) continue
+              const rawData = line.substring(5).trim()
+              if (!rawData) continue
+              if (rawData === '[DONE]') return
+              let outer
+              try { outer = JSON.parse(rawData) } catch { continue }
+              if (typeof outer.statusCodeValue === 'number' && outer.statusCodeValue !== 200) {
+                yield { kind: 'status', statusCodeValue: outer.statusCodeValue, bodyText: String(outer.body ?? '') }
+                continue
               }
-              const failure = `qoder upstream status ${outer.statusCodeValue}: ${String(outer.body ?? '').slice(0, 200)}`
-              if (!opened) { earlyError = failure; sawDone = true; break }
-              send({ error: { message: failure } })
-              sawDone = true
-              break
+              const bodyText = typeof outer.body === 'string' ? outer.body.trim() : ''
+              if (!bodyText) continue
+              if (bodyText === '[DONE]') return
+              let inner
+              try { inner = JSON.parse(bodyText) } catch { continue }
+              yield { kind: 'chunk', chunk: inner }
             }
-            const bodyText = typeof outer.body === 'string' ? outer.body.trim() : ''
-            if (!bodyText) continue
-            if (bodyText === '[DONE]') { sawDone = true; break }
-            let inner
-            try { inner = JSON.parse(bodyText) } catch { continue }
-            open()
-            if (inner.usage) send({ choices: [], usage: inner.usage })
-            const choice = Array.isArray(inner.choices) ? inner.choices[0] : undefined
-            if (!choice) continue
-            const delta = choice.delta ?? {}
-            const carry = {}
-            if (typeof delta.content === 'string' && delta.content !== '') carry.content = delta.content
-            if (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '') carry.reasoning_content = delta.reasoning_content
-            if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) {
-              carry.tool_calls = delta.tool_calls.map((call, i) => ({
-                index: call.index ?? i,
-                ...(call.id ? { id: call.id } : {}),
-                type: 'function',
-                function: { ...(call.id ? { name: call.function?.name ?? '' } : {}), arguments: call.function?.arguments ?? '' },
-              }))
-            }
-            const finish = typeof choice.finish_reason === 'string' && choice.finish_reason !== '' ? choice.finish_reason : null
-            if (Object.keys(carry).length > 0 || finish) {
-              send({ choices: [{ index: 0, delta: carry, finish_reason: finish }] })
-            }
-            if (finish) sawDone = true
           }
         }
-      } catch (error) {
-        if (!opened) {
-          try { await reader.cancel() } catch {}
-          return { ok: false, kind: 'server', status: 502, message: `qoder stream failed: ${String(error).slice(0, 200)}` }
+        const frames = iterateFrames()
+        let firstChunk = null
+        for (;;) {
+          const next = await frames.next()
+          if (next.done) break
+          const frame = next.value
+          if (frame.kind === 'status') {
+            if (frame.statusCodeValue !== 200) {
+              if (isQueueBody(frame.bodyText) && attempt < 3) break
+              frames.return?.()
+              return { ok: false, status: 502, kind: 'server', message: `qoder upstream ${frame.statusCodeValue}: ${frame.bodyText.slice(0, 200)}` }
+            }
+            continue
+          }
+          firstChunk = frame.chunk
+          break
         }
+        if (!firstChunk) continue
+
+        const stream = new ReadableStream({
+          async start(controller) {
+            try {
+              emitFrom(controller, firstChunk)
+              for (;;) {
+                const next = await frames.next()
+                if (next.done) break
+                const frame = next.value
+                if (frame.kind === 'status' && frame.statusCodeValue !== 200) break
+                if (frame.kind !== 'chunk') continue
+                emitFrom(controller, frame.chunk)
+              }
+              controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              controller.close()
+            } catch (error) {
+              controller.error(error)
+            }
+          },
+          cancel() {
+            try { frames.return() } catch {}
+          },
+        })
+        return { ok: true, response: { body: stream } }
       }
-      if (queuedFrame && attempt < 3) {
-        try { await reader.cancel() } catch {}
-        continue
-      }
-      if (!opened) {
-        return { ok: false, kind: 'server', status: 502, message: earlyError ?? `qoder 流在首个输出前结束(raw样本: ${buffer.slice(0, 300)})` }
-      }
-      send({ choices: [{ index: 0, delta: {}, finish_reason: 'stop' }] })
-      controllerRef.enqueue(encoder.encode('data: [DONE]\n\n'))
-      try { controllerRef.close() } catch {}
-      result = { ok: true, response: { body: bodyStream } }
-    }
-    return result ?? { ok: false, kind: 'soft_rate', status: 429, message: 'qoder 排队超时(10605),稍后重试' }
+      return { ok: false, kind: 'soft_rate', status: 429, message: 'qoder kept queueing (10605) after 4 attempts' }
   }
+}
 }
