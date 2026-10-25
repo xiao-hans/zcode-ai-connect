@@ -236,7 +236,7 @@ let qoderEp = null;
 try {
   qoderEp = await endpointRoster('.zcode-qoder-connect');
 } catch {
-  console.log('qoder:     端点不可达,跳过(如需启用: node D:/HANXIAO/tools/zcode-qoder-connect/bin/cli.mjs serve)');
+  console.log('qoder:     端点不可达,跳过(如需启用: node ' + QODER_DIR + '/bin/cli.mjs serve)');
 }
 let qoderModels = [];
 if (qoderEp) {

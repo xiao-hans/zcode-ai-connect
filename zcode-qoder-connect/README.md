@@ -53,4 +53,4 @@ node bin/cli.mjs serve --port 39270   # 前台运行;healthz 鉴权用 state 目
 
 ## 致谢与许可
 
-协议移植自 [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect)(MIT,作者 corrinehu),在本机凭据上对 wire 行为做了逐字段实测与修正(wire 层 tools 为 OpenAI 嵌套形、system/user content 为字符串、10605 排队重试等)。MIT,见 [LICENSE](LICENSE)。
+协议实现源自 [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect)(MIT,作者 corrinehu)。MIT,见 [LICENSE](LICENSE)。

@@ -91,6 +91,6 @@ zcode-ai-connect/
 ## 免责与致谢
 
 - 三款桌面 App 的接口均为非公开协议,来自社区逆向,随时可能变动;本项目仅限个人学习使用,请遵守各 App 的服务条款。
-- 协议来源与致谢:Trae 通道源自 [dsh-trae-connect](https://github.com/marsma-101/dsh-trae-connect)(MIT)与 Trae2api-cn 的协议文档;WorkBuddy 源自 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy)(MIT);Qoder 源自 [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect)(MIT)。本仓库在这些协议基础上做了移植、实测修正与功能扩展(消息保真、工具调用回传、模型别名、排队自愈等)。
+- 协议实现源自社区项目(MIT):Trae 通道源自 [dsh-trae-connect](https://github.com/marsma-101/dsh-trae-connect) 与 Trae2api-cn 的协议文档;WorkBuddy 源自 [dsh-connect-workbuddy](https://github.com/dingminhua/dsh-connect-workbuddy);Qoder 源自 [dsh-qoder-connect](https://github.com/masknull/dsh-qoder-connect)。
 
 MIT License — 见 [LICENSE](LICENSE)。

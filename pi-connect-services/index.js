@@ -2,10 +2,11 @@
  * pi-connect-services — ensure the local model endpoints are running when pi
  * starts (trae 39272 / workbuddy 39271 / qoder 39270).
  *
- * The three connect tools (D:\HANXIAO\tools\zcode-*-connect) each serve an
- * OpenAI-compatible loopback endpoint that pi's custom providers point at.
- * ZCode starts them via its SessionStart hook; this extension gives pi the
- * same behaviour so opening EITHER app brings the stack up.
+ * The three connect tools (siblings of this directory in the suite repo)
+ * each serve an OpenAI-compatible loopback endpoint that pi's custom
+ * providers point at. ZCode starts them via its SessionStart hook; this
+ * extension gives pi the same behaviour so opening EITHER app brings the
+ * stack up.
  *
  * Probe-then-spawn, fully detached, best-effort: a failed spawn never blocks
  * or breaks the session — the provider just reports unreachable and the user

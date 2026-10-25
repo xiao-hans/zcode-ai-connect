@@ -1,0 +1,40 @@
+{
+  "name": "zcode-trae-connect",
+  "version": "1.0.0",
+  "description": "Bring Trae desktop-app models — domestic and international (GLM-5.3, DeepSeek-V4.1-Flash, Kimi-K3, Trae Auto …) — into ZCode as OpenAI-compatible providers, with zero configuration.",
+  "description_i18n": {
+    "en": "Bring Trae desktop-app models, domestic and international, into ZCode as OpenAI-compatible providers, with zero configuration.",
+    "zh-CN": "把 Trae 桌面 App 的国内版与国际版模型（GLM-5.3、DeepSeek-V4.1-Flash、Kimi-K3、Trae Auto 等）零配置接入 ZCode 的模型供应商。"
+  },
+  "author": {
+    "name": "hawchou1995 (a port of marsma-101/dsh-trae-connect, MIT)"
+  },
+  "license": "MIT",
+  "homepage": "https://github.com/hawchou1995/zcode-trae-connect",
+  "keywords": [
+    "trae",
+    "openai-compatible",
+    "provider",
+    "glm",
+    "deepseek",
+    "kimi"
+  ],
+  "skills": "skills",
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "C:/nvm4w/nodejs/node.exe",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/service-ensure.mjs"
+            ],
+            "timeoutMs": 60000,
+            "statusMessage": "Starting the Trae endpoint"
+          }
+        ]
+      }
+    ]
+  }
+}

@@ -18,7 +18,7 @@ pi install /path/to/pi-connect-services
 
 ## 配置
 
-端点工具根目录默认 `D:/HANXIAO/tools`,可用环境变量覆盖:
+端点工具根目录默认为本扩展所在目录的上一级(即套件仓库根),可用环境变量覆盖:
 
 ```
 PI_CONNECT_TOOLS_ROOT=D:/your/tools/root
