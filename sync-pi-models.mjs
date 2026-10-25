@@ -214,7 +214,8 @@ for (const row of wbEp.rows) {
   wbModels.push(model);
 }
 
-/** qoder `cli.mjs status` 文本 -> Map(id -> efforts[]);词表就是 pi 原生档位。 */
+/** qoder `cli.mjs status` 文本 -> Map(内部key -> efforts[])。行首缩进两空格;
+ * 行内无 · 分隔符;档位词表本身就是 pi 的 low/medium/high/xhigh/max。 */
 function qoderEffortsFromStatus() {
   const out = execSync(`node "${QODER_DIR}/bin/cli.mjs" status`, {
     encoding: 'utf8',
@@ -222,12 +223,27 @@ function qoderEffortsFromStatus() {
   });
   const map = new Map();
   for (const line of out.split('\n')) {
-    const m = line.match(/^\s{2}(\S+)\s+.*?\s{2,}(\d+) ctx\s*(.*)$/);
+    const m = line.match(/^ {2}(\S+)\s+.*?\s{2,}(\d+) ctx\s*(.*)$/);
     if (!m) continue;
-    const effortPart = m[3].split(/(?=\s{2}|\bx)/).map((s) => s.trim()).find((p) => p.startsWith('efforts '));
-    if (effortPart) map.set(m[1], effortPart.slice('efforts '.length).split('/').filter(Boolean));
+    const effortMatch = m[3].match(/efforts ([^\n]+?)(?:\s{2,}x[\d.]+)?\s*$/);
+    if (effortMatch) map.set(m[1], effortMatch[1].split('/').filter(Boolean));
   }
   return map;
+}
+
+/** 服务端 /v1/models 对外用别名 id;档位表按内部 key 建,这里反向解出。 */
+const QODER_ALIAS_TO_INTERNAL = {
+  'qoder-auto': 'auto',
+  'qoder-fast': 'fast',
+  'qwen3.8-max': 'qmodel_38max',
+  'qwen3.8-flash': 'qfmodel',
+  'deepseek-v4-pro': 'dmodel',
+  'deepseek-flash': 'dfmodel',
+  'glm-5.3': 'gmodel',
+  'glm-5.3-flash': 'gfmodel',
+  'kimi-k3.1-pro': 'kmodel_latest',
+  'kimi-k2.8-preview': 'kmodel',
+  'minimax-m3.1-flash': 'mmodel',
 }
 
 // ---- qoder ----
@@ -242,8 +258,9 @@ let qoderModels = [];
 if (qoderEp) {
   const qoderEfforts = qoderEffortsFromStatus();
   for (const row of qoderEp.rows) {
-    if (row.id === 'auto') continue;
-    const efforts = qoderEfforts.get(row.id) ?? [];
+    if (row.id === 'qoder-auto') continue;
+    const internalKey = QODER_ALIAS_TO_INTERNAL[row.id] ?? row.id;
+    const efforts = qoderEfforts.get(internalKey) ?? [];
     const reasoning = efforts.length > 0;
     const model = {
       id: row.id,
