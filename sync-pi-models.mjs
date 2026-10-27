@@ -119,6 +119,7 @@ function wbEffortsFromStatus() {
     const effortPart = m[3].split('·').map((s) => s.trim()).find((p) => p.startsWith('efforts '));
     if (effortPart) map.set(m[1], effortPart.slice('efforts '.length).split('/').filter(Boolean));
   }
+  if (map.size < 5) console.log('警告: WB status 的档位解析异常地少(' + map.size + ' 条)——上游目录可能处于瞬时空窗,本次同步可能洗掉思考映射,重跑一次即可恢复');
   return map;
 }
 
