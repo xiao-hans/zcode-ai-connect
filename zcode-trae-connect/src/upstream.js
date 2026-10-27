@@ -1056,7 +1056,7 @@ export class TraeUpstreamClient {
 		const owned = typeof body?.model === "string" ? this.ownedFunctions?.get(body.model) : undefined;
 		if (owned) {
 			const identity = await resolveLlmIdentity();
-			return llmChatStream({
+			let result = await llmChatStream({
 				credential: { token: credential?.token ?? "", userId: credential?.userId },
 				identity,
 				baseUrl: this.endpoints().remoteBase,
@@ -1064,6 +1064,32 @@ export class TraeUpstreamClient {
 				ownedFunction: owned.ownedFunction,
 				signal,
 			});
+			// 4001 = "config_name is not served by this function": the gateway
+			// rotates models across directory functions, so a cached mapping
+			// goes stale. Refresh the directory once and retry with the
+			// function that owns the model NOW.
+			if (!result.ok && result.status === 400 && /4001/.test(result.message ?? "")) {
+				this.logger?.warn?.(`[trae] 4001 for ${body.model} under ${owned.ownedFunction} — refreshing the llm directory and retrying`);
+				try {
+					const refreshed = await this.fetchModels(credential);
+					const fresh = this.ownedFunctions?.get(body.model);
+					if (fresh && fresh.ownedFunction !== owned.ownedFunction) {
+						result = await llmChatStream({
+							credential: { token: credential?.token ?? "", userId: credential?.userId },
+							identity,
+							baseUrl: this.endpoints().remoteBase,
+							openaiBody: body,
+							ownedFunction: fresh.ownedFunction,
+							signal,
+						});
+					} else if (refreshed.length > 0) {
+						this.logger?.warn?.(`[trae] directory refreshed: ${body.model} still owned by ${fresh?.ownedFunction ?? "nobody"}`);
+					}
+				} catch (error) {
+					this.logger?.warn?.(`[trae] directory refresh failed: ${String(error).slice(0, 140)}`);
+				}
+			}
+			return result;
 		}
 		const model = typeof body?.model === "string" && body.model !== "" ? body.model : "auto";
 		const messages = Array.isArray(body?.messages) ? body.messages : [];

@@ -51,7 +51,7 @@ function deriveMasterKey(dataDir) {
   if (blob.subarray(0, 5).toString() !== 'DPAPI') throw new Error('Local State encrypted_key 不是 DPAPI 格式')
   const b64 = blob.subarray(5).toString('base64')
   const ps = "Add-Type -AssemblyName System.Security;[Convert]::ToBase64String([Security.Cryptography.ProtectedData]::Unprotect([Convert]::FromBase64String('" + b64 + "'),$null,'CurrentUser'))"
-  const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'] }).trim()
+  const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true }).trim()
   const key = Buffer.from(out, 'base64')
   if (key.length !== 32) throw new Error('DPAPI 解出的主密钥长度异常: ' + key.length)
   return key
