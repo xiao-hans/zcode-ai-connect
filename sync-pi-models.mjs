@@ -310,6 +310,43 @@ if (qoderEp && qoderModels.length > 0) {
 } else {
   delete config.providers.qoder;
 }
+// ZCode 侧:同步 v2/config.json 的 qoder provider 条目(模型选择器的数据源),
+// 并保持 WorkBuddy 条目的 apiKey 与端点 token 一致。失败不阻塞 pi 同步。
+try {
+  const cfgPath = path.join(home, '.zcode', 'v2', 'config.json');
+  const zcfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'));
+  zcfg.provider ??= {};
+  if (qoderEp) {
+    const models = {};
+    for (const row of qoderEp.rows) {
+      if (row.id === 'qoder-auto') continue;
+      models[row.id] = {
+        name: row.display_name ?? row.id,
+        limit: { context: row.context_window ?? 180000, output: row.max_output_tokens ?? 32000 },
+        modalities: { input: row.supports_images ? ['text', 'image'] : ['text'], output: ['text'] },
+      };
+    }
+    zcfg.provider['q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'] = {
+      name: 'Qoder',
+      kind: 'openai-compatible',
+      options: { apiKey: qoderEp.apiKey, baseURL: qoderEp.baseUrl, apiKeyRequired: true },
+      source: 'custom',
+      models,
+    };
+  } else {
+    delete zcfg.provider?.['q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'];
+  }
+  const wbEp = JSON.parse(fs.readFileSync(path.join(home, '.zcode-workbuddy-connect', 'endpoint.json'), 'utf8'));
+  for (const entry of Object.values(zcfg.provider ?? {})) {
+    if (entry?.options?.baseURL?.includes(':39271') && entry.options.apiKey !== wbEp.token) {
+      entry.options.apiKey = wbEp.token;
+    }
+  }
+  fs.writeFileSync(cfgPath, JSON.stringify(zcfg, null, 2));
+  console.log('zcode provider 条目已同步(qoder + workbuddy token)');
+} catch (error) {
+  console.log('zcode provider 同步跳过:', String(error).slice(0, 120));
+}
 fs.writeFileSync(MODELS_PATH, JSON.stringify(config, null, 2) + '\n', 'utf8');
 
 // ---- report(不打印 apiKey)----
