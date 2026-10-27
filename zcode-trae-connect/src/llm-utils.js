@@ -137,6 +137,14 @@ export function toLlmMessages(messages) {
 		if (typeof raw !== 'object' || raw === null) return raw
 		const message = { ...raw }
 		if (message.role === 'developer') message.role = 'system'
+		// Interrupted turns leave assistant messages with content null/[] (the
+		// tool_calls are there but no text). The upstream parameter validator
+		// rejects null/[] content with 4001 on EVERY request that carries the
+		// poisoned history (live-verified 2026-10-25); an empty text block
+		// passes. Normalize before the string-wrap below.
+		if (message.role === 'assistant' && (message.content === null || message.content === undefined || (Array.isArray(message.content) && message.content.length === 0))) {
+			message.content = ''
+		}
 		if (typeof message.content === 'string') message.content = [{ type: 'text', text: message.content }]
 		if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
 			message.function_call = message.tool_calls
@@ -238,7 +246,8 @@ export function classifyLlmError(failure) {
 	if (code === 1005 || code === 4008 || code === 4222) return { kind: 'hard_credit', status: 402, message }
 	if (code === 4011) return { kind: 'soft_rate', status: 429, message }
 	if (code === 401 || code === 403) return { kind: 'authentication', status: 401, message }
-	if (code === 4001 || code === 4023) return { kind: 'client', status: 400, message: `${message} (模型不在该 function 的名册里)` }
+	if (code === 4001) return { kind: 'client', status: 400, message: `${message} (上游参数校验拒绝：通常是历史中存在 content 为空的 assistant 消息——被打断的回合会留下这种消息；新开会话可自愈，重试同一会话无效)` }
+	if (code === 4023) return { kind: 'client', status: 400, message: `${message} (该 function 的名册里没有这个模型名)` }
 	if (code === 2001) return { kind: 'server', status: 502, message: `${message} (上游目录暂缺,稍后重试)` }
 	return { kind: 'server', status: 502, message }
 }
