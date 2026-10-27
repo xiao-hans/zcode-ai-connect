@@ -327,7 +327,7 @@ try {
         modalities: { input: row.supports_images ? ['text', 'image'] : ['text'], output: ['text'] },
       };
     }
-    zcfg.provider['q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'] = {
+    zcfg.provider['4d21d570-09de-47f2-8815-7438a52491e7'] = {
       name: 'Qoder',
       kind: 'openai-compatible',
       options: { apiKey: qoderEp.apiKey, baseURL: qoderEp.baseUrl, apiKeyRequired: true },
@@ -335,8 +335,11 @@ try {
       models,
     };
   } else {
-    delete zcfg.provider?.['q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'];
+    delete zcfg.provider?.['4d21d570-09de-47f2-8815-7438a52491e7'];
   }
+  // Retire the older mnemonic key: it isn't a valid UUID, so ZCode silently
+  // ignored the entry. Drop it whenever we see it.
+  delete zcfg.provider?.['q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'];
   const wbEp = JSON.parse(fs.readFileSync(path.join(home, '.zcode-workbuddy-connect', 'endpoint.json'), 'utf8'));
   for (const entry of Object.values(zcfg.provider ?? {})) {
     if (entry?.options?.baseURL?.includes(':39271') && entry.options.apiKey !== wbEp.token) {

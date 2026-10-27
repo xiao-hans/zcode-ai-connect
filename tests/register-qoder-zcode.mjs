@@ -12,8 +12,10 @@ const cfgPath = join(home, '.zcode', 'v2', 'config.json')
 const cfg = JSON.parse(fs.readFileSync(cfgPath, 'utf8'))
 cfg.provider ??= {}
 
-// Qoder entry — stable UUID so re-runs update in place.
-const QODER_KEY = 'q1a2b3c4-d5e6-4f7a-8b9c-0d1e2f3a4b5c'
+// Qoder entry — stable UUID so re-runs update in place. The key MUST be a real
+// UUID (hex only): ZCode validates provider keys and silently drops an entry
+// whose key isn't one, so a hand-written mnemonic id never shows up.
+const QODER_KEY = '4d21d570-09de-47f2-8815-7438a52491e7'
 const qEp = JSON.parse(fs.readFileSync(join(home, '.zcode-qoder-connect', 'endpoint.json'), 'utf8'))
 const qBase = `http://127.0.0.1:${qEp.port || 39270}/v1`
 const modelsR = await fetch(`${qBase}/models`, { headers: { Authorization: `Bearer ${qEp.token}` }, signal: AbortSignal.timeout(15000) })
