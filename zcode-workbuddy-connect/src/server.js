@@ -17,6 +17,9 @@
 
 import { timingSafeEqual } from 'node:crypto'
 import { createServer } from 'node:http'
+import { appendFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { hostIsLoopback, originIsLoopback } from './loopback.js'
 import { prepareChatBody, WorkBuddyUpstreamClient } from './upstream.js'
 
@@ -193,6 +196,58 @@ function completeToolCalls(accumulator) {
       type: 'function',
       function: { name: call.name, arguments: call.arguments },
     }))
+}
+
+
+/** Diagnostics: the service runs detached, so stdout goes nowhere. */
+const STREAM_LOG_PATH = process.env['ZC_STREAM_LOG'] ?? join(homedir(), '.zcode-workbuddy-connect', 'stream.log')
+
+/** Append one diagnostics line; logging must never break a request. */
+function diag(line) {
+  try {
+    appendFileSync(STREAM_LOG_PATH, `${new Date().toISOString()} workbuddy ${line}
+`)
+  } catch {
+    /* best effort */
+  }
+}
+
+/**
+ * Drop assistant messages that carry neither text nor tool calls.
+ *
+ * Upstream validators reject such a message outright (Trae answers 4001 / HTTP 400
+ * on EVERY request carrying it), and the client stores the empty assistant message
+ * in its session and sends it back next turn — one interrupted turn therefore
+ * poisons the whole session. A real session accumulated 154 of them and could not
+ * send another message.
+ *
+ * @param {string} bodyJson raw request body
+ * @returns {{ body: string, dropped: number }}
+ */
+function sanitizeHistory(bodyJson) {
+  let parsed
+  try {
+    parsed = JSON.parse(bodyJson)
+  } catch {
+    return { body: bodyJson, dropped: 0 }
+  }
+  if (!Array.isArray(parsed?.messages)) return { body: bodyJson, dropped: 0 }
+  const before = parsed.messages.length
+  const messages = parsed.messages.filter((message) => {
+    if (message?.role !== 'assistant') return true
+    const content = message.content
+    const hasText = typeof content === 'string'
+      ? content.trim() !== ''
+      : Array.isArray(content) && content.some((block) => String(block?.text ?? block?.content ?? '').length > 0)
+    const calls = Array.isArray(message.tool_calls)
+      ? message.tool_calls.length
+      : Array.isArray(message.function_call) ? message.function_call.length : 0
+    return hasText || calls > 0
+  })
+  const dropped = before - messages.length
+  if (dropped === 0) return { body: bodyJson, dropped: 0 }
+  parsed.messages = messages
+  return { body: JSON.stringify(parsed), dropped }
 }
 
 /**
@@ -677,6 +732,11 @@ export function createWorkBuddyServer(options) {
     }
 
     const raw = (await readBody(req)).toString('utf8')
+    // 丢掉「既无正文也无工具调用」的 assistant 消息：留着会让上游之后每一轮都拒绝请求。
+    const sanitized = sanitizeHistory(raw)
+    if (sanitized.dropped > 0) {
+      logger.warn(`[workbuddy] dropped ${sanitized.dropped} empty assistant message(s) from the request history`)
+    }
     let wantsStream = true
     let model = 'workbuddy'
     try {
@@ -697,8 +757,8 @@ export function createWorkBuddyServer(options) {
     const upstreamModel = legacy === undefined ? model : legacy.modelId
     const escaped = model.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
     const routed = upstreamModel === model
-      ? raw
-      : raw.replace(new RegExp(`("model"\\s*:\\s*")${escaped}"`), `$1${upstreamModel}"`)
+      ? sanitized.body
+      : sanitized.body.replace(new RegExp(`("model"\\s*:\\s*")${escaped}"`), `$1${upstreamModel}"`)
 
     let credential
     try {
@@ -725,12 +785,12 @@ export function createWorkBuddyServer(options) {
 
     if (!result.ok) {
       const kind = KIND_STATUS[result.kind] === undefined ? 'server' : result.kind
-      writeOpenAIError(
-        res,
-        KIND_STATUS[kind],
-        result.kind,
-        `workbuddy upstream ${result.kind} (http ${result.status}): ${result.message.slice(0, 400)}`,
-      )
+      const detail = String(result.message ?? '').trim()
+      const message = detail === ''
+        ? `workbuddy upstream returned http ${result.status} with an empty body (most often a rejected history: empty assistant message, orphan tool result, or an oversized payload)`
+        : `workbuddy upstream ${result.kind} (http ${result.status}): ${detail.slice(0, 400)}`
+      diag(`upstream-fail kind=${result.kind} status=${result.status} msg=${detail.slice(0, 120)}`)
+      writeOpenAIError(res, KIND_STATUS[kind], result.kind, message)
       return
     }
 

@@ -49,6 +49,17 @@ export const DIRECTORY_FUNCTIONS = [
 const DEFAULT_APP_ID = '6eefa01c-1036-4c7e-9ca5-d891f63bfcd8'
 const VERSION_CODE_FALLBACK = '20260716'
 
+/**
+ * 上游「响应头」到达的等待上限（毫秒）。
+ *
+ * 覆盖的是 fetch 等响应头的那一段；响应头到手后计时器立即清除，body 流不受它约束
+ * （见下方 fetch 处的注释）。上游接单后排队不回时，没有它就变成永久挂起——客户端
+ * 只看到一个一直转的圈，没有任何错误。宁可限时失败让下游重试（DSH/pi 都有退避重试）。
+ *
+ * 可用 `ZC_UPSTREAM_HEADER_TIMEOUT_MS` 覆盖。
+ */
+const UPSTREAM_HEADER_TIMEOUT_MS = Number(process.env['ZC_UPSTREAM_HEADER_TIMEOUT_MS'] ?? 120_000)
+
 const nonEmpty = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
 /** The agent/IDE endpoints hang off the HOST root, not under /api/remote/v1:
@@ -142,8 +153,20 @@ export function toLlmMessages(messages) {
 		// rejects null/[] content with 4001 on EVERY request that carries the
 		// poisoned history (live-verified 2026-10-25); an empty text block
 		// passes. Normalize before the string-wrap below.
+		// content 为 null/[] 的 assistant 消息会让上游参数校验恒定拒绝（4001），
+		// 且这一拒绝会污染**之后每一轮**请求：客户端把这条空消息存进会话再发回来，
+		// 于是整个会话再也无法继续（实测会话里能累积上百条这种空消息）。
+		// 归一成空文本块（上游接受空文本块）。
 		if (message.role === 'assistant' && (message.content === null || message.content === undefined || (Array.isArray(message.content) && message.content.length === 0))) {
 			message.content = ''
+		}
+		// 既没有正文也没有工具调用的 assistant 消息对上游毫无意义，却会触发校验
+		// 失败：直接丢掉（它们通常是被中断/报错的回合留下的空壳）。
+		const assistantCalls = Array.isArray(message.tool_calls) && message.tool_calls.length > 0
+			? message.tool_calls
+			: Array.isArray(message.function_call) && message.function_call.length > 0 ? message.function_call : undefined
+		if (message.role === 'assistant' && message.content === '' && assistantCalls === undefined) {
+			return null
 		}
 		if (typeof message.content === 'string') message.content = [{ type: 'text', text: message.content }]
 		if (message.role === 'assistant' && Array.isArray(message.tool_calls)) {
@@ -154,7 +177,7 @@ export function toLlmMessages(messages) {
 			throw new Error('llm-utils: tool message requires tool_call_id')
 		}
 		return message
-	})
+	}).filter((message) => message !== null)
 }
 
 /** OpenAI tools → wire tools (JSON-schema parameters become a string). */
@@ -329,15 +352,28 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 	for (let attempt = 0; attempt < 4; attempt++) {
 		if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
 		let response
+		// ⚠️ 必须用**可清除**的 AbortController，不能用 AbortSignal.timeout：
+		// 后者绑进 fetch 的 signal 后会被 undici 维持到整个响应生命周期（含 body 流），
+		// 长回答会在第 N 秒被掐死。这里只覆盖「拿到响应头之前」——上游接单后迟迟不回
+		// 是最常见的挂起形态，放任它等于让客户端永远等下去。头一到手立刻 clearTimeout，
+		// 之后的 body 流只受调用方 signal（客户端断连 / 流内看门狗）约束。
+		const headerAbort = new AbortController()
+		const headerTimer = setTimeout(() => {
+			headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+		}, UPSTREAM_HEADER_TIMEOUT_MS)
 		try {
 			response = await fetch(`${hostOf(baseUrl)}${LLM_CHAT_PATH}`, {
 				method: 'POST',
 				headers: llmHeaders(credential, identity),
 				body: JSON.stringify(wire),
-				signal: signal ?? AbortSignal.timeout(120_000),
+				signal: signal === undefined
+					? headerAbort.signal
+					: AbortSignal.any([signal, headerAbort.signal]),
 			})
 		} catch (error) {
 			return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+		} finally {
+			clearTimeout(headerTimer)
 		}
 		if (!response.ok) {
 			const text = await response.text().catch(() => '')

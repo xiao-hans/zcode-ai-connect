@@ -34,6 +34,11 @@ import crypto from 'node:crypto'
 export const FALLBACK_MODELS = []
 
 export const QODER_IDE_VERSION = '1.1.77'
+/**
+ * 上游「响应头」到达的等待上限（毫秒）。只覆盖响应头阶段，拿到即清除；
+ * body 流由流内看门狗负责。可用 `ZC_UPSTREAM_HEADER_TIMEOUT_MS` 覆盖。
+ */
+const UPSTREAM_HEADER_TIMEOUT_MS = Number(process.env['ZC_UPSTREAM_HEADER_TIMEOUT_MS'] ?? 120_000)
 const USER_AGENT = `qoder/${QODER_IDE_VERSION}`
 const LOGIN_VERSION = 'v2'
 const MACHINE_OS = `${process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'x86_64' : process.arch}_${process.platform}`
@@ -421,7 +426,14 @@ export class QoderUpstreamClient {
         if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
         const encoded = buildBody()
         let response
-        try {
+        // ⚠️ 可清除的 AbortController，而不是 AbortSignal.timeout：后者绑进 fetch 后
+      // 会被 undici 维持到整个响应生命周期（含 body 流），长回答会在第 N 秒被掐死。
+      // 这里只覆盖「响应头到达之前」——上游接单不回是最常见的挂起形态。
+      const headerAbort = new AbortController()
+      const headerTimer = setTimeout(() => {
+        headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+      }, UPSTREAM_HEADER_TIMEOUT_MS)
+      try {
           response = await fetch(chatUrl, {
             method: 'POST',
             headers: {
@@ -435,10 +447,12 @@ export class QoderUpstreamClient {
               ...buildCosyHeaders({ body: encoded, url: chatUrl, credential }),
             },
             body: encoded,
-            signal: signal ?? AbortSignal.timeout(300_000),
+            signal: signal === undefined ? headerAbort.signal : AbortSignal.any([signal, headerAbort.signal]),
           })
         } catch (error) {
           return { ok: false, kind: 'server', status: 0, message: `transport error: ${String(error).slice(0, 160)}` }
+        } finally {
+          clearTimeout(headerTimer)
         }
         if (!response.ok) {
           const text = await response.text().catch(() => '')

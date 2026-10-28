@@ -544,6 +544,12 @@ function normalizeCreditsDocument(data) {
  * Upstream HTTP client. One instance serves the whole process; requests take
  * the credential explicitly so token refreshes apply on the next call.
  */
+/**
+ * 上游「响应头」到达的等待上限（毫秒）。只覆盖响应头阶段，拿到即清除；
+ * body 流由流内看门狗负责。可用 `ZC_UPSTREAM_HEADER_TIMEOUT_MS` 覆盖。
+ */
+const UPSTREAM_HEADER_TIMEOUT_MS = Number(process.env['ZC_UPSTREAM_HEADER_TIMEOUT_MS'] ?? 120_000)
+
 export class WorkBuddyUpstreamClient {
   constructor(options = {}) {
     this.resolveAppVersion = options.resolveAppVersion ?? (() => resolveAppVersion())
@@ -564,15 +570,24 @@ export class WorkBuddyUpstreamClient {
       userAgent = chatUserAgent(fallbackChatIdentity(region), region)
     }
     let response
+    // ⚠️ 可清除的 AbortController（不能用 AbortSignal.timeout：它会被 undici 维持到
+    // body 流结束）。这里只覆盖「响应头到达之前」，上游排队不回时限时失败、让下游重试，
+    // 而不是让客户端永远等一个不会来的响应头。
+    const headerAbort = new AbortController()
+    const headerTimer = setTimeout(() => {
+      headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+    }, UPSTREAM_HEADER_TIMEOUT_MS)
     try {
       response = await fetch(`${chatBase(credential)}/v2/chat/completions`, {
         method: 'POST',
         headers: { ...chatHeaders(credential, userAgent), 'Authorization': `Bearer ${credential.accessToken}` },
         body: region === 'global' ? prepareInternationalChatBody(bodyJson) : bodyJson,
-        ...(signal === undefined ? {} : { signal }),
+        signal: signal === undefined ? headerAbort.signal : AbortSignal.any([signal, headerAbort.signal]),
       })
     } catch (error) {
       return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
+    } finally {
+      clearTimeout(headerTimer)
     }
     if (response.ok) return { ok: true, response }
     const text = (await response.text()).slice(0, ERROR_BODY_LIMIT)
