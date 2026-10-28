@@ -380,36 +380,7 @@ export class QoderUpstreamClient {
     // Either shape retries with a fresh request id (dsh rides a queue-status
     // poll; a timed retry is the pragmatic equivalent).
     const isQueueBody = (text) => /10605|isQueued|queueCount/.test(String(text))
-    const encoder = new TextEncoder()
-    for (let attempt = 0; attempt < 4; attempt++) {
-      if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
-      const encoded = buildBody()
-      let response
-      try {
-        response = await fetch(chatUrl, {
-          method: 'POST',
-          headers: {
-            'content-type': 'application/json',
-            accept: 'text/event-stream',
-            'cache-control': 'no-cache',
-            'accept-encoding': 'identity',
-            'x-model-key': modelKey,
-            'x-model-source': 'system',
-            'user-agent': USER_AGENT,
-            ...buildCosyHeaders({ body: encoded, url: chatUrl, credential }),
-          },
-          body: encoded,
-          signal: signal ?? AbortSignal.timeout(300_000),
-        })
-      } catch (error) {
-        return { ok: false, kind: 'server', status: 0, message: `transport error: ${String(error).slice(0, 160)}` }
-      }
-      if (!response.ok) {
-        const text = await response.text().catch(() => '')
-        if (isQueueBody(text) && attempt < 3) continue
-        return { ok: false, ...classifyStatus(response.status, text), message: `qoder chat [${response.status}]: ${text.slice(0, 300)}` }
-      }
-
+    {
       // Two-layer SSE: data frames hold outer {statusCodeValue?, body:string};
       // body carries the inner OpenAI chunk (choices[].delta.{content,
       // reasoning_content, tool_calls}, usage). The 10605 queue envelope is a
@@ -418,6 +389,12 @@ export class QoderUpstreamClient {
       // timed replay is the pragmatic equivalent). The first real output
       // chunk hands the response to the caller immediately, and the rest is
       // pumped from inside the stream.
+      //
+      // NOTE: there used to be a second, identical fetch in an OUTER loop
+      // before this one whose response was never read. Every turn therefore
+      // opened the model twice: two billed generations, and one abandoned
+      // upstream stream per turn (which the account's concurrency limit counts
+      // against the next turn). One request per attempt, starting here.
       const encoder = new TextEncoder()
       const emitFrom = (controller, inner) => {
         const choice = Array.isArray(inner.choices) ? inner.choices[0] : undefined
@@ -473,33 +450,40 @@ export class QoderUpstreamClient {
           const reader = response.body.getReader()
           const decoder = new TextDecoder()
           let buffer = ''
-          for (;;) {
-            const { done, value } = await reader.read()
-            if (done) return
-            buffer += decoder.decode(value, { stream: true })
-            let index
-            while ((index = buffer.indexOf('\n')) >= 0) {
-              let line = buffer.substring(0, index)
-              buffer = buffer.substring(index + 1)
-              if (line.endsWith('\r')) line = line.slice(0, -1)
-              line = line.trim()
-              if (!line.startsWith('data:')) continue
-              const rawData = line.substring(5).trim()
-              if (!rawData) continue
-              if (rawData === '[DONE]') return
-              let outer
-              try { outer = JSON.parse(rawData) } catch { continue }
-              if (typeof outer.statusCodeValue === 'number' && outer.statusCodeValue !== 200) {
-                yield { kind: 'status', statusCodeValue: outer.statusCodeValue, bodyText: String(outer.body ?? '') }
-                continue
+          try {
+            for (;;) {
+              const { done, value } = await reader.read()
+              if (done) return
+              buffer += decoder.decode(value, { stream: true })
+              let index
+              while ((index = buffer.indexOf('\n')) >= 0) {
+                let line = buffer.substring(0, index)
+                buffer = buffer.substring(index + 1)
+                if (line.endsWith('\r')) line = line.slice(0, -1)
+                line = line.trim()
+                if (!line.startsWith('data:')) continue
+                const rawData = line.substring(5).trim()
+                if (!rawData) continue
+                if (rawData === '[DONE]') return
+                let outer
+                try { outer = JSON.parse(rawData) } catch { continue }
+                if (typeof outer.statusCodeValue === 'number' && outer.statusCodeValue !== 200) {
+                  yield { kind: 'status', statusCodeValue: outer.statusCodeValue, bodyText: String(outer.body ?? '') }
+                  continue
+                }
+                const bodyText = typeof outer.body === 'string' ? outer.body.trim() : ''
+                if (!bodyText) continue
+                if (bodyText === '[DONE]') return
+                let inner
+                try { inner = JSON.parse(bodyText) } catch { continue }
+                yield { kind: 'chunk', chunk: inner }
               }
-              const bodyText = typeof outer.body === 'string' ? outer.body.trim() : ''
-              if (!bodyText) continue
-              if (bodyText === '[DONE]') return
-              let inner
-              try { inner = JSON.parse(bodyText) } catch { continue }
-              yield { kind: 'chunk', chunk: inner }
             }
+          } finally {
+            // An abandoned frame generator must also release the socket: the
+            // gateway counts the open stream against the account's concurrency.
+            try { await reader.cancel() } catch {}
+            try { reader.releaseLock() } catch {}
           }
         }
         const frames = iterateFrames()
@@ -523,20 +507,52 @@ export class QoderUpstreamClient {
 
         const stream = new ReadableStream({
           async start(controller) {
+            let sawFinishFrame = false
+            let sawOutput = false
+            const push = (inner) => {
+              const choice = Array.isArray(inner.choices) ? inner.choices[0] : undefined
+              const delta = choice?.delta ?? {}
+              if ((typeof delta.content === 'string' && delta.content !== '')
+                || (typeof delta.reasoning_content === 'string' && delta.reasoning_content !== '')
+                || (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0)) sawOutput = true
+              const finish = emitFrom(controller, inner)
+              if (finish !== null) sawFinishFrame = true
+              return finish !== null
+            }
             try {
-              emitFrom(controller, firstChunk)
-              for (;;) {
-                const next = await frames.next()
-                if (next.done) break
-                const frame = next.value
-                if (frame.kind === 'status' && frame.statusCodeValue !== 200) break
-                if (frame.kind !== 'chunk') continue
-                emitFrom(controller, frame.chunk)
+              if (push(firstChunk) === false) {
+                for (;;) {
+                  const next = await frames.next()
+                  if (next.done) break
+                  const frame = next.value
+                  if (frame.kind === 'status' && frame.statusCodeValue !== 200) break
+                  if (frame.kind !== 'chunk') continue
+                  if (push(frame.chunk)) break
+                }
+              }
+              if (!sawFinishFrame) {
+                // The gateway closed the stream without a finish frame. Passing
+                // that off as a plain `stop` is what makes a cut answer look
+                // like a finished one; `length` says it was cut.
+                controller.enqueue(encoder.encode('data: ' + JSON.stringify({
+                  choices: [{ index: 0, delta: {}, finish_reason: sawOutput ? 'length' : 'network_error' }],
+                }) + '\n\n'))
+                if (!sawOutput) {
+                  controller.enqueue(encoder.encode('data: ' + JSON.stringify({
+                    error: { message: 'upstream stream ended without any output', type: 'upstream_error' },
+                  }) + '\n\n'))
+                }
               }
               controller.enqueue(encoder.encode('data: [DONE]\n\n'))
               controller.close()
             } catch (error) {
-              controller.error(error)
+              try {
+                controller.enqueue(encoder.encode('data: ' + JSON.stringify({
+                  error: { message: String(error?.message ?? error).slice(0, 300), type: 'upstream_error' },
+                }) + '\n\n'))
+                controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+              } catch {}
+              try { controller.close() } catch {}
             }
           },
           cancel() {

@@ -192,6 +192,23 @@ run. After any hand-edit, check it yourself:
 node docs/validate-provider-config.mjs
 ```
 
+## Stream lifecycle (why a turn never "just stops")
+
+Long turns are where every proxy flaw looks identical: the model goes quiet,
+the spinner keeps turning, nothing errors. Five rules prevent that:
+
+| Situation | What the endpoint does |
+|---|---|
+| Upstream silent for 180 s on an open stream | `error` frame (`type: "upstream_stalled"`) + `finish_reason: "network_error"` + `[DONE]`, and the upstream call is aborted. The client retries instead of hanging behind our heartbeat. |
+| Upstream closes without a finish frame | Finishes with `finish_reason: "length"`. A cut answer is reported as cut, never rewritten to `stop`. |
+| Tool calls streamed, finish labelled `stop` | Corrected to `finish_reason: "tool_calls"`; the mirror case (promising `tool_calls` with no call delivered) still degrades to `stop`. |
+| Turn produced nothing at all | An `error` frame so the client retries rather than accepting an empty assistant message. |
+| Client disconnects mid-stream | The upstream request is aborted, so a cancelled turn stops being generated (and billed) immediately. |
+
+Watchdog interval: `ZC_STREAM_IDLE_TIMEOUT_MS` (default `180000`). The 10 s
+heartbeats keep the *client's* read timer alive but deliberately do not reset
+the watchdog, which only counts real upstream bytes.
+
 ## Design decisions
 
 | Decision | Why |

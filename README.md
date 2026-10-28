@@ -77,6 +77,23 @@ node D:/path/to/zcode-ai-connect/sync-pi-models.mjs
 
 各插件的完整文档(排障、命令、协议细节):[zcode-trae-connect](zcode-trae-connect/) · [zcode-workbuddy-connect](zcode-workbuddy-connect/) · [zcode-qoder-connect](zcode-qoder-connect/)
 
+## 五、长回合为什么不会「突然不动」
+
+三个端点的流收尾是同一套规则,任何一个都不允许把「异常」说成「正常结束」:
+
+| 情况 | 收尾 |
+|---|---|
+| 已开流后上游 180 秒零字节 | `error` 帧 + `finish_reason: "network_error"` + `[DONE]`,并中止上游 |
+| 上游没给 finish 帧就断流 | `finish_reason: "length"`(截断如实上报,绝不改写成 `stop`) |
+| 有 tool_calls 却标成 `stop` | 纠正为 `finish_reason: "tool_calls"` |
+| 整回合只有思考、没有任何产出 | `error` 帧(`empty_answer`),让下游重试 |
+| 客户端断开 | 中止上游请求 / 删除远端会话,不浪费额度也不占并发 |
+
+看门狗间隔:`ZC_STREAM_IDLE_TIMEOUT_MS`(默认 180000ms)。心跳只保活下游,不重置看门狗。
+改动前的症状正是「长时间任务后模型忽然暂停、没有报错」:上游断流被补成 `stop`,下游便把截断当成模型自己收尾。
+
+回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
+
 ## 目录
 
 ```

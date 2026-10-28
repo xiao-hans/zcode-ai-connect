@@ -177,6 +177,28 @@ node docs/validate-provider-config.mjs
 | Snapshot-stream diffing | The upstream re-sends the whole accumulated reply per frame; only strictly-extending frames are new content. See the ADR. |
 | Validate before writing provider config | A stray key does not fail one model, it silently deletes every provider. A temp file plus a schema mirror turns that into a loud error. |
 
+## Stream lifecycle (why a turn never "just stops")
+
+A long turn is where every proxy flaw shows up as the same symptom: the model
+goes quiet, the spinner keeps turning, nothing errors. Five rules keep that
+from happening, and they are the reason to prefer this endpoint over a plain
+passthrough:
+
+| Situation | What the endpoint does |
+|---|---|
+| Upstream sends nothing for 180 s on an already-open stream | Writes an `error` frame with `type: "upstream_stalled"`, finishes with `finish_reason: "network_error"`, closes with `[DONE]`, and aborts the upstream call. The client retries; it never hangs behind our heartbeat. |
+| Upstream closes the stream without a finish frame | Finishes with `finish_reason: "length"` — a cut answer is reported as cut. It is **never** rewritten to `stop`, which is what made truncated answers look like "the model decided it was done". |
+| The turn streamed tool calls but the upstream labelled it `stop` | The finish reason is corrected to `tool_calls`, because clients gate their agent loop on it. |
+| The turn produced nothing at all (thinking only) | An `error` frame (`type: "empty_answer"`) is emitted so the client retries instead of accepting an empty assistant message. |
+| The client disconnects mid-stream | The upstream request is aborted and the remote session deleted, so a cancelled turn costs nothing and cannot occupy the account's concurrency budget (Trae allows 2 sessions). |
+
+The watchdog interval is configurable: `ZC_STREAM_IDLE_TIMEOUT_MS` (default
+`180000`). Heartbeats (`: heartbeat` every 10 s) are still emitted — they keep
+the *client's* read timer alive — but they deliberately do **not** reset the
+watchdog, which only listens to real upstream bytes.
+
+Behaviour is covered by `tests/test-stream-guard.mjs`.
+
 ## Notes
 
 - **No tool calling.** The Trae remote-session protocol is a plain-text

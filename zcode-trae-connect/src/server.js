@@ -30,6 +30,18 @@ const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
 const CATALOG_REFRESH_MS = 30 * 60 * 1000
 /** SSE comment cadence during upstream silence, well under any read timeout. */
 const HEARTBEAT_MS = 10_000
+/**
+ * How long the server tolerates TOTAL upstream silence before it gives up.
+ *
+ * Heartbeats keep the client's read timer alive, which is what makes a dead
+ * upstream invisible: the connection stays open, the client keeps waiting and
+ * the turn never ends — the "model just stopped moving" report. Reasoning
+ * streams normally push a frame every few hundred ms and a queued request
+ * emits `progress_notice` frames, so a multi-minute silence is a stalled
+ * upstream, not a slow model. Giving up explicitly turns that silence into a
+ * retryable error instead of an endless spinner.
+ */
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
 
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS = {
@@ -162,13 +174,16 @@ async function collectCompletion(body, model) {
  * ignores comment lines, so this keeps intermediaries and read timers alive
  * without inventing protocol events.
  */
-function createStreamNormalizer(res, fallbackModel) {
+function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
   let model = fallbackModel
   let id = `chatcmpl-${Date.now()}`
   let created = Math.floor(Date.now() / 1000)
   let done = false
   let settled = false
+  /** Any tool_call delta reached the wire: the finish reason must say so. */
+  let toolCallsSent = false
   let heartbeat
+  let idleTimer
   // Reasoning-order guarantee: a client pins the thinking panel at the slot
   // where the FIRST reasoning delta arrives, so the first content delta is
   // held until the order is known - either reasoning shows up (the held
@@ -194,7 +209,37 @@ function createStreamNormalizer(res, fallbackModel) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`)
   }
 
+  /**
+   * Upstream-liveness watchdog. Re-armed on every upstream byte, so only real
+   * silence counts (our own heartbeats do NOT re-arm it — that would keep
+   * masking a dead upstream forever). Firing ends the response with an error
+   * frame and a `network_error` finish reason: a client that gets that retries,
+   * where a bare hanging socket leaves it spinning.
+   */
+  const armIdle = () => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      if (done || settled) return
+      logger?.warn?.(`[trae] upstream silent for ${STREAM_IDLE_TIMEOUT_MS}ms — aborting the turn`)
+      write({
+        error: {
+          message: `upstream produced no data for ${STREAM_IDLE_TIMEOUT_MS}ms`,
+          type: 'upstream_stalled',
+          code: 'upstream_stalled',
+        },
+      })
+      emitFinish('network_error')
+      done = true
+      if (res.writable) res.end('data: [DONE]\n\n')
+      // Telling the upstream is what frees the connection (and, for the
+      // chat_sessions path, stops a remote turn we no longer read).
+      onStall?.()
+    }, STREAM_IDLE_TIMEOUT_MS)
+    idleTimer.unref?.()
+  }
+
   bumpHeartbeat()
+  armIdle()
 
   const emitDelta = carry => {
     write({
@@ -230,14 +275,22 @@ function createStreamNormalizer(res, fallbackModel) {
   const emitFinish = finishReason => {
     if (settled) return
     settled = true
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
     flushHeldContent()
     flushLateReasoning()
+    // A turn that streamed tool calls must say `tool_calls` even when the
+    // upstream labelled it `stop`: clients gate their agent loop on this
+    // finish reason, and a `stop` next to pending calls ends the task
+    // instead of running them.
+    const wireFinish = toolCallsSent && (finishReason === 'stop' || finishReason === 'end')
+      ? 'tool_calls'
+      : finishReason
     write({
       id,
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      choices: [{ index: 0, delta: {}, finish_reason: wireFinish }],
     })
   }
 
@@ -300,6 +353,7 @@ function createStreamNormalizer(res, fallbackModel) {
     // emitting directly keeps the reasoning-before-answer ordering.
     if (Array.isArray(delta['tool_calls']) && delta['tool_calls'].length > 0) {
       contentStarted = true
+      toolCallsSent = true
       emitDelta({ tool_calls: delta['tool_calls'] })
     }
 
@@ -321,6 +375,7 @@ function createStreamNormalizer(res, fallbackModel) {
 
   return {
     push(text) {
+      armIdle()
       let sawEnd = false
       for (const line of text.split('\n')) {
         const trimmed = line.trim()
@@ -344,15 +399,23 @@ function createStreamNormalizer(res, fallbackModel) {
     /** Finish the response: terminate with the OpenAI [DONE] sentinel. */
     end() {
       if (heartbeat !== undefined) clearInterval(heartbeat)
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
       if (done) return
-      flushHeldContent()
-      flushLateReasoning()
+      if (!settled) {
+        // The upstream closed without ever naming a finish reason. Reporting
+        // that as a plain `stop` is what turns a cut-off answer into "the model
+        // decided to stop" — the client then ends the task silently. `length`
+        // says "this was cut", which every client understands.
+        logger?.warn?.('[trae] upstream stream ended without a finish frame — closing as a truncated answer')
+        emitFinish('length')
+      }
       done = true
       if (res.writable) res.end('data: [DONE]\n\n')
     },
     /** Stop the heartbeat without ending the response (client went away). */
     dispose() {
       if (heartbeat !== undefined) clearInterval(heartbeat)
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
       done = true
     },
   }
@@ -607,7 +670,17 @@ export function createTraeServer(options) {
     const client = variant.client ?? options.client
 
     const controller = new AbortController()
-    req.on('close', () => controller.abort())
+    // Disconnect detection: on Node >= 16 `req` 'close' fires once the request
+    // BODY has been received, not when the client goes away — as a disconnect
+    // signal it never fires (the listener is even attached after the event),
+    // which leaks the upstream call for every cancelled turn. `res` 'close'
+    // fires on the real socket close; `writableEnded` separates that from a
+    // response we finished ourselves.
+    res.on('close', () => {
+      if (res.writableEnded) return
+      logger.warn('[trae] client disconnected mid-stream — releasing the upstream turn')
+      controller.abort('client disconnected')
+    })
     const result = await client.chatStream(credential, routed, controller.signal)
 
     if (!result.ok) {
@@ -641,7 +714,10 @@ export function createTraeServer(options) {
       Connection: 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
-    const normalizer = createStreamNormalizer(res, model)
+    const normalizer = createStreamNormalizer(res, model, {
+      logger,
+      onStall: () => controller.abort('upstream stalled'),
+    })
     const decoder = new TextDecoder()
     const reader = result.response.body.getReader()
     try {
@@ -654,10 +730,12 @@ export function createTraeServer(options) {
     } catch (error) {
       logger.warn(`[trae] upstream stream failed mid-flight: ${String(error)}`)
       // Always close the SSE stream properly: a client left waiting for a
-      // terminator that never arrives hangs the whole conversation.
+      // terminator that never arrives hangs the whole conversation. A client
+      // that already went away gets nothing written to its socket.
       normalizer.end()
     } finally {
       normalizer.dispose()
+      void result.response.body.cancel?.().catch?.(() => {})
     }
   }
 

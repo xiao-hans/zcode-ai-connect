@@ -24,6 +24,15 @@ const REQUEST_BODY_LIMIT = 64 * 1024 * 1024
 const CATALOG_REFRESH_MS = 30 * 60 * 1000
 /** SSE comment cadence during upstream silence, well under any read timeout. */
 const HEARTBEAT_MS = 10_000
+/**
+ * Total upstream silence tolerated before the turn is given up.
+ *
+ * Heartbeats keep the client's read timer alive, which is exactly what hides a
+ * dead upstream: the socket stays open, the client keeps waiting, nothing ever
+ * ends — the "model just stopped moving" report. A multi-minute silence on an
+ * already-open stream is a stall, not a slow model.
+ */
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
 
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS = {
@@ -203,7 +212,7 @@ function completeToolCalls(accumulator) {
  * ignores comment lines, so this keeps intermediaries and read timers alive
  * without inventing protocol events.
  */
-function createStreamNormalizer(res, fallbackModel) {
+function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
   const pending = new Map()
   let model = fallbackModel
   let id = `chatcmpl-${Date.now()}`
@@ -212,6 +221,7 @@ function createStreamNormalizer(res, fallbackModel) {
   let done = false
   let settled = false
   let heartbeat
+  let idleTimer
   // Reasoning-order guarantee: a client pins the thinking panel at the slot
   // where the FIRST reasoning delta arrives, so the first content delta is
   // held until the order is known - either reasoning shows up (the held
@@ -237,7 +247,33 @@ function createStreamNormalizer(res, fallbackModel) {
     res.write(`data: ${JSON.stringify(payload)}\n\n`)
   }
 
+  /**
+   * Upstream-liveness watchdog. Re-armed on every upstream byte only, so our
+   * own heartbeats cannot keep it quiet — the whole point is to notice an
+   * upstream that went silent while the client is still waiting.
+   */
+  const armIdle = () => {
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
+    idleTimer = setTimeout(() => {
+      if (done || settled) return
+      logger?.warn?.(`[workbuddy] upstream silent for ${STREAM_IDLE_TIMEOUT_MS}ms — aborting the turn`)
+      write({
+        error: {
+          message: `upstream produced no data for ${STREAM_IDLE_TIMEOUT_MS}ms`,
+          type: 'upstream_stalled',
+          code: 'upstream_stalled',
+        },
+      })
+      emitToolCallsAndFinish('network_error')
+      done = true
+      if (res.writable) res.end('data: [DONE]\n\n')
+      onStall?.()
+    }, STREAM_IDLE_TIMEOUT_MS)
+    idleTimer.unref?.()
+  }
+
   bumpHeartbeat()
+  armIdle()
 
   const emitDelta = carry => {
     write({
@@ -273,6 +309,7 @@ function createStreamNormalizer(res, fallbackModel) {
   const emitToolCallsAndFinish = finishReason => {
     if (settled) return
     settled = true
+    if (idleTimer !== undefined) clearTimeout(idleTimer)
     flushHeldContent()
     flushLateReasoning()
     const calls = completeToolCalls(pending)
@@ -289,8 +326,10 @@ function createStreamNormalizer(res, fallbackModel) {
     // A finish that promises tool calls but delivered none (every pending
     // call was nameless and dropped) must not reach the client as
     // `finish_reason: "tool_calls"` — a turn that ends on that contract
-    // without any call derails the client's loop.
-    const wireFinish = toolCallsSent ? finishReason
+    // without any call derails the client's loop. The mirror case matters as
+    // much: calls that DID go out must not be reported as `stop`.
+    const wireFinish = toolCallsSent
+      ? (finishReason === 'stop' || finishReason === 'end' ? 'tool_calls' : finishReason)
       : (finishReason === 'tool_calls' || finishReason === 'function_call') ? 'stop'
       : finishReason
     write({
@@ -377,6 +416,7 @@ function createStreamNormalizer(res, fallbackModel) {
 
   return {
     push(text) {
+      armIdle()
       let sawEnd = false
       for (const line of text.split('\n')) {
         const trimmed = line.trim()
@@ -400,15 +440,23 @@ function createStreamNormalizer(res, fallbackModel) {
     /** Finish the response: close any dangling tool calls, then terminate. */
     end() {
       if (heartbeat !== undefined) clearInterval(heartbeat)
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
       if (done) return
       if (pending.size > 0) emitToolCallsAndFinish('tool_calls')
-      else { flushHeldContent(); flushLateReasoning() }
+      else if (!settled) {
+        // The upstream closed without a finish frame: a cut answer, not a
+        // finished one. Reporting `stop` here is what lets a truncated
+        // response pass for "the model decided it was done".
+        logger?.warn?.('[workbuddy] upstream stream ended without a finish frame — closing as a truncated answer')
+        emitToolCallsAndFinish('length')
+      } else { flushHeldContent(); flushLateReasoning() }
       done = true
       if (res.writable) res.end('data: [DONE]\n\n')
     },
     /** Stop the heartbeat without ending the response (client went away). */
     dispose() {
       if (heartbeat !== undefined) clearInterval(heartbeat)
+      if (idleTimer !== undefined) clearTimeout(idleTimer)
       done = true
     },
   }
@@ -662,7 +710,17 @@ export function createWorkBuddyServer(options) {
     const prepared = prepareChatBody(routed)
 
     const controller = new AbortController()
-    req.on('close', () => controller.abort())
+    // Disconnect detection: on Node >= 16 `req` 'close' fires once the request
+    // BODY has been received — never when the client goes away — so a cancel
+    // went unnoticed and the upstream kept generating into a dead socket
+    // (billable, and it counts against the account's concurrency limit).
+    // `res` 'close' is the real socket close; `writableEnded` tells a finished
+    // response apart from an abandoned one.
+    res.on('close', () => {
+      if (res.writableEnded) return
+      logger.warn('[workbuddy] client disconnected mid-stream — releasing the upstream turn')
+      controller.abort('client disconnected')
+    })
     const result = await client.chatStream(credential, prepared, controller.signal)
 
     if (!result.ok) {
@@ -696,7 +754,10 @@ export function createWorkBuddyServer(options) {
       'Connection': 'keep-alive',
       'X-Accel-Buffering': 'no',
     })
-    const normalizer = createStreamNormalizer(res, model)
+    const normalizer = createStreamNormalizer(res, model, {
+      logger,
+      onStall: () => controller.abort('upstream stalled'),
+    })
     const decoder = new TextDecoder()
     const reader = result.response.body.getReader()
     try {
@@ -713,6 +774,7 @@ export function createWorkBuddyServer(options) {
       normalizer.end()
     } finally {
       normalizer.dispose()
+      void result.response.body.cancel?.().catch?.(() => {})
     }
   }
 

@@ -280,25 +280,34 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 		const decoder = new TextDecoder()
 		let buffer = ''
 		let eventName = ''
-		for (;;) {
-			const { done, value } = await reader.read()
-			if (done) return
-			buffer += decoder.decode(value, { stream: true })
-			let index
-			while ((index = buffer.indexOf('\n')) >= 0) {
-				const line = buffer.slice(0, index).replace(/\r$/, '')
-				buffer = buffer.slice(index + 1)
-				if (line.startsWith('event:')) {
-					eventName = line.slice(6).trim()
-					continue
+		try {
+			for (;;) {
+				const { done, value } = await reader.read()
+				if (done) return
+				buffer += decoder.decode(value, { stream: true })
+				let index
+				while ((index = buffer.indexOf('\n')) >= 0) {
+					const line = buffer.slice(0, index).replace(/\r$/, '')
+					buffer = buffer.slice(index + 1)
+					if (line.startsWith('event:')) {
+						eventName = line.slice(6).trim()
+						continue
+					}
+					if (!line.startsWith('data:')) continue
+					const raw = line.slice(5).trim()
+					if (raw === '' || raw === '[DONE]') return
+					let record
+					try { record = JSON.parse(raw) } catch { continue }
+					yield { eventName, record }
 				}
-				if (!line.startsWith('data:')) continue
-				const raw = line.slice(5).trim()
-				if (raw === '' || raw === '[DONE]') return
-				let record
-				try { record = JSON.parse(raw) } catch { continue }
-				yield { eventName, record }
 			}
+		} finally {
+			// Abandoning the generator (client gone, stall watchdog) must also
+			// release the gateway connection: without this the upstream keeps
+			// generating into a socket nobody reads, burning the account's
+			// concurrency budget until the next turn is queued instead of served.
+			try { await reader.cancel() } catch {}
+			try { reader.releaseLock() } catch {}
 		}
 	}
 
@@ -372,30 +381,85 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 			const firstChunks = deltaChunks(record)
 			const stream = new ReadableStream({
 				async start(controller) {
+					/** A terminal frame from the gateway was forwarded. */
+					let sawTerminal = false
+					/** Something a client can actually use reached the wire. */
+					let emittedContent = false
+					let emittedToolCalls = false
+					const emit = (chunk) => controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+					const finish = (finishReason) => {
+						emit({ choices: [{ index: 0, delta: {}, finish_reason: finishReason }] })
+						sawTerminal = true
+					}
 					try {
-						for (const chunk of firstChunks) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+						for (const chunk of firstChunks) {
+							const delta = chunk.choices[0].delta
+							if (typeof delta.content === 'string') emittedContent = true
+							if (Array.isArray(delta.tool_calls)) emittedToolCalls = true
+							emit(chunk)
+						}
 						for (;;) {
 							const next = await frames.next()
 							if (next.done) break
 							const { eventName: ev, record: rec } = next.value
-							if (typeof rec.statusCodeValue === 'number' && rec.statusCodeValue !== 200) break
-							if (ev === 'error') break
+							if (typeof rec.statusCodeValue === 'number' && rec.statusCodeValue !== 200) {
+								// Mid-stream refusal: the answer is dead, say why.
+								emit({ error: { message: `upstream ${rec.statusCodeValue}: ${String(rec.body ?? '').slice(0, 240)}`, type: 'upstream_error' } })
+								finish('network_error')
+								break
+							}
+							if (ev === 'error') {
+								const failure = classifyLlmError({ code: rec.code, message: rec.message ?? '', extra: rec.extra })
+								emit({ error: { message: failure.message, type: failure.kind } })
+								finish('network_error')
+								break
+							}
 							if (ev === 'token_usage') {
-								controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [], usage: { prompt_tokens: rec.prompt_tokens, completion_tokens: rec.completion_tokens, total_tokens: rec.total_tokens } })}\n\n`))
+								emit({ choices: [], usage: { prompt_tokens: rec.prompt_tokens, completion_tokens: rec.completion_tokens, total_tokens: rec.total_tokens } })
 								continue
 							}
 							if (ev === 'done') {
-								const fr = typeof rec.finish_reason === 'string' && rec.finish_reason !== '' ? rec.finish_reason : 'stop'
-								controller.enqueue(encoder.encode(`data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: fr }] })}\n\n`))
-								controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+								if (!emittedContent && !emittedToolCalls) {
+									// A turn that only thought and then stopped leaves the agent
+									// with an empty assistant message: the task silently ends
+									// ("the model just stopped moving"). Surface it so the client
+									// retries instead of accepting an empty answer.
+									emit({ error: { message: 'upstream returned an empty answer (reasoning only)', type: 'empty_answer' } })
+									finish('network_error')
+									break
+								}
+								// The gateway labels a tool-call turn `stop` as often
+								// as `tool_calls`; the caller's loop keys off this
+								// value, so a turn that DID stream calls must say so.
+								const raw = typeof rec.finish_reason === 'string' && rec.finish_reason !== '' ? rec.finish_reason : 'stop'
+								const reason = emittedToolCalls && (raw === 'stop' || raw === 'end') ? 'tool_calls' : raw
+								finish(reason)
 								break
 							}
-							for (const chunk of deltaChunks(rec)) controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`))
+							for (const chunk of deltaChunks(rec)) {
+								const delta = chunk.choices[0].delta
+								if (typeof delta.content === 'string' && delta.content !== '') emittedContent = true
+								if (Array.isArray(delta.tool_calls) && delta.tool_calls.length > 0) emittedToolCalls = true
+								emit(chunk)
+							}
 						}
-						controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-						controller.close()
+						if (!sawTerminal) {
+							// The gateway closed the SSE without a done frame. Reporting
+							// a bare end (or a fabricated `stop`) makes a cut-off answer
+							// look like a finished one; `length` is the honest signal.
+							if (emittedContent || emittedToolCalls) finish('length')
+							else {
+								emit({ error: { message: 'upstream stream ended without any output', type: 'upstream_error' } })
+								finish('network_error')
+							}
+						}
 					} catch (error) {
-						controller.error(error)
+						try {
+							emit({ error: { message: String(error?.message ?? error).slice(0, 300), type: 'upstream_error' } })
+						} catch {}
+					} finally {
+						controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+						try { controller.close() } catch {}
 					}
 				},
 				cancel() {

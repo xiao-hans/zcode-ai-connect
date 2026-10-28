@@ -638,7 +638,11 @@ async function* readSse(response) {
 			}
 		}
 	} finally {
-		reader.releaseLock();
+		// Releasing the lock is not enough: an early exit (terminal frame,
+		// client cancel, stall) must cancel the body, otherwise the gateway
+		// keeps streaming into a socket nobody reads.
+		try { await response.body?.cancel?.() } catch {}
+		try { reader.releaseLock() } catch {}
 	}
 }
 
@@ -753,7 +757,9 @@ export async function* streamChat(token, model, messages, signal, options = {}, 
 		response.body?.cancel?.().catch?.(() => {});
 	}
 	if (!sawTerminal && !emittedAny) throw new Error("trae events stream ended without a done event");
-	yield { type: "done" };
+	// A stream that ends without a terminal frame is a CUT answer, not a
+	// finished one: the consumer must be able to tell the two apart.
+	yield { type: "done", truncated: !sawTerminal };
 }
 
 /** Fetch the account's remaining credits (entitlement usage).
@@ -882,7 +888,7 @@ export function piecesToOpenAIStream(iterator, { model, first, onDone }) {
 		}
 		if (piece?.type === "done") {
 			finished = true;
-			return chunk({}, "stop");
+			return chunk({}, piece.truncated === true ? "length" : "stop");
 		}
 		return undefined; // the session broadcast never reaches the wire
 	};
