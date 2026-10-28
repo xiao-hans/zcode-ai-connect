@@ -125,8 +125,9 @@ async function collectCompletion(body, model) {
 
   const message = { role: 'assistant', content: content === '' ? null : content }
   if (reasoning !== '') message['reasoning_content'] = reasoning
-  if (toolCalls.size > 0) {
-    message['tool_calls'] = completeToolCalls(toolCalls).map(call => ({
+  const completed = completeToolCalls(toolCalls)
+  if (completed.length > 0) {
+    message['tool_calls'] = completed.map(call => ({
       id: call.id,
       type: call.type,
       function: call.function,
@@ -172,6 +173,11 @@ function mergeToolCalls(accumulator, fragments) {
 function completeToolCalls(accumulator) {
   return [...accumulator.entries()]
     .sort((a, b) => a[0] - b[0])
+    // A nameless call is worse than a missing one: the client stores it in
+    // history, and every later turn then fails upstream with 400 code 11133
+    // ("the request parameters were rejected") — deepseek's provider rejects
+    // `name: ""` outright. A truncated stream can produce one; drop it.
+    .filter(([, call]) => call.name !== '')
     .map(([index, call]) => ({
       index,
       id: call.id === '' ? `call_${Math.random().toString(36).slice(2, 11)}` : call.id,
@@ -280,12 +286,19 @@ function createStreamNormalizer(res, fallbackModel) {
         choices: [{ index: 0, delta: { role: 'assistant', content: null, tool_calls: calls }, finish_reason: null }],
       })
     }
+    // A finish that promises tool calls but delivered none (every pending
+    // call was nameless and dropped) must not reach the client as
+    // `finish_reason: "tool_calls"` — a turn that ends on that contract
+    // without any call derails the client's loop.
+    const wireFinish = toolCallsSent ? finishReason
+      : (finishReason === 'tool_calls' || finishReason === 'function_call') ? 'stop'
+      : finishReason
     write({
       id,
       object: 'chat.completion.chunk',
       created,
       model,
-      choices: [{ index: 0, delta: {}, finish_reason: finishReason }],
+      choices: [{ index: 0, delta: {}, finish_reason: wireFinish }],
     })
   }
 

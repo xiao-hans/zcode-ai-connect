@@ -219,9 +219,67 @@ function normalizeToolChoice(obj) {
 }
 
 /**
+ * Repair conversation history that carries an assistant tool_call with an
+ * empty `function.name`.
+ *
+ * A truncated model stream used to be able to yield a nameless call, and a
+ * client that stored it in history then failed on EVERY later turn with
+ * HTTP 400 code 11133 ("the request parameters were rejected") — the
+ * deepseek provider rejects `name: ""` outright while other providers
+ * tolerate it, so the failure looked model-specific and the session
+ * unrecoverable. Healing here runs before the upstream sees the body:
+ * a name recoverable from the paired `tool` message's `name` field is
+ * backfilled; otherwise the nameless call is dropped together with its
+ * `tool` result, because a tool message whose `tool_call_id` references
+ * nothing is its own rejection risk.
+ */
+function normalizeToolCallHistory(obj) {
+  const messages = obj['messages']
+  if (!Array.isArray(messages)) return
+  const nameByToolCallId = new Map()
+  for (const message of messages) {
+    if (!isObject(message) || message['role'] !== 'tool') continue
+    const id = message['tool_call_id']
+    if (typeof id !== 'string' || id === '') continue
+    if (typeof message['name'] === 'string' && message['name'] !== '') nameByToolCallId.set(id, message['name'])
+  }
+  for (let i = 0; i < messages.length; i += 1) {
+    const message = messages[i]
+    if (!isObject(message) || message['role'] !== 'assistant' || !Array.isArray(message['tool_calls'])) continue
+    const kept = []
+    const droppedIds = []
+    for (const call of message['tool_calls']) {
+      if (!isObject(call)) continue
+      const fn = isObject(call['function']) ? call['function'] : undefined
+      const id = typeof call['id'] === 'string' ? call['id'] : ''
+      let name = typeof fn?.['name'] === 'string' ? fn['name'] : ''
+      if (name === '' && id !== '' && nameByToolCallId.has(id)) name = nameByToolCallId.get(id)
+      if (name === '') {
+        if (id !== '') droppedIds.push(id)
+        continue
+      }
+      kept.push(call)
+    }
+    if (kept.length === message['tool_calls'].length) continue
+    if (kept.length > 0) message['tool_calls'] = kept
+    else delete message['tool_calls']
+    for (const id of droppedIds) {
+      for (let j = i + 1; j < messages.length; j += 1) {
+        const candidate = messages[j]
+        if (isObject(candidate) && candidate['role'] === 'tool' && candidate['tool_call_id'] === id) {
+          messages.splice(j, 1)
+          j -= 1
+        }
+      }
+    }
+  }
+}
+
+/**
  * Normalize an OpenAI chat-completions body for the WorkBuddy upstream:
  * force `stream: true` (the upstream rejects non-streaming), flatten
- * `tool_choice`, and rewrite `developer` messages as `system`.
+ * `tool_choice`, rewrite `developer` messages as `system`, and repair
+ * history polluted with nameless tool calls.
  */
 export function prepareChatBody(source) {
   let body
@@ -234,6 +292,7 @@ export function prepareChatBody(source) {
   body['stream'] = true
   normalizeDeveloperRole(body)
   normalizeToolChoice(body)
+  normalizeToolCallHistory(body)
   return JSON.stringify(body)
 }
 
