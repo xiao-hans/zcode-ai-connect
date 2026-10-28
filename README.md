@@ -51,13 +51,23 @@
 node <插件>/bin/cli.mjs setup      # 仅 trae / workbuddy 需要;qoder / qwenwork 开箱即用
 ```
 
-模型选择器中出现 WorkBuddy / Trae / Qoder 分组。
+模型选择器中出现 WorkBuddy / Trae / Qoder / QwenWork 分组。
+
+### 不想 clone?用 npm 安装
+
+四个工具与 pi 启动扩展都发布在 npm,全局安装后把 `plugins.dirs` 指向 npm 全局
+`node_modules` 里的对应包目录即可(端点 CLI 也可直接 `npx zcode-qwenwork-connect serve`):
+
+```sh
+npm i -g zcode-trae-connect zcode-workbuddy-connect zcode-qoder-connect zcode-qwenwork-connect
+```
 
 ## 三、接入 pi
 
 ```sh
-# 1. 安装启动扩展(打开 pi 自动拉起三个端点)
+# 1. 安装启动扩展(打开 pi 自动拉起端点;git clone 安装或 npm 包二选一)
 pi install D:/path/to/zcode-ai-connect/pi-connect-services
+# 或: pi install npm:pi-connect-services
 
 # 2. 生成/刷新 pi 的供应商与模型名册(从三个端点实时拉取,含思考档位映射)
 node D:/path/to/zcode-ai-connect/sync-pi-models.mjs

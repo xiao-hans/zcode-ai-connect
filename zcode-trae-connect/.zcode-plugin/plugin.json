@@ -26,7 +26,7 @@
         "hooks": [
           {
             "type": "process",
-            "command": "C:/nvm4w/nodejs/node.exe",
+            "command": "node",
             "args": [
               "${ZCODE_PLUGIN_ROOT}/hooks/service-ensure.mjs"
             ],

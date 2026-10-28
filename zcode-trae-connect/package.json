@@ -1,16 +1,41 @@
 {
   "name": "zcode-trae-connect",
   "version": "1.0.0",
-  "private": true,
   "description": "Expose Trae desktop-app models (CN and international) through a loopback OpenAI-compatible endpoint, for use as a model provider in ZCode or any OpenAI-compatible client.",
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "xiao-hans"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-hans/zcode-ai-connect.git",
+    "directory": "zcode-trae-connect"
+  },
+  "homepage": "https://github.com/xiao-hans/zcode-ai-connect/tree/main/zcode-trae-connect#readme",
+  "bugs": {
+    "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
+  },
+  "os": [
+    "win32"
+  ],
   "engines": {
     "node": ">=18.17.0"
   },
   "bin": {
-    "zcode-trae-connect": "./bin/cli.mjs"
+    "zcode-trae-connect": "bin/cli.mjs"
   },
+  "files": [
+    ".zcode-plugin",
+    "bin",
+    "src",
+    "hooks",
+    "skills",
+    "docs",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md"
+  ],
   "exports": {
     ".": "./src/upstream.js",
     "./server": "./src/server.js",

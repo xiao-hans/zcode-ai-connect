@@ -7,33 +7,44 @@
     "zh-CN": "把千问办公(QwenWork)桌面 App 的模型(Qwen3.8-Flash、Pro、Qwen3.8-Max)复用桌面登录零配置接入 ZCode 的模型供应商。"
   },
   "author": {
-    "name": "vendored from xiao-hans/pi-provider-qwenwork (lib lineage: gaoqiaoliangjie666/dsh-qwen-connect, MIT)"
+    "name": "xiao-hans",
+    "url": "https://github.com/xiao-hans"
   },
   "license": "MIT",
   "type": "module",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-hans/zcode-ai-connect.git",
+    "directory": "zcode-qwenwork-connect"
+  },
+  "homepage": "https://github.com/xiao-hans/zcode-ai-connect/tree/main/zcode-qwenwork-connect#readme",
+  "bugs": {
+    "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
+  },
+  "os": [
+    "win32"
+  ],
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "bin": {
+    "zcode-qwenwork-connect": "bin/cli.mjs"
+  },
+  "files": [
+    ".zcode-plugin",
+    "bin",
+    "hooks",
+    "skills",
+    "src",
+    "vendor",
+    "LICENSE",
+    "README.md"
+  ],
+  "dependencies": {},
   "keywords": [
     "qwenwork",
     "qwen",
     "openai-compatible",
-    "provider",
-    "qwen3.8"
-  ],
-  "skills": "skills",
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "process",
-            "command": "C:/nvm4w/nodejs/node.exe",
-            "args": [
-              "${ZCODE_PLUGIN_ROOT}/hooks/service-ensure.mjs"
-            ],
-            "timeoutMs": 60000,
-            "statusMessage": "Starting the QwenWork endpoint"
-          }
-        ]
-      }
-    ]
-  }
+    "provider"
+  ]
 }

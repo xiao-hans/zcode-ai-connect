@@ -1,16 +1,42 @@
 {
   "name": "zcode-workbuddy-connect",
   "version": "1.0.0",
-  "private": true,
   "description": "Expose WorkBuddy desktop-app models (CN) through a loopback OpenAI-compatible endpoint, for use as a model provider in ZCode or any OpenAI-compatible client.",
   "type": "module",
   "license": "MIT",
+  "author": {
+    "name": "xiao-hans"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-hans/zcode-ai-connect.git",
+    "directory": "zcode-workbuddy-connect"
+  },
+  "homepage": "https://github.com/xiao-hans/zcode-ai-connect/tree/main/zcode-workbuddy-connect#readme",
+  "bugs": {
+    "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
+  },
+  "os": [
+    "win32"
+  ],
   "engines": {
     "node": ">=18.17.0"
   },
   "bin": {
-    "zcode-workbuddy-connect": "./bin/cli.mjs"
+    "zcode-workbuddy-connect": "bin/cli.mjs"
   },
+  "files": [
+    ".zcode-plugin",
+    "bin",
+    "src",
+    "hooks",
+    "skills",
+    "docs",
+    "LICENSE",
+    "NOTICE.md",
+    "README.md",
+    "!src/server.js.bak-order"
+  ],
   "exports": {
     ".": "./src/upstream.js",
     "./server": "./src/server.js",

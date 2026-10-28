@@ -1,0 +1,43 @@
+{
+  "name": "hermes-connect-services",
+  "version": "1.0.0",
+  "description": "Bring zcode-ai-connect's four loopback endpoints to hermes: lazy-start them on session start and sync them into hermes' config.yaml as OpenAI-compatible providers.",
+  "type": "module",
+  "license": "MIT",
+  "author": {
+    "name": "xiao-hans",
+    "url": "https://github.com/xiao-hans"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-hans/zcode-ai-connect.git",
+    "directory": "hermes-connect-services"
+  },
+  "homepage": "https://github.com/xiao-hans/zcode-ai-connect/tree/main/hermes-connect-services#readme",
+  "bugs": {
+    "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "files": [
+    "bin",
+    "src",
+    "README.md",
+    "LICENSE"
+  ],
+  "bin": {
+    "hermes-connect-ensure": "bin/ensure-services.mjs",
+    "hermes-connect-sync": "bin/sync-hermes-config.mjs"
+  },
+  "dependencies": {},
+  "keywords": [
+    "hermes",
+    "openai-compatible",
+    "loopback",
+    "trae",
+    "workbuddy",
+    "qoder",
+    "qwenwork"
+  ]
+}
