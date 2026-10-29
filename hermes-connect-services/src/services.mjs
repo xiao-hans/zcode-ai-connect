@@ -26,7 +26,10 @@ import { fileURLToPath } from 'node:url';
  * `node_modules` is what we want — otherwise every path would gain a second
  * `node_modules`.
  */
-const PACKAGE_PARENT = dirname(dirname(dirname(fileURLToPath(import.meta.url))));
+const HERE_FILE = fileURLToPath(import.meta.url);
+/** `<…>/hermes-connect-services` — the package root, whatever layout it sits in. */
+const PACKAGE_ROOT = dirname(dirname(HERE_FILE));
+const PACKAGE_PARENT = dirname(PACKAGE_ROOT);
 export const SUITE_ROOT = resolve(
   process.env.AI_CONNECT_SUITE_ROOT
   ?? (basename(PACKAGE_PARENT) === 'node_modules' ? dirname(PACKAGE_PARENT) : PACKAGE_PARENT),
@@ -70,12 +73,21 @@ const toolDirCache = new Map();
 /**
  * Where a sibling tool actually lives.
  *
- * Three layouts have to work, because this module ships both as a git checkout
- * and as an npm package:
+ * Five layouts have to work, because this module ships both as a git checkout
+ * and as an npm package, and npm's layout is not the only one:
  *
  *   <repo>/hermes-connect-services/ + <repo>/zcode-trae-connect/   (checkout)
  *   <proj>/node_modules/zcode-trae-connect/                        (npm install)
  *   <prefix>/node_modules/zcode-trae-connect/                      (npm -g)
+ *   …/node_modules/.pnpm/hermes…@x/node_modules/zcode-trae-connect (pnpm)
+ *   …/node_modules/.pnpm/hermes…@x/node_modules/zcode-trae-connect (yarn berry)
+ *
+ * The last two are why the first candidate is `<package parent>/<tool>` and
+ * not anything derived from `SUITE_ROOT`: under pnpm the package root is
+ * `<…>/node_modules/.pnpm/<pkg>/node_modules/<pkg>`, so `SUITE_ROOT` lands on
+ * `.pnpm/<pkg>` — one level too deep, and every derived path misses. The
+ * package's own parent directory, by contrast, is where the package manager
+ * puts that package's resolved dependencies in every one of these layouts.
  *
  * `AI_CONNECT_SUITE_ROOT` wins when set, which is the escape hatch for any
  * layout not covered above.
@@ -84,14 +96,18 @@ export function toolDir(service) {
   const cached = toolDirCache.get(service.id);
   if (cached) return cached;
 
+  // Universal: the directory holding this package's resolved siblings.
+  const alongside = join(PACKAGE_PARENT, service.tool);
+
   const candidates = [
     process.env.AI_CONNECT_SUITE_ROOT ? join(process.env.AI_CONNECT_SUITE_ROOT, service.tool) : null,
+    alongside,
     join(SUITE_ROOT, service.tool),
     join(SUITE_ROOT, 'node_modules', service.tool),
     join(dirname(SUITE_ROOT), service.tool),
   ].filter(Boolean);
 
-  const resolved = candidates.find((dir) => existsSync(join(dir, 'bin', 'cli.mjs'))) ?? candidates[1];
+  const resolved = candidates.find((dir) => existsSync(join(dir, 'bin', 'cli.mjs'))) ?? alongside;
   toolDirCache.set(service.id, resolved);
   return resolved;
 }

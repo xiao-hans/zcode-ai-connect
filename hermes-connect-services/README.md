@@ -30,12 +30,16 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 写完**重启 hermes**:hook 只在网关启动时注册。
 
-也可以走 npm(四个端点包 + 本包装在同一项目里,脚本会自动在 `node_modules/` 找兄弟包):
+也可以走 npm(四个端点包已是本包的 `dependencies`,一个命令就会一起装上):
 
 ```sh
-npm i zcode-trae-connect zcode-workbuddy-connect zcode-qoder-connect zcode-qwenwork-connect hermes-connect-services
+npm i hermes-connect-services
 npx hermes-connect-sync --install-hooks
 ```
+
+启动器按「本包所在目录的同级」找四个端点,因此 npm 扁平安装、`npm i -g`、pnpm、yarn berry 的布局都能命中;非标准布局用 `AI_CONNECT_SUITE_ROOT=<套件根>` 覆盖。
+
+> 整个套件只支持 **Windows**(四个端点都要读桌面 App 的登录态),所以本包声明了 `"os": ["win32"]`,在 macOS/Linux 上 `npm i` 会直接报 `EBADPLATFORM`,而不是装完静默失效。
 
 配置文件位置自动探测:
 

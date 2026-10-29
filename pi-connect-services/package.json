@@ -1,6 +1,6 @@
 {
   "name": "pi-connect-services",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Ensure the local connect endpoints (qoder 39270 / workbuddy 39271 / trae 39272) are running when pi starts, and ask for one more turn when the model closes without giving anything (thinking-only turns, or an announced-but-unexecuted step).",
   "type": "module",
   "license": "MIT",
@@ -17,6 +17,9 @@
   "bugs": {
     "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
   },
+  "os": [
+    "win32"
+  ],
   "engines": {
     "node": ">=18.17.0"
   },
@@ -28,9 +31,9 @@
   ],
   "main": "index.js",
   "dependencies": {
-    "zcode-qoder-connect": "^1.1.0",
-    "zcode-workbuddy-connect": "^1.1.0",
-    "zcode-trae-connect": "^1.1.0"
+    "zcode-qoder-connect": "^1.2.2",
+    "zcode-workbuddy-connect": "^1.2.2",
+    "zcode-trae-connect": "^1.2.2"
   },
   "keywords": [
     "pi",
