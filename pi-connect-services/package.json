@@ -1,7 +1,7 @@
 {
   "name": "pi-connect-services",
-  "version": "1.1.1",
-  "description": "Ensure the local connect endpoints (qoder 39270 / workbuddy 39271 / trae 39272) are running when pi starts — the pi-side half of zcode-ai-connect's launch-on-open design.",
+  "version": "1.2.0",
+  "description": "Ensure the local connect endpoints (qoder 39270 / workbuddy 39271 / trae 39272) are running when pi starts, and ask for one more turn when the model closes without giving anything (thinking-only turns, or an announced-but-unexecuted step).",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -22,6 +22,7 @@
   },
   "files": [
     "index.js",
+    "lib/",
     "README.md",
     "LICENSE"
   ],

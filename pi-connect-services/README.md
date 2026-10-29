@@ -10,6 +10,24 @@ ZCode 侧由各插件的 SessionStart hook 负责同样的事;装上这个扩展
 - 已在跑 → 跳过;不在 → detached 静默拉起(`node <工具>/bin/cli.mjs serve --port N`);
 - 全程 best-effort:拉起失败不影响 pi 会话,失败会体现在对应 provider 的连接错误里。
 
+## 收尾守卫
+
+同一个扩展还挂在 `agent_before_settle` 上，模型**什么都没给就收工**时补一轮：
+
+| 场景 | 是否续跑 | 说明 |
+|---|---|---|
+| 空回合（只有 thinking，正文为空、无工具） | 是 | 所有 provider 都管 |
+| stall：宣布了下一步却没动手 | 是 | 仅限没有自带守卫的 provider |
+| stall 且 provider=qwenwork | 否 | 交给 pi-provider-qwenwork，不塞两条提示 |
+| 用户中断 / 出错的回合 | 否 | `outcome !== 'completed'` |
+| 本轮已经调过工具 | 否 | 不存在「只说不做」 |
+
+同一条用户输入之后最多续跑 2 次，用户一发新消息预算重置。
+
+为什么放在这个扩展而不是 pi-provider-qwenwork：后者在 `startChatShim()` 失败时
+直接 `return`，没装/没登录 qwenwork 时守卫会整体消失 —— 而那正是只用
+trae / workbuddy / qoder 时的常态。
+
 ## 安装
 
 ```sh

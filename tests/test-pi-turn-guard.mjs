@@ -8,8 +8,10 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
-const { default: turnGuard, MAX_AUTO_CONTINUES } = await import(
-  pathToFileURL(join(HERE, '..', 'pi-turn-guard', 'index.js')).href
+// 守卫挂在 pi-connect-services 上（不是独立包）：它不依赖任何 provider 的凭据，
+// 加载可靠；而 pi-provider-qwenwork 在 shim 起不来时直接 return，守卫会消失。
+const { installTurnGuard, MAX_AUTO_CONTINUES } = await import(
+  pathToFileURL(join(HERE, '..', 'pi-connect-services', 'index.js')).href
 );
 
 let passed = 0;
@@ -53,7 +55,7 @@ const DONE_TEXT = [{ type: 'text', text: '已经完成全部修改，测试通�
 
 function mount() {
   const pi = fakePi();
-  turnGuard(pi);
+  installTurnGuard(pi);
   return pi;
 }
 
