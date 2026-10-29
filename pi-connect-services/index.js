@@ -16,7 +16,7 @@
 import { spawn } from 'node:child_process'
 import { readFile } from 'node:fs/promises'
 import { existsSync } from 'node:fs'
-import { dirname, join } from 'node:path'
+import { basename, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { createRequire } from 'node:module'
 
@@ -45,11 +45,16 @@ function packageRootOf(entryFile, maxUp = 4) {
  * Locate a connect tool's directory.
  *
  * 1. PI_CONNECT_TOOLS_ROOT — explicit override, always wins.
- * 2. The npm dependency (`zcode-*-connect` ships bin/cli.mjs). This is what
- *    makes a plain `pi install npm:pi-connect-services` work: no sibling
- *    layout, no env var, nothing to configure.
- * 3. The sibling layout — <suite repo root>/<tool> next to this extension,
- *    which is how the monorepo checkout (and a path install) is shaped.
+ * 2. The npm dependency, located by resolving the package entry. Works for
+ *    tools that declare `main`/`exports`.
+ * 3. A nested dependency: <here>/node_modules/<tool>, which is where npm puts
+ *    a dependency when the top level is taken by a conflicting version.
+ * 4. The parent directory: <parent>/<tool>. Under `pi install npm:` the parent
+ *    is node_modules, so this is the normal flat install; in a monorepo
+ *    checkout it is the suite root, i.e. the sibling layout.
+ *
+ * Step 4 is what keeps this working for tools that ship neither `main` nor
+ * `exports` (resolving those throws MODULE_NOT_FOUND) — do not drop it.
  *
  * Returns { dir, via } or null when the tool cannot be found anywhere.
  */
@@ -67,9 +72,14 @@ export function locateTool(tool) {
     const root = packageRootOf(require_.resolve(tool))
     if (root) candidates.push({ dir: root, via: 'npm dependency' })
   } catch {
-    // Not installed as a dependency — fall through.
+    // No resolvable entry (or not installed) — fall through.
   }
-  candidates.push({ dir: join(dirname(HERE), tool), via: 'sibling layout' })
+  candidates.push({ dir: join(HERE, 'node_modules', tool), via: 'nested dependency' })
+  const parent = dirname(HERE)
+  candidates.push({
+    dir: join(parent, tool),
+    via: basename(parent) === 'node_modules' ? 'npm (flat)' : 'sibling layout',
+  })
 
   for (const candidate of candidates) {
     if (existsSync(join(candidate.dir, 'bin', 'cli.mjs'))) return candidate
