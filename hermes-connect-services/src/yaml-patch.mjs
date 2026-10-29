@@ -19,6 +19,8 @@
 
 const START = (marker) => `# >>> ${marker} >>>`;
 const END = (marker) => `# <<< ${marker} <<<`;
+/** A child key this suite owns — used to find an orphaned region's real start. */
+const OWNS_CHILD = /^\s{0,4}zc-[A-Za-z0-9._-]+\s*:\s*$/;
 
 /**
  * Replace the managed region inside one top-level mapping key.
@@ -59,9 +61,16 @@ export function patchManagedBlock(text, topKey, blockBody, options = {}) {
 
   if (owned) {
     const replacement = nextBlock; // '' when the caller wants it gone
+    const before = lines.join('\n');
     lines.splice(owned.start, owned.end - owned.start + 1, ...replacement);
-    const action = replacement.length === 0 ? 'removed' : 'replaced';
-    return { text: lines.join('\n'), changed: true, action };
+    const after = lines.join('\n');
+    return {
+      text: after,
+      // Rewriting an identical region is not a change: callers (and their
+      // backups) must not churn just because sync ran twice.
+      changed: after !== before,
+      action: replacement.length === 0 ? 'removed' : 'replaced',
+    };
   }
 
   if (nextBlock.length === 0) return { text, changed: false, action: 'noop' };
@@ -82,6 +91,36 @@ export function readManagedBlock(text, topKey, options = {}) {
   const owned = findManagedRegion(lines, region, START(marker), END(marker));
   if (!owned) return '';
   return lines.slice(owned.start + 1, owned.end).join('\n');
+}
+
+/**
+ * Split a managed region into its per-child blocks, keyed by the child's name.
+ *
+ * Needed for partial syncs (`--only zc-trae`): the region is rewritten whole,
+ * so without this the three untouched providers would be dropped on the floor.
+ *
+ * @returns {Array<{ key: string, body: string }>}
+ */
+export function readManagedChildren(text, topKey, options = {}) {
+  const marker = options.marker ?? 'zcode-ai-connect';
+  const lines = text.split(/\r?\n/);
+  const keyIndex = findTopLevelKey(lines, topKey);
+  if (keyIndex === -1) return [];
+  const region = mappingRegion(lines, keyIndex);
+  const owned = findManagedRegion(lines, region, START(marker), END(marker));
+  if (!owned) return [];
+  // Inside `providers:` the region carries the mapping's 2-space indent; strip
+  // the common prefix before looking for column-0 child keys.
+  return splitBlocks(dedent(lines.slice(owned.start + 1, owned.end)));
+}
+
+/** Remove the shortest common leading indent shared by every non-blank line. */
+function dedent(lines) {
+  const indents = lines
+    .filter((line) => line.trim() !== '')
+    .map((line) => line.length - line.trimStart().length);
+  const shift = indents.length === 0 ? 0 : Math.min(...indents);
+  return shift === 0 ? lines : lines.map((line) => (line.trim() === '' ? line : line.slice(shift)));
 }
 
 /** True when the top-level mapping key exists at all. */
@@ -119,6 +158,18 @@ function mappingRegion(lines, keyIndex) {
   return { start: keyIndex + 1, end };
 }
 
+/**
+ * Locate the managed region inside one mapping.
+ *
+ * `orphan` covers the case that actually bites in the field: hermes rewrites
+ * config.yaml from its own model (GUI model switch, `hermes config set`, …) and
+ * drops the opening marker comment while keeping the body and the closing one.
+ * Treating that as "no region" makes the next sync insert a second copy of every
+ * provider — duplicate top-level keys, and PyYAML silently keeps the last. So an
+ * orphan is claimed from its first owned child (`zc-*`) to the stray end marker
+ * and rewritten whole. Starting at the child—not at the mapping—is deliberate:
+ * a hand-written provider above ours must never be swallowed.
+ */
 function findManagedRegion(lines, region, startToken, endToken) {
   let start = -1;
   for (let i = region.start; i < region.end; i += 1) {
@@ -127,7 +178,14 @@ function findManagedRegion(lines, region, startToken, endToken) {
       break;
     }
   }
-  if (start === -1) return null;
+  if (start === -1) {
+    const endIndex = lines.findIndex((line, i) => i >= region.start && i < region.end && line.trim() === endToken);
+    if (endIndex === -1) return null;
+    for (let i = region.start; i < endIndex; i += 1) {
+      if (OWNS_CHILD.test(lines[i])) return { start: i, end: endIndex, orphan: true };
+    }
+    return null;
+  }
   for (let i = start; i < region.end; i += 1) {
     if (lines[i].trim() === endToken) return { start, end: i };
   }
@@ -144,6 +202,28 @@ function buildManagedBlock(blockBody, { marker, indent }) {
     ...body.split('\n').map((line) => (line === '' ? '' : `${indent}${line}`)),
     `${indent}${END(marker)}`,
   ];
+}
+
+/**
+ * Cut a list of already-dedented lines into top-level blocks. A block starts at
+ * a column-0 `key:` line and runs to the next one.
+ */
+function splitBlocks(body) {
+  const blocks = [];
+  let current = null;
+  for (const line of body) {
+    if (/^\S/.test(line) && /^\S[^#]*:\s*$/.test(line)) {
+      if (current) blocks.push(current);
+      current = { key: line.replace(/:\s*$/, ''), lines: [line] };
+      continue;
+    }
+    if (current) current.lines.push(line);
+  }
+  if (current) blocks.push(current);
+  return blocks.map(({ key, lines }) => ({
+    key,
+    body: lines.join('\n').replace(/\s+$/, ''),
+  }));
 }
 
 function appendKeyBlock(text, topKey, blockBody, { marker, indent }) {
