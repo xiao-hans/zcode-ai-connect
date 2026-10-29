@@ -1,7 +1,7 @@
 {
   "name": "hermes-connect-services",
-  "version": "1.1.0",
-  "description": "Bring zcode-ai-connect's four loopback endpoints to hermes: lazy-start them on session start and sync them into hermes' config.yaml as OpenAI-compatible providers.",
+  "version": "1.2.0",
+  "description": "Bring zcode-ai-connect's four loopback endpoints to hermes, and add the missing turn-end gate that re-runs a turn when the model announces a next step but calls no tool.",
   "type": "module",
   "license": "MIT",
   "author": {
@@ -23,13 +23,15 @@
   "files": [
     "bin",
     "src",
+    "lib",
     "tests",
     "README.md",
     "LICENSE"
   ],
   "bin": {
     "hermes-connect-ensure": "bin/ensure-services.mjs",
-    "hermes-connect-sync": "bin/sync-hermes-config.mjs"
+    "hermes-connect-sync": "bin/sync-hermes-config.mjs",
+    "hermes-connect-stall-gate": "bin/patch-hermes-stall-gate.mjs"
   },
   "dependencies": {},
   "keywords": [
@@ -39,6 +41,8 @@
     "trae",
     "workbuddy",
     "qoder",
-    "qwenwork"
+    "qwenwork",
+    "stall-guard",
+    "hook"
   ]
 }

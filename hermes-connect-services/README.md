@@ -118,8 +118,66 @@ model:
 | `… --no-reasoning` | 全部模型标 `supports_reasoning: false` |
 | `… --config <path>` | 指定配置文件 |
 | `node bin/ensure-services.mjs [--verbose]` | 单独执行懒启动(也是 hook 本体) |
+| `node bin/patch-hermes-stall-gate.mjs` | 给 hermes 补「宣布下一步却没动手」的续跑闸门 |
+| `… --check` | 只报告补丁状态(升级后跑一次看是否失效) |
+| `… --revert` | 撤销补丁,恢复到原始字节 |
 
-## 五、排障
+## 五、续跑闸门:模型说要做什么,然后就停了
+
+模型常见的收尾是「我先检查配置，再修改这里：」——宣布了下一步,零工具调用就结束这一轮。这不是完成,是卡住。
+
+ZCode / pi / dsh 三端各有一个官方钩子点可以兜住(Stop hook、`turn_end`、`agent/turn-stopping`)。**hermes 没有**:
+
+- `hermes_cli/plugins.py` 的 `VALID_HOOKS` 里没有任何「回合正常结束」事件(`agent_loop_stopped` 是 `/stop` 打断,不是收尾)。
+- 唯一能续跑的闸门是 `pre_verify`,但它的前置条件是 `if _edited and has_hook("pre_verify")` —— 本轮**写过文件**才触发。而「我先检查配置」这种收尾往往只读不写,或一个工具都没调,正好落在门控之外。
+- 内置的 `_dropped_toolcall_nudge` 只处理 `finish_reason == "tool_calls"` 但 `tool_calls` 为空 —— 协议层信号,精确但覆盖面窄。
+
+所以只能往宿主的收尾闸门链里加第 5 道。
+
+```sh
+node bin/patch-hermes-stall-gate.mjs            # 打补丁
+node bin/patch-hermes-stall-gate.mjs --check    # 看状态
+node bin/patch-hermes-stall-gate.mjs --revert   # 干净回退
+```
+
+改动面刻意压到最小 —— 宿主原有行一个字节不动:
+
+| 文件 | 改动 |
+|---|---|
+| `agent/turn_stop_gates.py` | 两个 marker 块:模块级判定函数 + 一处调用 |
+| `agent/stall_detector.py` | 新增,判定逻辑本体(与 JS 版逐条对齐) |
+
+`--revert` 会从首次打补丁时留下的快照还原 `turn_stop_gates.py`,实测与原始文件**逐字节相同**。
+
+### 生效方式
+
+**改完必须重启 hermes gateway** —— 已 import 的模块不会自动重载,不重启就等于没打。
+
+### hermes 升级会覆盖
+
+自更新会重置 `hermes-agent/` 下的源码,两块一起消失。表现是「续跑不再发生」而不是报错:模块级 import 包在 `try/except` 里,`stall_detector.py` 不在时闸门静默失效,不影响正常结束。升级后重跑一次脚本即可,`--check` 会告诉你当前状态。
+
+### 开关与防护
+
+```yaml
+agent:
+  stall_guard: false      # 或环境变量 HERMES_STALL_GUARD=0
+```
+
+- **同一段回复只续一次**:按文本 sha1 指纹去重,模型被提示后原样复读不会二次触发。
+- **一个会话上限 3 次**:与 ZCode 侧一致。连续 3 次都唤不醒,再提示也只是复读计划。
+- **本轮有工具调用就不判**:`_zc_tool_calls_this_turn()` 只看最后一条 user 消息之后的 `tool_calls`,`> 0` 一律跳过。
+- 闸门内部全部 fail-open:任何异常只写 debug 日志,绝不让一次正常收尾因为插件出错而崩。
+
+### 阈值不是「看到冒号就续跑」
+
+判定是打分制,否决规则先于肯定规则求值:问句收尾、把决定权交回用户、明确完成宣告 —— 一律不续跑。冒号只是加权项(说明性文字大量以冒号收尾)。规则表与 ZCode / pi / dsh 完全同源,`tests/test-detector-parity.mjs` 会拿同一批文本喂给 JS 与 Python 两份实现,逐字段比对 `verdict` / `score` / `signals` —— 任一边改了规则而另一边没跟上,这个测试就红。
+
+### 一个已知差异
+
+ZCode 的 Stop hook 由宿主保证「只在一轮零工具调用时执行」,所以那边按**每轮**计数。hermes 这边没有可靠的轮次标识(续跑本身会追加一条 user 消息),所以上限按**会话**计:同一会话累计续跑 3 次后不再触发。保守方向是一致的 —— 只能少续,不会多续。
+
+## 六、排障
 
 **401 / 模型不在了** — 端点 token 轮换或上游名册变了,重跑 `sync-hermes-config.mjs`。
 
@@ -155,13 +213,15 @@ no_proxy=127.0.0.1,localhost,::1,0.0.0.0
 
 **思考档位** — hermes 全局 `agent.reasoning_effort` 默认 `ultra`,这些端点会原样转发 OpenAI 的 `reasoning_effort`。上游不认 `ultra` 时把它降到 `high`。不想让任何模型思考就加 `--no-reasoning`。
 
-## 六、测试
+## 七、测试
 
 ```sh
-node hermes-connect-services/tests/test-yaml-patch.mjs
+node tests/test-yaml-patch.mjs          # 托管块插入/替换/卸载、幂等、--only、孤儿标记自愈
+node ../tests/test-detector-parity.mjs  # JS ↔ Python 判定器逐字段对齐
+node tests/test-stall-gate.mjs          # 闸门行为(需要本机装有 hermes)
 ```
 
-覆盖的是最危险的那部分:托管块插入/替换/卸载、幂等性、`--only` 不删邻居、孤儿标记自愈。
+`test-stall-gate.mjs` 直接 import 宿主的 `apply_stop_gates`,让整条闸门链真实跑一遍 —— 不是 mock 一个函数名对得上就算过。
 
 ---
 

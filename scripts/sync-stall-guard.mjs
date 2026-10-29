@@ -10,20 +10,28 @@
  * @module zcode-ai-connect/scripts/sync-stall-guard
  */
 
-import { readFileSync, writeFileSync, existsSync, copyFileSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, copyFileSync, mkdirSync } from 'node:fs';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const DETECTOR_SOURCE = join(ROOT, 'shared', 'stall-detector.mjs');
+const PY_DETECTOR_SOURCE = join(ROOT, 'shared', 'stall_detector.py');
 const GUARD_SOURCE = join(ROOT, 'zcode-trae-connect', 'hooks', 'stall-guard.mjs');
 const PACKAGES = ['zcode-trae-connect', 'zcode-workbuddy-connect', 'zcode-qoder-connect', 'zcode-qwenwork-connect'];
+
+/**
+ * Python 版检测器的分发目标：hermes 侧由 patch 脚本从 `lib/stall_detector.py` 复制进宿主。
+ * 只发这一份 —— pi / dsh 是 Node 包，不需要 Python。
+ */
+const PY_DETECTOR_TARGETS = [join(ROOT, 'hermes-connect-services', 'lib', 'stall_detector.py')];
 
 const argv = process.argv.slice(2);
 const dryRun = argv.includes('--dry-run');
 const bump = argv.includes('--bump');
 
 const detector = readFileSync(DETECTOR_SOURCE, 'utf8');
+const pyDetector = readFileSync(PY_DETECTOR_SOURCE, 'utf8');
 const guard = readFileSync(GUARD_SOURCE, 'utf8');
 
 /** Stop 段：不带 matcher —— 对 Stop 事件 matcher 无意义，写它只会误导读者。 */
@@ -85,6 +93,17 @@ for (const pkg of PACKAGES) {
     console.log(`  ${pkg}: plugin.json Stop registered${bump ? ` (v${manifest.version})` : ''}`);
     touched += 1;
   }
+}
+
+// Python 版检测器：hermes 的补丁脚本从这里读，随 npm 包一起发布。
+for (const target of PY_DETECTOR_TARGETS) {
+  const existed = existsSync(target);
+  if (!dryRun) {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, pyDetector, 'utf8');
+  }
+  console.log(`  ${target.slice(ROOT.length + 1).replaceAll('\\', '/')} ${existed ? 'updated' : 'created'}`);
+  touched += 1;
 }
 
 console.log(`\n${dryRun ? '[dry-run] ' : ''}${touched} file(s) ${dryRun ? 'would be ' : ''}written`);

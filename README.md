@@ -131,13 +131,22 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
 
-## 七、「只说不做」的自动续跑(Stop hook)
+## 七、「只说不做」的自动续跑
 
 模型常见的一种收尾是**宣布了下一步却直接停住**:
 
 > 我先检查配置,再修改这里:
 
-这一轮**没有任何工具调用**,于是 ZCode 认为回复结束、等你说话。四个连接器插件现在各注册一个 `Stop` hook(`hooks/stall-guard.mjs`)来兜住这种情况:
+这一轮**没有任何工具调用**,于是宿主认为回复结束、等你说话。四个宿主各有一个挂载点兜住它:
+
+| 宿主 | 挂载点 | 续跑方式 |
+|---|---|---|
+| ZCode(四个插件) | `Stop` hook | 输出 `{"decision":"block","reason":"…"}`,提示回灌上下文再请求一次 |
+| pi | `turn_end` | 返回 `{continue:true, entries:[custom_message]}` |
+| dsh | `agent/turn-stopping` | `agent.steer(user 消息)` 塞进 `inbox.nextStep` |
+| hermes | **没有** —— 见下 | 补第 5 道收尾闸(`turn_stop_gates.py`) |
+
+ZCode 侧的执行流程:
 
 | 步骤 | 发生什么 |
 |---|---|
@@ -152,9 +161,19 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 - 同一段回复文本**只续跑一次**:四个插件并存时用原子指纹锁(默认 `~/.zcode-stall-guard/`,`ZCODE_STALL_GUARD_HOME` 可改)跨进程互斥,只会注入一条提示,不会四条;
 - 以冒号结尾只是加权项,不足以独立触发(说明性文字大量以冒号收尾)。
 
-**限制:Stop 载荷里没有 provider 信息**,所以这份 hook 影响 ZCode 里的所有模型,不只千问办公那一个。判定逻辑与 pi / dsh 侧共用同一份 `shared/stall-detector.mjs`(由 `scripts/sync-stall-guard.mjs` 分发),三端阈值一致。
+**限制:Stop 载荷里没有 provider 信息**,所以这份 hook 影响 ZCode 里的所有模型,不只千问办公那一个。判定逻辑与 pi / dsh / hermes 侧共用同一套规则(`shared/stall-detector.mjs` 与 `shared/stall_detector.py`,由 `scripts/sync-stall-guard.mjs` 分发),四端阈值一致，`tests/test-detector-parity.mjs` 会逐字段比对两份实现。
 
-回归测试:`node tests/test-stall-detector.mjs`
+### hermes 为什么是个例外
+
+hermes 没有「回合正常结束」类的钩子点:`VALID_HOOKS` 里唯一能续跑的 `pre_verify` 要求本轮**写过文件**才触发,而「我先检查配置」这种收尾往往只读不写。所以只能往宿主的收尾闸门链里补第 5 道:
+
+```sh
+node hermes-connect-services/bin/patch-hermes-stall-gate.mjs   # --check / --revert
+```
+
+改的是 `agent/turn_stop_gates.py`(两个 marker 块)+ 新增 `agent/stall_detector.py`,宿主原有行不动,`--revert` 逐字节还原。**hermes 升级会覆盖,升级后重跑一次即可**;生效需要重启 gateway。详见 [hermes-connect-services/README.md](hermes-connect-services/README.md)。
+
+回归测试:`node tests/test-stall-detector.mjs`、`node tests/test-detector-parity.mjs`、`node hermes-connect-services/tests/test-stall-gate.mjs`
 
 ## 目录
 
@@ -166,10 +185,10 @@ zcode-ai-connect/
 ├── zcode-qwenwork-connect/   # 千问办公接入(vendored WASM 签名链)
 ├── pi-connect-services/      # pi 启动扩展:自动拉起三个端点
 ├── sync-pi-models.mjs        # pi 供应商/名册同步脚本
-├── hermes-connect-services/  # hermes 接入:config.yaml 同步 + 启动 hook
-├── shared/                   # stall-detector 权威源(分发到各宿主)
+├── hermes-connect-services/  # hermes 接入:config.yaml 同步 + 启动 hook + 收尾闸补丁
+├── shared/                   # stall-detector 权威源:.mjs(ZCode/pi/dsh)+ .py(hermes)
 ├── scripts/                  # sync-stall-guard.mjs:把检测器铺到各包
-└── tests/                    # 检测器与流收尾的回归测试
+└── tests/                    # 检测器回归 + JS↔Python 一致性(test-detector-parity.mjs)
 ```
 
 ## 免责与致谢
