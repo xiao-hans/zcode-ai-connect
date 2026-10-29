@@ -32,15 +32,19 @@ MIN_WEIGHTED_CHARS = 14.0
 # 请求用户裁决 / 提供输入的措辞。命中即否决。
 REQUEST_PATTERNS = [
     # 中文：把决定权交回用户
-    r"请你?(?:确认|批准|授权|选择|决定|提供|粘贴|发送|告知|告诉)",
+    r"请你?(?:确认|批准|授权|选择|决定|提供|粘贴|发送|告知|告诉|现在|立刻|马上|配合|扫码|扫|在)",
     r"你(?:可以|需要|来)(?:确认|决定|选择|提供|先)",
     r"需要你(?:确认|决定|操作|提供|回复|选择)",
     r"(?:是否|要不要|需不需要|要不要我|需要我)(?:继续|执行|我|帮|先|再)?",
-    r"等你(?:确认|回复|决定|操作)",
-    r"告诉我(?:你|是否|要|结果|选择)",
+    r"等你(?:确认|回复|决定|操作|安排)",
+    r"告诉我(?:你|是否|要|结果|选择|一声|什么时候)",
+    r"(?:说|吱|喊)一声",
+    r"你(?:点个?头|说[「“\"']?开[」”\"']?)(?:我就|我立刻|我马上)?",
+    r"要我[^。！？\n]{0,24}(?:就|的话|吗)",
+    r"扫完(?:不用回复|告诉我|说一声)",
     r"让我知道",
-    r"由你(?:决定|来|选)",
-    r"你(?:先|来)(?:确认|决定|操作|选)",
+    r"由你(?:决定|来|选|定)",
+    r"你(?:先|来)(?:确认|决定|操作|选|说)",
     r"确认后(?:我)?再",
     r"(?:你|您)看(?:看|一下)?(?:是否|要不要|行不行)",
     # English: handing the decision back
@@ -55,11 +59,18 @@ REQUEST_PATTERNS = [
     r"\bwaiting (?:for|on) your\b",
 ]
 
+# 确认/复述长期规则或未来条件约定（「以后遇到…我会先…」「可以，主人。以后…」）。
+# 这是回答用户的规则设定，不是当前回合宣布下一步动作后漏调工具。
+STANDING_RULE_PATTERNS = [
+    r"(?:以后|今后|之后|下次|后续|往后|接下来每次|每当|每次)[^。！？\n]{0,40}(?:提到|遇到|收到|让我|你让我|要求|需要|开始|做|时|的时候)[^。！？\n]{0,30}我(?:会|将|都会|先|就)",
+    r"^(?:可以|好的?|明白|没问题|收到|记下了|知道了)[，,。！!\s]*(?:主人|小主|老板)?[，,。！!\s]*(?:以后|今后|之后|下次|后续|往后|每当|每次)",
+]
+
 # 「已经做完」的收尾。命中且无未来标记时否决。
 DONE_PATTERNS = [
     r"(?:已|已经)(?:经)?(?:完成|修好|改好|搞定|处理完|就绪|生效|上线|发布|通过)",
-    r"(?:全部|都)(?:完成|通过|搞定|就绪)",
-    r"(?:搞定|收工|完事)(?:了)?[。.!！]?$",
+    r"(?:全部|都)(?:完成|通过|搞定|就绪|闭合)",
+    r"(?:搞定|收工|完事|可以收尾)(?:了)?[。.!！]?$",
     r"(?:到|就)这里(?:为止|结束)?",
     r"(?:没有|无需)(?:其他|更多|别的)(?:改动|问题|需要)",
     r"\b(?:all )?done\b",
@@ -77,6 +88,8 @@ FUTURE_STRONG = [
     r"让(?:我们|我)先",
     r"(?:接下来|下面|现在)我(?:来|将|会|要)",
     r"开始(?:执行|处理|修改|实现|写|改|跑|检查)",
+    r"(?:^|[。！？\n]\s*)(?:开始[。，,\s]*)?先(?:把|将|从|去|给|对|用|跑|看|查|改|写|读|登记|核对|整理|创建|执行|检查)[^。！？\n]{1,60}再",
+    r"(?:^|[。！？\n]\s*)现在(?:重新|开始|把|将|先|去|来|给|对|跑|开|改|写|整理|执行|检查)",
     r"\blet me\b",
     r"\bi'?ll\b",
     r"\bi will\b",
@@ -98,11 +111,11 @@ FUTURE_WEAK = [
 
 # 动作动词：把「未来时」落到「要做一件具体的事」上。
 ACTION_VERB = [
-    r"(?:检查|查看|看看|查一下|读取|打开|搜索|定位)",
-    r"(?:修改|改成|改掉|编辑|写入|创建|新建|删除|移除|重写)",
-    r"(?:执行|运行|跑一下|启动|重启|安装|部署|发布|提交)",
+    r"(?:检查|查看|看看|查一下|读取|打开|搜索|定位|核对|登记|整理)",
+    r"(?:修改|改成|改掉|编辑|写入|创建|新建|删除|移除|重写|写进)",
+    r"(?:执行|运行|跑一下|跑起|启动|重启|安装|部署|发布|提交|开窗口|重新开)",
     r"(?:修复|实现|添加|增加|补充|更新|替换|迁移|重构)",
-    r"(?:验证|测试|校验|确认一下|跑通|编译)",
+    r"(?:验证|测试|校验|确认一下|跑通|编译|上机)",
     r"\b(?:check|read|open|inspect|look at|search|grep)\b",
     r"\b(?:edit|write|create|add|remove|delete|rewrite|patch|update)\b",
     r"\b(?:run|execute|install|deploy|build|start|restart|publish)\b",
@@ -113,6 +126,11 @@ ACTION_VERB = [
 COLON_TAIL = re.compile(r"[:：]\s*\Z")
 ELLIPSIS_TAIL = re.compile(r"(?:\.{3,}|…)\s*\Z")
 QUESTION_TAIL = re.compile(r"[?？]\s*\Z")
+
+# action-colon 判定用：末行收尾的冒号、分句切分、列表项前缀。
+_COLON_AT_END = re.compile(r"[:：]\s*\Z")
+_CLAUSE_SPLIT = re.compile(r"[，,。；;！!？?]")
+_LIST_ITEM = re.compile(r"^[-*•\d|]")
 
 # 阈值。只有弱未来标记时必须靠额外信号才能过线。
 THRESHOLD_STRONG = 3.0
@@ -140,6 +158,7 @@ def _any_match(group: str, text: str) -> bool:
 
 _PATTERN_GROUPS = {
     "request": REQUEST_PATTERNS,
+    "standing_rule": STANDING_RULE_PATTERNS,
     "done": DONE_PATTERNS,
     "future_strong": FUTURE_STRONG,
     "future_weak": FUTURE_WEAK,
@@ -207,10 +226,14 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
     if _any_match("request", tail):
         return _result("asked-user")
 
+    # ── 否决 ③：确认/复述长期规则约定（「以后遇到…我会先…」）──────────────
+    if _any_match("standing_rule", tail):
+        return _result("standing-rule")
+
     has_strong = _any_match("future_strong", tail)
     has_weak = _any_match("future_weak", tail)
 
-    # ── 否决 ③：明确宣告完成且没有未来时 ──────────────────────────────────
+    # ── 否决 ④：明确宣告完成且没有未来时 ──────────────────────────────────
     if not has_strong and not has_weak and _any_match("done", tail):
         return _result("already-done")
 
@@ -224,20 +247,42 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
     if has_weak:
         score += 1.5
         signals.append("future-weak")
-    if _any_match("action_verb", tail):
+    has_verb = _any_match("action_verb", tail)
+    if has_verb:
         score += 1.0
         signals.append("action-verb")
-    if COLON_TAIL.search(raw):
+    has_colon = bool(COLON_TAIL.search(raw))
+    if has_colon:
         score += 1.5
         signals.append("colon-tail")
     if ELLIPSIS_TAIL.search(raw):
         score += 0.5
         signals.append("ellipsis-tail")
 
-    if not has_strong and not has_weak:
+    # 末行非列表项以「动作动词 + 冒号」收尾（例如「……整份重写干净：」）：
+    # 即使省略了显式「我先/接下来」代词，也是典型的即将发起工具调用。
+    #
+    # 动词必须落在冒号前的**最后一个分句**里，否则「已定位问题并修好，根因有
+    # 三层：」这类说明性收尾会被误判 —— 它的动词讲的是已完成的事，冒号引出的
+    # 是名词性解释。宁可漏掉一次续跑，也不要把说明性收尾当成漏执行。
+    lines = [line.strip() for line in raw.split("\n") if line.strip()]
+    last_line = lines[-1] if lines else ""
+    tail_clause = _CLAUSE_SPLIT.split(_COLON_AT_END.sub("", last_line))[-1] if last_line else ""
+    is_action_colon = (
+        has_colon
+        and has_verb
+        and _any_match("action_verb", tail_clause)
+        and not _LIST_ITEM.match(last_line)
+        and len(last_line) <= 160
+    )
+    if not has_strong and not has_weak and is_action_colon:
+        score += 1.0
+        signals.append("action-colon")
+
+    if not has_strong and not has_weak and not is_action_colon:
         return _result("no-future-cue", score, signals)
 
-    threshold = THRESHOLD_STRONG if has_strong else THRESHOLD_WEAK_ONLY
+    threshold = THRESHOLD_STRONG if (has_strong or is_action_colon) else THRESHOLD_WEAK_ONLY
     if score < threshold:
         return _result("weak-only", score, signals)
 

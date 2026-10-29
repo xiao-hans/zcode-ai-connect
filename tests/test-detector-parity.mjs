@@ -30,12 +30,17 @@ const CASES = [
   { text: 'Let me check the config first, then patch the providers block:' },
   { text: '我先读取 config.yaml 里的 providers 段，再定位重复的那两个键。' },
   { text: 'Now I\'ll patch the file...' },
+  // action-colon：省略了「我先/接下来」，靠冒号前的动作动词识别
+  { text: '好的，我已经看完了，现在把这份配置整份重写干净：' },
   // 不该续跑
   { text: '需要我先确认一下端口状态吗？' },
   { text: '请确认后我再执行。' },
   { text: '接下来需要你决定用哪个方案，我再动手。' },
   { text: '已完成全部修改，测试通过。' },
   { text: '已定位问题并修好，根因有三层：' },
+  // 长期规则/未来条件约定：回答的是「以后怎么做」，不是本回合漏调工具
+  { text: '可以，主人。以后遇到这种情况我会先确认再动手执行。' },
+  { text: '好的，以后每次你让我改配置，我都会先备份再动手。' },
   { text: '好的。' },
   { text: '下面这段代码是完整实现：\n\n```js\nconst a = 1;\n```\n' },
   { text: '总结：三个改动都已完成，没有其他需要改动的地方。' },

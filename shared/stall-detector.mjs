@@ -35,15 +35,19 @@ const MIN_WEIGHTED_CHARS = 14;
 /** 请求用户裁决 / 提供输入的措辞。命中即否决。 */
 const REQUEST_PATTERNS = [
   // 中文：把决定权交回用户
-  /请你?(?:确认|批准|授权|选择|决定|提供|粘贴|发送|告知|告诉)/,
+  /请你?(?:确认|批准|授权|选择|决定|提供|粘贴|发送|告知|告诉|现在|立刻|马上|配合|扫码|扫|在)/,
   /你(?:可以|需要|来)(?:确认|决定|选择|提供|先)/,
   /需要你(?:确认|决定|操作|提供|回复|选择)/,
   /(?:是否|要不要|需不需要|要不要我|需要我)(?:继续|执行|我|帮|先|再)?/,
-  /等你(?:确认|回复|决定|操作)/,
-  /告诉我(?:你|是否|要|结果|选择)/,
+  /等你(?:确认|回复|决定|操作|安排)/,
+  /告诉我(?:你|是否|要|结果|选择|一声|什么时候)/,
+  /(?:说|吱|喊)一声/,
+  /你(?:点个?头|说[「“"']?开[」”"']?)(?:我就|我立刻|我马上)?/,
+  /要我[^。！？\n]{0,24}(?:就|的话|吗)/,
+  /扫完(?:不用回复|告诉我|说一声)/,
   /让我知道/,
-  /由你(?:决定|来|选)/,
-  /你(?:先|来)(?:确认|决定|操作|选)/,
+  /由你(?:决定|来|选|定)/,
+  /你(?:先|来)(?:确认|决定|操作|选|说)/,
   /确认后(?:我)?再/,
   /(?:你|您)看(?:看|一下)?(?:是否|要不要|行不行)/,
   // English: handing the decision back
@@ -58,11 +62,20 @@ const REQUEST_PATTERNS = [
   /\bwaiting (?:for|on) your\b/i,
 ];
 
+/**
+ * 确认/复述长期规则或未来条件约定（「以后遇到…我会先…」「可以，主人。以后…」）。
+ * 这是回答用户的规则设定，不是当前回合宣布下一步动作后漏调工具。
+ */
+const STANDING_RULE_PATTERNS = [
+  /(?:以后|今后|之后|下次|后续|往后|接下来每次|每当|每次)[^。！？\n]{0,40}(?:提到|遇到|收到|让我|你让我|要求|需要|开始|做|时|的时候)[^。！？\n]{0,30}我(?:会|将|都会|先|就)/,
+  /^(?:可以|好的?|明白|没问题|收到|记下了|知道了)[，,。！!\s]*(?:主人|小主|老板)?[，,。！!\s]*(?:以后|今后|之后|下次|后续|往后|每当|每次)/,
+];
+
 /** 「已经做完」的收尾。命中且无未来标记时否决。 */
 const DONE_PATTERNS = [
   /(?:已|已经)(?:经)?(?:完成|修好|改好|搞定|处理完|就绪|生效|上线|发布|通过)/,
-  /(?:全部|都)(?:完成|通过|搞定|就绪)/,
-  /(?:搞定|收工|完事)(?:了)?[。.!！]?$/,
+  /(?:全部|都)(?:完成|通过|搞定|就绪|闭合)/,
+  /(?:搞定|收工|完事|可以收尾)(?:了)?[。.!！]?$/,
   /(?:到|就)这里(?:为止|结束)?/,
   /(?:没有|无需)(?:其他|更多|别的)(?:改动|问题|需要)/,
   /\b(?:all )?done\b/i,
@@ -80,6 +93,8 @@ const FUTURE_STRONG = [
   /让(?:我们|我)先/,
   /(?:接下来|下面|现在)我(?:来|将|会|要)/,
   /开始(?:执行|处理|修改|实现|写|改|跑|检查)/,
+  /(?:^|[。！？\n]\s*)(?:开始[。，,\s]*)?先(?:把|将|从|去|给|对|用|跑|看|查|改|写|读|登记|核对|整理|创建|执行|检查)[^。！？\n]{1,60}再/,
+  /(?:^|[。！？\n]\s*)现在(?:重新|开始|把|将|先|去|来|给|对|跑|开|改|写|整理|执行|检查)/,
   /\blet me\b/i,
   /\bi'?ll\b/i,
   /\bi will\b/i,
@@ -101,11 +116,11 @@ const FUTURE_WEAK = [
 
 /** 动作动词：把「未来时」落到「要做一件具体的事」上。 */
 const ACTION_VERB = [
-  /(?:检查|查看|看看|查一下|读取|打开|搜索|定位)/,
-  /(?:修改|改成|改掉|编辑|写入|创建|新建|删除|移除|重写)/,
-  /(?:执行|运行|跑一下|启动|重启|安装|部署|发布|提交)/,
+  /(?:检查|查看|看看|查一下|读取|打开|搜索|定位|核对|登记|整理)/,
+  /(?:修改|改成|改掉|编辑|写入|创建|新建|删除|移除|重写|写进)/,
+  /(?:执行|运行|跑一下|跑起|启动|重启|安装|部署|发布|提交|开窗口|重新开)/,
   /(?:修复|实现|添加|增加|补充|更新|替换|迁移|重构)/,
-  /(?:验证|测试|校验|确认一下|跑通|编译)/,
+  /(?:验证|测试|校验|确认一下|跑通|编译|上机)/,
   /\b(?:check|read|open|inspect|look at|search|grep)\b/i,
   /\b(?:edit|write|create|add|remove|delete|rewrite|patch|update)\b/i,
   /\b(?:run|execute|install|deploy|build|start|restart|publish)\b/i,
@@ -162,7 +177,7 @@ function weightedLength(text) {
  * @returns {{
  *   stall: boolean,
  *   verdict: 'stall' | 'had-tools' | 'too-short' | 'empty' | 'question' | 'asked-user'
- *          | 'already-done' | 'no-future-cue' | 'weak-only',
+ *          | 'standing-rule' | 'already-done' | 'no-future-cue' | 'weak-only',
  *   score: number,
  *   signals: string[],
  *   prompt: string | null,
@@ -190,10 +205,13 @@ export function detectStall(rawText, options = {}) {
   // ── 否决 ②：把决定权交回用户 ─────────────────────────────────────────────
   if (anyMatch(REQUEST_PATTERNS, tail)) return { ...empty, verdict: 'asked-user' };
 
+  // ── 否决 ③：确认/复述长期规则约定（「以后遇到…我会先…」）────────────────
+  if (anyMatch(STANDING_RULE_PATTERNS, tail)) return { ...empty, verdict: 'standing-rule' };
+
   const hasStrongFuture = anyMatch(FUTURE_STRONG, tail);
   const hasWeakFuture = anyMatch(FUTURE_WEAK, tail);
 
-  // ── 否决 ③：明确宣告完成且没有未来时 ─────────────────────────────────────
+  // ── 否决 ④：明确宣告完成且没有未来时 ─────────────────────────────────────
   if (!hasStrongFuture && !hasWeakFuture && anyMatch(DONE_PATTERNS, tail)) {
     return { ...empty, verdict: 'already-done' };
   }
@@ -210,11 +228,13 @@ export function detectStall(rawText, options = {}) {
     score += 1.5;
     signals.push('future-weak');
   }
-  if (anyMatch(ACTION_VERB, tail)) {
+  const hasVerb = anyMatch(ACTION_VERB, tail);
+  if (hasVerb) {
     score += 1;
     signals.push('action-verb');
   }
-  if (COLON_TAIL.test(trimmedRaw)) {
+  const hasColon = COLON_TAIL.test(trimmedRaw);
+  if (hasColon) {
     score += 1.5;
     signals.push('colon-tail');
   }
@@ -223,16 +243,43 @@ export function detectStall(rawText, options = {}) {
     signals.push('ellipsis-tail');
   }
 
-  if (!hasStrongFuture && !hasWeakFuture) {
+  // 末行非列表项以「动作动词 + 冒号」收尾（例如「……整份重写干净：」）：
+  // 即使省略了显式「我先/接下来」代词，也是典型的即将发起工具调用。
+  //
+  // 动词必须落在冒号前的**最后一个分句**里。只看「整行有没有动词」会把
+  // 「已定位问题并修好，根因有三层：」这类说明性收尾也算进来 —— 它的动词
+  // 在句中描述已完成的事，冒号引出的是名词性解释，不是待办。按设计原则第 1
+  // 条，宁可漏掉一次续跑，也不能把一条说明性收尾当成漏执行。
+  const lastLine = trimmedRaw.split('\n').map((l) => l.trim()).filter(Boolean).at(-1) ?? '';
+  const tailClause = lastLine.replace(/[:：]\s*$/, '').split(/[，,。；;！!？?]/).pop() ?? '';
+  const isActionColon = hasColon && hasVerb && anyMatch(ACTION_VERB, tailClause)
+    && !/^[-*•\d|]/.test(lastLine) && lastLine.length <= 160;
+  if (!hasStrongFuture && !hasWeakFuture && isActionColon) {
+    score += 1;
+    signals.push('action-colon');
+  }
+
+  if (!hasStrongFuture && !hasWeakFuture && !isActionColon) {
     return { stall: false, verdict: 'no-future-cue', score, signals, prompt: null };
   }
 
-  const threshold = hasStrongFuture ? THRESHOLD_STRONG : THRESHOLD_WEAK_ONLY;
+  const threshold = hasStrongFuture || isActionColon ? THRESHOLD_STRONG : THRESHOLD_WEAK_ONLY;
   if (score < threshold) {
     return { stall: false, verdict: 'weak-only', score, signals, prompt: null };
   }
 
   return { stall: true, verdict: 'stall', score, signals, prompt: CONTINUE_PROMPT };
+}
+
+/**
+ * 布尔判定便捷封装（供只需 boolean 的调用方使用）。
+ *
+ * @param {string} rawText
+ * @param {{ toolCallCount?: number }} [options]
+ * @returns {boolean}
+ */
+export function looksLikeAbandonedStep(rawText, options = {}) {
+  return detectStall(rawText, options).stall;
 }
 
 /**
