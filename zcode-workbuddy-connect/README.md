@@ -223,6 +223,34 @@ the watchdog, which only counts real upstream bytes.
 | Validate before writing provider config | A stray key does not fail one model, it silently deletes every provider. A temp file plus a schema mirror turns that into a loud error. |
 | Decrypt WorkBuddy 5.6 credentials inside the plugin | Since 5.6 the desktop app seals `accessToken`/`refreshToken` at rest, so the file is no longer readable as plain JSON. The plugin opens them by running the app's own Electron once as Node and reading its private storage binding — never by copying the tokens anywhere new. |
 
+## Stop hook: continue a turn that only announced the next step
+
+A second hook ships beside `SessionStart`. When a turn is about to end with
+**zero tool calls**, `hooks/stall-guard.mjs` scores the tail of the reply
+(`hooks/stall-detector.mjs`). A reply that announces work without doing it —
+`我先…`, `接下来…`, `Let me…`, usually ending in a colon — makes the hook print
+
+```json
+{"decision":"block","reason":"<continue prompt>"}
+```
+
+and ZCode feeds that prompt back for one more model request (contract read from
+`zcode.cjs`'s `processHookOutput`).
+
+Guards, because a wrong nudge is worse than a missed one:
+
+- a question, a request for your decision, or a completion summary is never continued;
+- the same reply text is continued at most once — the four `zcode-*-connect`
+  plugins claim an atomic fingerprint lock (`~/.zcode-stall-guard/`, override
+  with `ZCODE_STALL_GUARD_HOME`) so one prompt is injected, not four;
+- an explicit `exit 2` is never used: for `Stop` it means "continue", and the
+  error text would be replayed to the model as an instruction.
+
+The hook applies to **every** model in ZCode, not only this provider — the
+`Stop` payload carries no provider. The detector is a verbatim copy of
+`shared/stall-detector.mjs` in the suite root; regression test:
+`node tests/test-stall-detector.mjs`.
+
 ## Notes
 
 - **Never write to WorkBuddy's own files.** The sign-in file is input only.

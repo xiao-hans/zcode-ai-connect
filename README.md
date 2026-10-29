@@ -1,6 +1,6 @@
 # zcode-ai-connect
 
-把四款国产 AI IDE 桌面 App 的模型——**Trae CN**、**WorkBuddy**、**Qoder CN**、**千问办公(QwenWork)**——以本地 OpenAI 兼容端点的形式接入 **ZCode** 与 **pi**(以及任何 OpenAI 客户端)。复用各桌面 App 已有的登录,零 API key、零按量计费。
+把四款国产 AI IDE 桌面 App 的模型——**Trae CN**、**WorkBuddy**、**Qoder CN**、**千问办公(QwenWork)**——以本地 OpenAI 兼容端点的形式接入 **ZCode**、**pi**、**hermes**(以及任何 OpenAI 客户端)。复用各桌面 App 已有的登录,零 API key、零按量计费。
 
 ```
                  ┌─ ZCode(插件 + SessionStart 自动拉起)
@@ -10,21 +10,29 @@
 127.0.0.1:39270 ◀┤  zcode-qoder-connect     ──▶ Qoder CN     (COSY+WAF 协议)
 127.0.0.1:39269 ◀┤  zcode-qwenwork-connect  ──▶ 千问办公       (COSY WASM 签名)
                  │
-                 └─ pi(pi-connect-services 启动扩展 + models.json 供应商)
+                 ├─ pi(pi-connect-services 启动扩展 + models.json 供应商)
+                 └─ hermes(hermes-connect-services:on_session_start hook + config.yaml)
 ```
 
 ## 前置条件
 
 - Windows + [Node.js](https://nodejs.org) 18+(四个工具均为纯 Node,零依赖);
 - 对应桌面 App 已安装并**登录过一次**:Trae CN / WorkBuddy / Qoder CN / 千问办公(凭据只读复用,见各插件 README);
-- ZCode(可选)与 [pi coding agent](https://github.com/badlogic/pi-mono)(可选)。
+- ZCode(可选)、[pi coding agent](https://github.com/badlogic/pi-mono)(可选)、hermes(可选)。
+
+已发布到 npm 的部分(四个端点可独立安装,不必 clone):
+
+```sh
+npm i zcode-trae-connect zcode-workbuddy-connect zcode-qoder-connect zcode-qwenwork-connect
+```
 
 ## 一、启动方式(核心设计)
 
-服务**不注册开机自启**。打开 ZCode 或 pi **任一应用**时自动拉起:
+服务**不注册开机自启**。打开 ZCode / pi / hermes **任一应用**时自动拉起:
 
 - ZCode 侧:每个插件的 `SessionStart` hook 探测端口,不在则静默拉起;
-- pi 侧:`pi-connect-services` 扩展在 pi 启动时做同样的事。
+- pi 侧:`pi-connect-services` 扩展在 pi 启动时做同样的事;
+- hermes 侧:`hermes-connect-services` 的 `on_session_start` shell hook 做同样的事。
 
 手动兜底:`node <插件>/bin/cli.mjs serve --port <端口>`。
 
@@ -77,7 +85,22 @@ node D:/path/to/zcode-ai-connect/sync-pi-models.mjs
 
 千问办公在 pi 侧走姊妹扩展 [pi-provider-qwenwork](https://github.com/xiao-hans/pi-provider-qwenwork)(随机端口、进程内密钥),与本套件的 39269 端点互不冲突——二者读同一份桌面登录态,服务进程独立。
 
-## 四、各家速览
+## 四、接入 hermes
+
+[hermes-connect-services](hermes-connect-services/) 用一次命令完成全部件事:写 provider、写模型能力、写懒启动 hook。
+
+```sh
+node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
+```
+
+- 写入位置:`%LOCALAPPDATA%\hermes\config.yaml`(Windows)/ `~/.hermes/config.yaml`,只动三块 `# >>> zcode-ai-connect >>>` 标记之间的区域,其余配置原样保留;写盘前自动备份 `.bak`。
+- provider id:`zc-trae` / `zc-workbuddy` / `zc-qoder` / `zc-qwenwork`,`/model` 或 `--provider zc-workbuddy --model deepseek-v4.1-flash` 选用。
+- 打开 hermes 即自动拉起四个端点(同 ZCode / pi 的探针+拉起逻辑)。
+- Token 轮换或上游名册变化:重跑同一条命令。`--remove` 卸载,`--only <id>` 单独同步。
+
+完整文档与排障(hooks 确认、回环被代理劫持、思考档位)见 [hermes-connect-services/README.md](hermes-connect-services/README.md)。
+
+## 五、各家速览
 
 | | WorkBuddy | Trae CN | Qoder CN | 千问办公 |
 |---|---|---|---|---|
@@ -91,7 +114,7 @@ node D:/path/to/zcode-ai-connect/sync-pi-models.mjs
 
 各插件的完整文档(排障、命令、协议细节):[zcode-trae-connect](zcode-trae-connect/) · [zcode-workbuddy-connect](zcode-workbuddy-connect/) · [zcode-qoder-connect](zcode-qoder-connect/) · [zcode-qwenwork-connect](zcode-qwenwork-connect/)
 
-## 五、长回合为什么不会「突然不动」
+## 六、长回合为什么不会「突然不动」
 
 四个端点的流收尾是同一套规则,任何一个都不允许把「异常」说成「正常结束」:
 
@@ -108,6 +131,31 @@ node D:/path/to/zcode-ai-connect/sync-pi-models.mjs
 
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
 
+## 七、「只说不做」的自动续跑(Stop hook)
+
+模型常见的一种收尾是**宣布了下一步却直接停住**:
+
+> 我先检查配置,再修改这里:
+
+这一轮**没有任何工具调用**,于是 ZCode 认为回复结束、等你说话。四个连接器插件现在各注册一个 `Stop` hook(`hooks/stall-guard.mjs`)来兜住这种情况:
+
+| 步骤 | 发生什么 |
+|---|---|
+| 1 | 一轮在零工具调用下准备结束时,ZCode 执行 `Stop` hook,把整段回复放进 stdin |
+| 2 | `hooks/stall-detector.mjs` 给收尾打分:强/弱未来标记(`我先…`/`接下来…`/`Let me…`)+ 动作动词 + 冒号/省略号收尾 |
+| 3 | 命中则输出 `{"decision":"block","reason":"<续跑提示>"}`,ZCode 把提示回灌上下文并再请求一次模型 |
+| 4 | ZCode 自身限制每轮续跑次数;再给一次机会,不保证任务一定做完 |
+
+**误判是这里唯一真正昂贵的事**,所以否决规则先于肯定规则求值:
+
+- 以问句收尾、把决定权交回你(`请你确认`/`是否要`/`shall I`)、明确的完成宣告(`已完成`/`all done`)——一律不续跑;
+- 同一段回复文本**只续跑一次**:四个插件并存时用原子指纹锁(默认 `~/.zcode-stall-guard/`,`ZCODE_STALL_GUARD_HOME` 可改)跨进程互斥,只会注入一条提示,不会四条;
+- 以冒号结尾只是加权项,不足以独立触发(说明性文字大量以冒号收尾)。
+
+**限制:Stop 载荷里没有 provider 信息**,所以这份 hook 影响 ZCode 里的所有模型,不只千问办公那一个。判定逻辑与 pi / dsh 侧共用同一份 `shared/stall-detector.mjs`(由 `scripts/sync-stall-guard.mjs` 分发),三端阈值一致。
+
+回归测试:`node tests/test-stall-detector.mjs`
+
 ## 目录
 
 ```
@@ -117,7 +165,11 @@ zcode-ai-connect/
 ├── zcode-qoder-connect/      # Qoder CN 接入(双轨凭据)
 ├── zcode-qwenwork-connect/   # 千问办公接入(vendored WASM 签名链)
 ├── pi-connect-services/      # pi 启动扩展:自动拉起三个端点
-└── sync-pi-models.mjs        # pi 供应商/名册同步脚本
+├── sync-pi-models.mjs        # pi 供应商/名册同步脚本
+├── hermes-connect-services/  # hermes 接入:config.yaml 同步 + 启动 hook
+├── shared/                   # stall-detector 权威源(分发到各宿主)
+├── scripts/                  # sync-stall-guard.mjs:把检测器铺到各包
+└── tests/                    # 检测器与流收尾的回归测试
 ```
 
 ## 免责与致谢

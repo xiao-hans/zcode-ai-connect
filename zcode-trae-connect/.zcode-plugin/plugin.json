@@ -35,6 +35,21 @@
           }
         ]
       }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "process",
+            "command": "node",
+            "args": [
+              "${ZCODE_PLUGIN_ROOT}/hooks/stall-guard.mjs"
+            ],
+            "timeoutMs": 15000,
+            "statusMessage": "Checking for an announced-but-unexecuted step"
+          }
+        ]
+      }
     ]
   }
 }

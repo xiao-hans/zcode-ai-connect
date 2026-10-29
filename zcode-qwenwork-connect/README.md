@@ -55,6 +55,24 @@ pi 侧由姊妹扩展 [pi-provider-qwenwork](https://github.com/xiao-hans/pi-pro
 - 凭据只在内存中传递；日志不含 token；上游错误经脱敏后才回传。
 - 本插件不向千问办公上游之外的任何地址发起请求。
 
+## 只说不做:Stop hook 续跑
+
+插件在 `SessionStart` 之外还注册一个 `Stop` hook。一轮**零工具调用**准备结束时,ZCode 把整段回复交给 `hooks/stall-guard.mjs`;`hooks/stall-detector.mjs` 判断这段话是不是「宣布了下一步却没动手」(`我先…`/`接下来…`/`Let me…`,常以冒号收尾)。命中则输出
+
+```json
+{"decision":"block","reason":"<续跑提示>"}
+```
+
+ZCode 把提示回灌上下文、再请求一次模型(契约来自 `zcode.cjs` 的 `processHookOutput`)。
+
+三条防护,因为误续跑比漏续跑更贵:
+
+- 以问句收尾、把决定权交回用户、明确宣告完成 —— 一律不续跑;
+- 同一段回复只续跑一次:四个 `zcode-*-connect` 插件并存时用原子指纹锁(`~/.zcode-stall-guard/`,`ZCODE_STALL_GUARD_HOME` 可改)跨进程互斥,只注入一条提示;
+- 绝不用 `exit 2` 报错 —— 对 `Stop` 它等价于「要求继续」,错误文本会被当成续跑指令回灌。
+
+**限制**:`Stop` 载荷不带 provider,这份 hook 影响 ZCode 里所有模型,不只千问办公。判定逻辑是 `shared/stall-detector.mjs` 的逐字副本;回归测试 `node tests/test-stall-detector.mjs`。
+
 ## 来源与许可
 
 MIT。`vendor/lib/` 与 `vendor/research/` vendored 自
