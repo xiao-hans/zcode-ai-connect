@@ -13,15 +13,33 @@ ZCode 侧由各插件的 SessionStart hook 负责同样的事;装上这个扩展
 ## 安装
 
 ```sh
+pi install npm:pi-connect-services
+```
+
+三个 connect 工具(`zcode-qoder-connect`、`zcode-workbuddy-connect`、`zcode-trae-connect`)是本包的依赖,会一并装上,**无需额外配置**。
+
+也可以装本地副本(例如套件仓库里的开发版):
+
+```sh
 pi install /path/to/pi-connect-services
 ```
 
+## 工具定位顺序
+
+扩展按顺序找每个工具目录,第一个含 `bin/cli.mjs` 的胜出:
+
+1. `PI_CONNECT_TOOLS_ROOT` —— 显式覆盖,优先级最高;
+2. npm 依赖 —— `pi install npm:` 时的默认路径,开箱即用;
+3. 兄弟目录布局 —— 本扩展上一级下的 `<tool>`,即套件仓库 checkout 的形状。
+
+三个都找不到时,启动日志会出现一条 `FAILED — <tool> not found` 警告(而不是静默失败)。
+
 ## 配置
 
-端点工具根目录默认为本扩展所在目录的上一级(即套件仓库根),可用环境变量覆盖:
+通常不需要。只有当你想让 npm 安装的扩展去拉起**套件仓库里的开发版**工具时,才设:
 
 ```
-PI_CONNECT_TOOLS_ROOT=D:/your/tools/root
+PI_CONNECT_TOOLS_ROOT=D:/your/suite/repo
 ```
 
 (其下应存在 `zcode-qoder-connect`、`zcode-workbuddy-connect`、`zcode-trae-connect` 三个目录。)
