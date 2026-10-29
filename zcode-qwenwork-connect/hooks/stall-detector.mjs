@@ -295,4 +295,21 @@ export const CONTINUE_PROMPT = [
   '如果需要用户先决定，提出一个具体的问题，不要继续描述待办。',
 ].join('\n');
 
+/**
+ * 空回合的续跑提示：模型只留下思考过程（thinking），既没有正文也没有工具调用。
+ *
+ * 实测故障模式（2026-10-30，pi 会话 01a1880e，provider=workbuddy / hy4-preview）：
+ * usage 显示 output 有 286 / 667 个 token、reasoning 145 / 457，耗时 7.6s、15.5s
+ * （不是超时被切），但 content 里只有 thinking 块，正文为空。用户看到的就是
+ * 「思考着，突然不工作了」。
+ *
+ * 与 CONTINUE_PROMPT 的区别：那一条假定还有可见文本可以判断意图；这里什么都
+ * 没有，所以不能说「执行你宣布的操作」—— 只能要求它把结论说出来。
+ */
+export const EMPTY_TURN_PROMPT = [
+  '你上一条回复只留下了思考过程，没有给出任何可见内容，也没有调用任何工具。',
+  '请把你的结论直接说出来：已经做了什么、接下来要做什么，或者一句话说明这一轮的结果。',
+  '不要重复思考过程，也不要只描述计划而不动手。',
+].join('\n');
+
 export default detectStall;

@@ -95,7 +95,18 @@ async function main() {
   const empty = await hookSays('');
   check('empty stdin -> no block', !empty.blocked);
 
-  console.log('\n[4] stdout is always parseable JSON');
+  console.log('\n[4] empty turn: only thinking, no text, no tools');
+  const e1 = await hookSays({ session_id: 's9', turnId: 't9', toolCallCount: 0, responseText: '' });
+  check('empty text + no tools -> block', e1.blocked);
+  check('uses the empty-turn prompt, not the stall one', e1.raw.includes('只留下了思考过程'), e1.raw.slice(0, 40));
+
+  const e2 = await hookSays({ session_id: 's9', turnId: 't9', toolCallCount: 0, responseText: '   \n  ' });
+  check('whitespace-only text -> block', e2.blocked);
+
+  const e3 = await hookSays({ session_id: 's9', turnId: 't9', toolCallCount: 2, responseText: '' });
+  check('empty text but tools did run -> no block', !e3.blocked);
+
+  console.log('\n[5] stdout is always parseable JSON');
   for (const [label, r] of [['stall', a1], ['dedupe', a2], ['budget', c1], ['junk', junk]]) {
     let okJson = false;
     try { JSON.parse(r.raw); okJson = true; } catch { okJson = false; }

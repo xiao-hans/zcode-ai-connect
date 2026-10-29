@@ -1,6 +1,6 @@
 {
   "name": "zcode-qwenwork-connect",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Bring QwenWork (千问办公) desktop models — Qwen3.8-Flash, Pro, Qwen3.8-Max — into ZCode as an OpenAI-compatible provider, reusing the desktop app's own sign-in. Zero configuration, zero API keys.",
   "description_i18n": {
     "en": "Bring QwenWork (千问办公) desktop models into ZCode as an OpenAI-compatible provider, reusing the desktop app's own sign-in.",

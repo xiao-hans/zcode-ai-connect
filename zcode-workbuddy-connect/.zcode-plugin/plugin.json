@@ -1,6 +1,6 @@
 {
   "name": "zcode-workbuddy-connect",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "description": "Bring WorkBuddy desktop-app models — domestic and international (GLM-5.3, DeepSeek-V4-Pro, Kimi-K3, MiniMax-M3, Hy3, GPT-5.6, Gemini-3.5-Flash …) — into ZCode as OpenAI-compatible providers, with zero configuration.",
   "description_i18n": {
     "en": "Bring WorkBuddy desktop-app models, domestic and international, into ZCode as OpenAI-compatible providers, with zero configuration.",

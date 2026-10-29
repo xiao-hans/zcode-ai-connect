@@ -1,0 +1,41 @@
+{
+  "name": "pi-turn-guard",
+  "displayName": "Pi Turn Guard",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "Pi 扩展：模型只留下思考过程就收尾（空回合）时自动补一轮；同时为没有自带守卫的 provider（trae / workbuddy / qoder）补上「宣布下一步却没动手」的续跑。",
+  "license": "MIT",
+  "author": {
+    "name": "xiao-hans",
+    "url": "https://github.com/xiao-hans"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiao-hans/zcode-ai-connect.git",
+    "directory": "pi-turn-guard"
+  },
+  "homepage": "https://github.com/xiao-hans/zcode-ai-connect/tree/main/pi-turn-guard#readme",
+  "bugs": {
+    "url": "https://github.com/xiao-hans/zcode-ai-connect/issues"
+  },
+  "engines": {
+    "node": ">=18.17.0"
+  },
+  "files": [
+    "index.js",
+    "lib/",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "index.js",
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org/",
+    "access": "public"
+  },
+  "keywords": [
+    "pi",
+    "pi-coding-agent",
+    "extension",
+    "stall-guard"
+  ]
+}

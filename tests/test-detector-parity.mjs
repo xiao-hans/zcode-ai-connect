@@ -16,7 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { detectStall } from '../shared/stall-detector.mjs';
+import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PY_DETECTOR = join(HERE, '..', 'shared', 'stall_detector.py');
@@ -146,6 +146,27 @@ try {
 } catch (error) {
   failed += 1;
   console.log(`  FAIL CONTINUE_PROMPT\n       ${error.message.split('\n')[0]}`);
+}
+
+// EMPTY_TURN_PROMPT 同理：空回合的续跑提示，两边措辞必须一致。
+{
+  const pyDir = dirname(PY_DETECTOR).replaceAll('\\', '/');
+  const out = spawnSync(
+    python,
+    // 走 json.dumps：Windows 上 python 的 stdout 不一定是 UTF-8，直接 print
+    // 中文会乱码，json 会转义成 ASCII 所以安全。
+    ['-c', `import sys, json; sys.path.insert(0, r"${pyDir}"); import stall_detector as d; print(json.dumps(d.EMPTY_TURN_PROMPT))`],
+    { encoding: 'utf8', timeout: 20000 },
+  );
+  try {
+    assert.equal(out.status, 0, `python 读取 EMPTY_TURN_PROMPT 失败: ${(out.stderr || '').slice(0, 200)}`);
+    assert.equal(JSON.parse(out.stdout), EMPTY_TURN_PROMPT, 'EMPTY_TURN_PROMPT 文本不一致');
+    passed += 1;
+    console.log('  ok   EMPTY_TURN_PROMPT 逐字一致');
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL EMPTY_TURN_PROMPT\n       ${error.message.split('\n')[0]}`);
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

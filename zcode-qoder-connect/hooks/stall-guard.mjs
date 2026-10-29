@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { detectStall } from './stall-detector.mjs';
+import { detectStall, EMPTY_TURN_PROMPT } from './stall-detector.mjs';
 
 /** 四个包共用同一把锁，否则「装几个插件就续跑几次」。 */
 const LOCK_HOME = process.env['ZCODE_STALL_GUARD_HOME'] ?? join(homedir(), '.zcode-stall-guard');
@@ -163,7 +163,14 @@ async function main() {
   const turnId = pickString(input, ['turnId', 'turn_id']) || `session:${sessionId}`;
 
   const result = detectStall(text, { toolCallCount });
-  if (!result.stall) {
+
+  // 空回合：模型只留下 thinking，既没有正文也没有工具调用就收尾了。
+  // detectStall 对空文本返回 'empty'（不续跑），但那正是用户看到「思考着突然
+  // 不工作」的场景 —— 这里单独识别并续跑，提示语也不同（没有可判断的意图，
+  // 只能要求它把结论说出来）。
+  const emptyTurn = !result.stall && text.trim() === '' && toolCallCount === 0;
+
+  if (!result.stall && !emptyTurn) {
     log(`no stall (${result.verdict}, score=${result.score})`);
     return emit({});
   }
@@ -182,8 +189,12 @@ async function main() {
   }
 
   pruneOldSignatures();
-  log(`stall detected (score=${result.score}, signals=${result.signals.join('+')}) → asking for one more turn (${attempt}/${MAX_AUTO_CONTINUES})`);
   // decision:block 必须带 reason，否则 additionalContexts 为空、不会续跑。
+  if (emptyTurn) {
+    log(`empty turn (only thinking, no text, no tools) → asking for one more turn (${attempt}/${MAX_AUTO_CONTINUES})`);
+    return emit({ decision: 'block', reason: EMPTY_TURN_PROMPT });
+  }
+  log(`stall detected (score=${result.score}, signals=${result.signals.join('+')}) → asking for one more turn (${attempt}/${MAX_AUTO_CONTINUES})`);
   return emit({ decision: 'block', reason: result.prompt });
 }
 
