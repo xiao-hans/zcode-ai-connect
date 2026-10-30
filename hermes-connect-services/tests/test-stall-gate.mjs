@@ -83,9 +83,25 @@ let failed = 0;
 
 const meta = JSON.parse(lines[0]);
 console.log(`  max nudges = ${meta.max_nudges}`);
+if (meta.max_nudges !== 2) {
+  failed += 1;
+  console.log(`  FAIL max nudges = ${meta.max_nudges} (expect 2, 与 ZCode / pi / dsh 一致)`);
+}
 
 for (const line of lines.slice(1)) {
   const r = JSON.parse(line);
+  if (r.name === 'per-turn-budget') {
+    const sameTurnOk = JSON.stringify(r.same_turn) === JSON.stringify([true, true, false]);
+    const resetOk = r.after_new_user === true;
+    if (sameTurnOk && resetOk) {
+      passed += 1;
+      console.log(`  ok   per-turn-budget → ${JSON.stringify(r.same_turn)} 且新用户消息后重置`);
+    } else {
+      failed += 1;
+      console.log(`  FAIL per-turn-budget → same_turn=${JSON.stringify(r.same_turn)} after_new_user=${r.after_new_user}`);
+    }
+    continue;
+  }
   const ok = r.continue_turn === r.expect;
   if (ok) {
     passed += 1;

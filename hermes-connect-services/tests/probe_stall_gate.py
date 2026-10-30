@@ -71,3 +71,33 @@ for case in CASES:
     result["name"] = case["name"]
     result["expect"] = case["expect"]
     print(json.dumps(result, ensure_ascii=False))
+
+
+def budget_probe():
+    """同一 agent 连跑多次收尾闸：预算应按轮计（2 次），新用户消息后重置。
+
+    闸门注入的提示带 flag=True，_zc_stall_guard_turn_key 会跳过它，
+    所以同一轮里续跑不会把自己当成新回合 —— 这里正是验证这一点。
+    """
+    agent = FakeAgent()
+    messages = [{"role": "user", "content": "开始"}]
+
+    def fire(text):
+        verdict = apply_stop_gates(
+            agent, {"role": "assistant", "content": text},
+            final_response=text, messages=messages, conversation_history=[],
+            pending_verification_response=None, pending_verification_response_previewed=False,
+        )
+        return bool(verdict.continue_turn)
+
+    same_turn = [
+        fire("我先检查配置，再修改这里："),
+        fire("好的，我先看一下日志再定位："),
+        fire("接下来我要把配置改掉："),
+    ]
+    messages.append({"role": "user", "content": "换个问题"})
+    after_new_turn = fire("好的，我先看一下日志再定位：")
+    return {"name": "per-turn-budget", "same_turn": same_turn, "after_new_user": after_new_turn}
+
+
+print(json.dumps(budget_probe(), ensure_ascii=False))
