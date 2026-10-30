@@ -26,6 +26,11 @@ const PACKAGES = ['zcode-trae-connect', 'zcode-workbuddy-connect', 'zcode-qoder-
  */
 const PY_DETECTOR_TARGETS = [join(ROOT, 'hermes-connect-services', 'lib', 'stall_detector.py')];
 
+/**
+ * 其他 Node 宿主自带的判定器副本。pi 扩展走 npm 分发，同样不能跨包 import。
+ */
+const MJS_DETECTOR_TARGETS = [join(ROOT, 'pi-connect-services', 'lib', 'stall-detector.mjs')];
+
 const argv = process.argv.slice(2);
 const dryRun = argv.includes('--dry-run');
 const bump = argv.includes('--bump');
@@ -93,6 +98,17 @@ for (const pkg of PACKAGES) {
     console.log(`  ${pkg}: plugin.json Stop registered${bump ? ` (v${manifest.version})` : ''}`);
     touched += 1;
   }
+}
+
+// Node 版检测器的其他宿主（pi 扩展）。
+for (const target of MJS_DETECTOR_TARGETS) {
+  const existed = existsSync(target);
+  if (!dryRun) {
+    mkdirSync(dirname(target), { recursive: true });
+    writeFileSync(target, detector, 'utf8');
+  }
+  console.log(`  ${target.slice(ROOT.length + 1).replaceAll('\\', '/')} ${existed ? 'updated' : 'created'}`);
+  touched += 1;
 }
 
 // Python 版检测器：hermes 的补丁脚本从这里读，随 npm 包一起发布。

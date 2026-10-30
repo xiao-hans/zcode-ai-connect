@@ -1,6 +1,6 @@
 {
   "name": "zcode-trae-connect",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Bring Trae desktop-app models — domestic and international (GLM-5.3, DeepSeek-V4.1-Flash, Kimi-K3, Trae Auto …) — into ZCode as OpenAI-compatible providers, with zero configuration.",
   "description_i18n": {
     "en": "Bring Trae desktop-app models, domestic and international, into ZCode as OpenAI-compatible providers, with zero configuration.",

@@ -60,6 +60,16 @@ check('我先…（无冒号，靠强未来 + 动词过线）', () => {
   stalls('我先读取 config.yaml 里的 providers 段，再定位重复的那两个键。');
 });
 
+// 真实事故回放：宣布「我查一下…」后以冒号收尾，却没调工具。
+// 冒号 +1.5、动作动词 +1、「我查一下」强未来 +2 = 4.5，过强信号线。
+check('「我查一下…」+ 冒号（真实事故回放）', () => {
+  const r = detectStall('先别急着让你找——我查一下插件源码和官方文档，确认配对码到底由谁生成：');
+  assert.equal(r.stall, true, `expected stall, got verdict=${r.verdict} score=${r.score}`);
+  assert.equal(r.score, 4.5, `score=${r.score}`);
+  assert.deepEqual(r.signals, ['future-strong', 'action-verb', 'colon-tail']);
+  assert.equal(r.prompt, CONTINUE_PROMPT);
+});
+
 // ── 不许续跑的 ──────────────────────────────────────────────────────────────
 check('提问结尾', () => {
   quiet('需要我先确认一下端口状态吗？', 'question');
@@ -75,6 +85,18 @@ check('交回选择权', () => {
 
 check('已完成宣告', () => {
   quiet('已完成全部修改，测试通过。', 'already-done');
+});
+
+// 「可以，主人。以后…」是在复述一条长期规则，不是本轮宣布了动作却漏调工具。
+check('复述长期规则约定（standing-rule）', () => {
+  const r = detectStall('可以，主人。以后遇到这类问题我会先检查插件源码再动手。');
+  assert.equal(r.stall, false, `expected no stall, got score=${r.score}`);
+  assert.equal(r.verdict, 'standing-rule');
+});
+
+// 「我 + 动词」必须带量词才算强未来：「我看」是表态，不是要动手。
+check('表态不算宣布动作', () => {
+  quiet('我看这个方案可以，就按它来。', 'no future cue');
 });
 
 check('纯说明性冒号收尾（无未来时）', () => {

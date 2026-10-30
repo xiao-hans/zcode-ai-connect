@@ -1,6 +1,6 @@
 {
   "name": "zcode-qoder-connect",
-  "version": "1.2.3",
+  "version": "1.2.4",
   "description": "Bring Qoder CN models — domestic (DeepSeek-V4-Pro, Qwen3.8-Max, GLM-5.3, Kimi-K3.1-Pro …) — into ZCode as an OpenAI-compatible provider, with zero configuration.",
   "description_i18n": {
     "en": "Bring Qoder CN models into ZCode as OpenAI-compatible providers, with zero configuration.",
