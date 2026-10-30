@@ -244,14 +244,19 @@ export function createQwenworkServer(options) {
     }
 
     if (req.method === 'POST' && (path === '/v1/chat/completions' || path === '/v1/chat/completions/')) {
-      let wantsStream = true
+      // OpenAI defaults `stream` to false when the key is absent. Defaulting to
+      // true here silently turned every non-streaming caller (auxiliary clients:
+      // title generation, smart approvals, probes) into an SSE consumer, so they
+      // parsed a `data: {...}` text frame as the completion and failed with
+      // "LLM returned invalid response (type=str)". Keep the spec default.
+      let wantsStream = false
       let model = 'pro'
       let raw
       try {
         raw = await readBody(req)
         const text = raw.toString('utf8')
         const parsed = JSON.parse(text === '' ? '{}' : text)
-        wantsStream = parsed?.['stream'] !== false
+        wantsStream = parsed?.['stream'] === true
         if (typeof parsed?.['model'] === 'string' && parsed['model'] !== '') model = parsed['model']
       } catch (error) {
         writeOpenAIError(res, 400, 'invalid_request_error', String(error?.message ?? error))

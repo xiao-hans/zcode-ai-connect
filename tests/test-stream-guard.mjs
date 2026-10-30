@@ -181,4 +181,27 @@ const base = { model: 'test-model', messages: [{ role: 'user', content: 'hi' }],
   })
 }
 
+// --- 5. omitted `stream` must default to non-streaming JSON -----------------
+// OpenAI defaults `stream` to false. Defaulting to true broke every auxiliary
+// client that omits the key (Hermes title generation / smart approvals): it
+// received `data: {...}` SSE text and failed with
+// "LLM returned invalid response (type=str)".
+{
+  const chunks = [
+    'data: {"choices":[{"index":0,"delta":{"content":"你好"},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n',
+  ]
+  const client = { chatStream: async () => ({ ok: true, response: sseResponse(chunks) }) }
+  await withServer(client, async server => {
+    const res = await post(server, { model: 'test-model', messages: [{ role: 'user', content: 'hi' }] })
+    const contentType = res.headers.get('content-type') ?? ''
+    assert.ok(contentType.includes('application/json'), `omitted stream must yield JSON, got ${contentType}`)
+    const body = await res.json()
+    assert.equal(body.object, 'chat.completion')
+    assert.equal(body.choices[0].message.content, '你好')
+    await server.close()
+    console.log('ok  5. omitted stream defaults to a JSON completion')
+  })
+}
+
 console.log('all stream-guard tests passed')

@@ -698,11 +698,16 @@ export function createTraeServer(options) {
     if (sanitized.dropped > 0) {
       logger.warn(`[trae] dropped ${sanitized.dropped} empty assistant message(s) from the request history`)
     }
-    let wantsStream = true
+    // OpenAI defaults `stream` to false when the key is absent. Defaulting to
+    // true here silently turned every non-streaming caller (auxiliary clients:
+    // title generation, smart approvals, probes) into an SSE consumer, so they
+    // parsed a `data: {...}` text frame as the completion and failed with
+    // "LLM returned invalid response (type=str)". Keep the spec default.
+    let wantsStream = false
     let model = 'auto'
     try {
       const parsed = JSON.parse(raw)
-      wantsStream = parsed?.['stream'] !== false
+      wantsStream = parsed?.['stream'] === true
       if (typeof parsed?.['model'] === 'string') model = parsed['model']
     } catch {
       // A non-JSON body fails in the upstream client below; treat it as
