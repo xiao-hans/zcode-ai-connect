@@ -327,5 +327,8 @@
       }
     ]
   },
-  "autoCompactEnabled": true
+  "autoCompactEnabled": true,
+  "permissions": {
+    "defaultMode": "bypassPermissions"
+  }
 }
