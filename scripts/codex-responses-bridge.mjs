@@ -675,6 +675,27 @@ class AnthropicStreamBuilder {
   }
 }
 
+// ---- 用量估算 ----
+// 估算供 message_start 的 usage 与 Claude 的上下文计量。必须排除 image 块的
+// base64 数据:翻译时图片被丢弃,上游成本为零;若按 JSON 长度计,一张截图的
+// base64(~25 万字符)会虚增 6 万+ token,把 Claude 的上下文计量灌爆,
+// 触发与真实用量无关的 "Context limit reached" 本地拒发。
+function estimateTokens(body) {
+  let chars = 0;
+  const walk = (v) => {
+    if (typeof v === 'string') { chars += v.length; return; }
+    if (Array.isArray(v)) { for (const x of v) walk(x); return; }
+    if (v && typeof v === 'object') {
+      if (v.type === 'image' && typeof v.source?.data === 'string') { chars += 400; return; }
+      for (const k in v) walk(v[k]);
+    }
+  };
+  walk(body.system);
+  walk(body.messages);
+  walk(body.tools);
+  return Math.ceil(chars / 4);
+}
+
 async function handleMessages(req, res, body) {
   const wireModel = body.model ?? '';
   const slash = wireModel.indexOf('/');
@@ -701,7 +722,7 @@ async function handleMessages(req, res, body) {
   if (tools) chatPayload.tools = tools;
   const tc = anthropicToolChoice(body.tool_choice);
   if (tc) chatPayload.tool_choice = tc;
-  const estInput = Math.ceil((JSON.stringify(body.system ?? '') + JSON.stringify(body.messages ?? '') + JSON.stringify(body.tools ?? '')).length / 4);
+  const estInput = estimateTokens(body);
 
   const callUpstream = (mutLevel, noStreamOptions) => {
     const p = { ...chatPayload };
