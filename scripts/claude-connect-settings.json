@@ -2,14 +2,17 @@
   "env": {
     "ANTHROPIC_BASE_URL": "http://127.0.0.1:39268",
     "ANTHROPIC_AUTH_TOKEN": "zc-connect-local",
-    "ANTHROPIC_MODEL": "wb/glm-5.3",
+    "ANTHROPIC_MODEL": "wb/deepseek-v4.1-flash",
     "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qw/qwen3.8-flash",
     "ANTHROPIC_DEFAULT_SONNET_MODEL": "wb/glm-5.3",
     "ANTHROPIC_DEFAULT_OPUS_MODEL": "wb/glm-5.3",
     "ANTHROPIC_DEFAULT_FABLE_MODEL": "wb/glm-5.3",
-    "CLAUDE_CODE_SUBAGENT_MODEL": "wb/glm-5.3",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "wb/deepseek-v4.1-flash",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
-    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy"
   },
   "modelPicker": {
     "replaceBuiltInOptions": true,
@@ -31,12 +34,12 @@
       },
       {
         "model": "wb/deepseek-v4.1-flash",
-        "label": "DeepSeek-V4.1-Flash · WorkBuddy",
+        "label": "DeepSeek-V4.1-Flash · WorkBuddy ★",
         "behavesAs": "claude-sonnet-4-6"
       },
       {
         "model": "wb/glm-5.3",
-        "label": "GLM-5.3 · WorkBuddy ★",
+        "label": "GLM-5.3 · WorkBuddy",
         "behavesAs": "claude-sonnet-4-6"
       },
       {
