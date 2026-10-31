@@ -10,5 +10,18 @@
     "CLAUDE_CODE_SUBAGENT_MODEL": "wb/glm-5.3",
     "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  },
+  "modelPicker": {
+    "replaceBuiltInOptions": true,
+    "options": [
+      { "model": "wb/glm-5.3", "label": "GLM-5.3 · WorkBuddy(主推)", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "wb/kimi-k3.1-pro", "label": "Kimi K3.1 Pro · WorkBuddy", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "wb/deepseek-v4.1-flash", "label": "DeepSeek V4.1 Flash · WorkBuddy", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "trae/glm-5.3", "label": "GLM-5.3 · Trae CN", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "qoder/glm-5.3", "label": "GLM-5.3 · Qoder CN", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "qoder/deepseek-v4-pro", "label": "DeepSeek V4 Pro · Qoder CN", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "qw/qwen3.8-max-preview", "label": "Qwen3.8 Max Preview · 千问办公", "behavesAs": "claude-sonnet-4-6" },
+      { "model": "qw/qwen3.8-flash", "label": "Qwen3.8 Flash · 千问办公(快速档)", "behavesAs": "claude-haiku-4-5" }
+    ]
   }
 }

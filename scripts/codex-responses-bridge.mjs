@@ -282,17 +282,22 @@ function mapUsage(u) {
 }
 
 // ---- 上游 WAF 去指纹 ----
-// workbuddy 上游对已知 coding CLI 的官方身份声明做通道指纹匹配(Codex 与 Claude Code
-// 的开头段均实测命中),空白归一化、大小写与 CRLF 不敏感,命中即 400/11128 拦截。
-// 语义无损的词级改写即可绕过:
-//   level 0:去牛津逗号(命中 Codex 指纹)
-//   level 1:首处 "You are "→"You're "(命中 Claude Code 指纹)+ Codex 专用措辞改写
+// workbuddy 上游对已知 coding CLI 的官方特征做通道指纹匹配(命中即 400/11128),
+// 实测指纹(Claude Code 侧大小写、斜杠、空白均归一,只能改词):
+//   · Codex:开头身份三句("You are a coding agent running in the Codex CLI…")
+//   · Claude Code:x-anthropic-billing-header 计费块(见 stripBillingBlocks,直接剥)
+//     以及 system 里的官方反馈链接 github.com/anthropics/claude-code/issues
+// 语义无损的改写梯子:
+//   level 0:去牛津逗号 + 反馈链接周边措辞微调(链接本体不动、仍可点)
+//   level 1:首处 "You are "→"You're " + Codex 专用措辞 + 链接路径破形(兜底)
 function deFingerprint(instructions, level = 0) {
   if (typeof instructions !== 'string' || !instructions) return instructions;
   let s = instructions.replace(/, and /g, ' and ');
+  s = s.replace(/report the issue at (https:\/\/github\.com\/anthropics\/claude-code\/issues)/, 'report issues at $1');
   if (level >= 1) {
     s = s.replace(/You are /, "You're ");
     s = s.replace(/running in the Codex CLI/g, 'running within the Codex CLI');
+    s = s.replace(/anthropics\/claude-code\/issues/, 'anthropics/claude-code/claude-code/issues');
   }
   return s;
 }

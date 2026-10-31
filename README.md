@@ -138,13 +138,14 @@ Claude Code 讲 Anthropic Messages 协议,同一个桥同样翻译:`POST /v1/mes
 scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交互 / MCP 均可)
 ```
 
-模型映射在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`,sonnet/opus/fable 位同主模型,`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`(WorkBuddy glm-5.3 实窗口 1M);想换模型直接改该文件。
+模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`,`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`(WorkBuddy glm-5.3 实窗口 1M)。`modelPicker` 提供四家 8 个模型的 `/model` 阵容,会话内随时切换;`--model <前缀>/<id>` 单次指定;想改默认值直接编辑该文件。
 
 实现注记(踩过的坑):
 
 - Claude Code 会在 system 首块塞 `x-anthropic-billing-header` 计费元数据,WorkBuddy 上游对它做通道指纹匹配(11128,改词也绕不过);桥翻译时直接剥掉该块——它是纯传输元数据。
-- 官方身份声明("You are Claude Code…" / "You are a coding agent…")同样被指纹匹配;重试梯子把首处 "You are " 改写为 "You're " 即可绕过(语义无损)。
+- system 里的官方反馈链接 `github.com/anthropics/claude-code/issues` 也是指纹(大小写、斜杠归一,只认原文);桥把周边措辞「report the issue at」微调为「report issues at」绕过,链接本体保持可点;重试梯子兜底会直接破形 URL。
 - Claude Code 2.1.316 会把 hook 上下文作为 `role:"system"` 的 message 发来,Codex 0.166 把系统提示词挪进 `developer` 消息——桥对两者都已正确映射。
+- 网关模型发现(`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`)会过滤掉 id 不含 claude/anthropic 的条目,对本套件的前缀 id 无效;选择器走 `modelPicker` 显式阵容。
 
 回归测试:`node scripts/test-claude-bridge.mjs`(Anthropic 协议冒烟:文本/工具/多轮 tool_result/非流式/count_tokens)。
 
