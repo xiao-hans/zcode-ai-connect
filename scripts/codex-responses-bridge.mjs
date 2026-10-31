@@ -72,10 +72,10 @@ function textOfContent(content) {
     .join('');
 }
 
-function toChatMessages(instructions, input) {
+function toChatMessages(instructions, input, mutLevel = 0) {
   const messages = [];
   if (typeof instructions === 'string' && instructions.trim()) {
-    messages.push({ role: 'system', content: instructions });
+    messages.push({ role: 'system', content: deFingerprint(instructions, mutLevel) });
   }
   const items = typeof input === 'string'
     ? [{ type: 'message', role: 'user', content: input }]
@@ -85,7 +85,10 @@ function toChatMessages(instructions, input) {
     if (item.type === 'message') {
       const role = item.role === 'developer' ? 'system' : item.role ?? 'user';
       const text = textOfContent(item.content);
-      if (text) messages.push({ role, content: text });
+      if (text) {
+        // Codex 0.166 起把系统提示词放进 developer 消息,与 instructions 一样需要去指纹
+        messages.push({ role, content: role === 'system' ? deFingerprint(text, mutLevel) : text });
+      }
     } else if (item.type === 'function_call') {
       messages.push({
         role: 'assistant',
@@ -279,22 +282,27 @@ function mapUsage(u) {
 }
 
 // ---- 上游 WAF 去指纹 ----
-// workbuddy 上游对 Codex CLI 官方身份声明(开头三句,空白归一化)做通道指纹匹配,
-// 命中即 400/11128 拦截。对 instructions 做语义无损的词级改写即可绕过:
-// level 0 去牛津逗号;level 1 再换一处措辞(指纹区域更新时的第二梯子)。
+// workbuddy 上游对已知 coding CLI 的官方身份声明做通道指纹匹配(Codex 与 Claude Code
+// 的开头段均实测命中),空白归一化、大小写与 CRLF 不敏感,命中即 400/11128 拦截。
+// 语义无损的词级改写即可绕过:
+//   level 0:去牛津逗号(命中 Codex 指纹)
+//   level 1:首处 "You are "→"You're "(命中 Claude Code 指纹)+ Codex 专用措辞改写
 function deFingerprint(instructions, level = 0) {
   if (typeof instructions !== 'string' || !instructions) return instructions;
   let s = instructions.replace(/, and /g, ' and ');
-  if (level >= 1) s = s.replace(/running in the Codex CLI/g, 'running within the Codex CLI');
+  if (level >= 1) {
+    s = s.replace(/You are /, "You're ");
+    s = s.replace(/running in the Codex CLI/g, 'running within the Codex CLI');
+  }
   return s;
 }
 
-async function upstreamChat(ep, body, { noStreamOptions = false } = {}) {
+async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
   const payload = {
     model: body.model,
-    messages: toChatMessages(body.instructions, body.input),
+    messages: toChatMessages(body.instructions, body.input, mutLevel),
     stream: true,
   };
   if (!noStreamOptions) payload.stream_options = { include_usage: true };
@@ -339,7 +347,7 @@ async function handleResponses(req, res, wireModel, body) {
   }
 
   const callUpstream = (mutLevel, noStreamOptions) =>
-    upstreamChat(ep, { ...body, instructions: deFingerprint(body.instructions, mutLevel), model: chatModel }, { noStreamOptions });
+    upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions });
 
   let upstream;
   try {
@@ -447,6 +455,13 @@ function anthropicTextOf(content) {
   return content.filter(p => p && p.type === 'text' && typeof p.text === 'string').map(p => p.text).join('');
 }
 
+// Claude Code 会在 system 里塞 x-anthropic-billing-header 计费元数据块,WorkBuddy 上游
+// 对它做通道指纹匹配(11128,改词也绕不过)。它是纯传输元数据,翻译时直接剥掉。
+function stripBillingBlocks(system) {
+  if (!Array.isArray(system)) return system;
+  return system.filter(b => !(b?.type === 'text' && typeof b.text === 'string' && b.text.startsWith('x-anthropic-billing-header')));
+}
+
 function toChatMessagesAnthropic(systemText, messages) {
   const out = [];
   if (systemText) out.push({ role: 'system', content: systemText });
@@ -475,6 +490,10 @@ function toChatMessagesAnthropic(systemText, messages) {
       const msg = { role: 'assistant', content: text || (toolCalls.length ? null : '') };
       if (toolCalls.length) msg.tool_calls = toolCalls;
       out.push(msg);
+    } else if (m.role === 'system' || m.role === 'developer') {
+      // Claude Code 2.1.316 会把 hook 上下文作为 role:"system" 的 message 发来
+      const text = anthropicTextOf(m.content);
+      if (text) out.push({ role: 'system', content: text });
     }
   }
   return out;
@@ -622,7 +641,7 @@ async function handleMessages(req, res, body) {
     return;
   }
 
-  const sysText = deFingerprint(anthropicTextOf(body.system), 0);
+  const sysText = deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), 0);
   const chatPayload = {
     model: chatModel,
     messages: toChatMessagesAnthropic(sysText, body.messages),

@@ -1,0 +1,14 @@
+{
+  "env": {
+    "ANTHROPIC_BASE_URL": "http://127.0.0.1:39268",
+    "ANTHROPIC_AUTH_TOKEN": "zc-connect-local",
+    "ANTHROPIC_MODEL": "wb/glm-5.3",
+    "ANTHROPIC_DEFAULT_HAIKU_MODEL": "qw/qwen3.8-flash",
+    "ANTHROPIC_DEFAULT_SONNET_MODEL": "wb/glm-5.3",
+    "ANTHROPIC_DEFAULT_OPUS_MODEL": "wb/glm-5.3",
+    "ANTHROPIC_DEFAULT_FABLE_MODEL": "wb/glm-5.3",
+    "CLAUDE_CODE_SUBAGENT_MODEL": "wb/glm-5.3",
+    "CLAUDE_CODE_MAX_CONTEXT_TOKENS": "1000000",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1"
+  }
+}

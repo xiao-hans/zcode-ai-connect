@@ -11,6 +11,7 @@
 127.0.0.1:39269 ◀┤  zcode-qwenwork-connect  ──▶ 千问办公       (COSY WASM 签名)
                  │
                  ├─ Codex(--profile connect-*:经 codex-responses-bridge :39268)
+                 ├─ Claude Code(claude-connect.cmd:同桥 /v1/messages)
                  ├─ pi(pi-connect-services 启动扩展 + models.json 供应商)
                  └─ hermes(hermes-connect-services:on_session_start hook + config.yaml)
 ```
@@ -129,7 +130,25 @@ profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.to
 
 回归测试:`node scripts/test-codex-bridge.mjs`(桥协议冒烟,需桥在跑)· `node scripts/test-codex-wiring.mjs`(四端点直连冒烟,需端点在跑)。
 
-## 六、各家速览
+## 六、接入 Claude Code
+
+Claude Code 讲 Anthropic Messages 协议,同一个桥同样翻译:`POST /v1/messages` 与 `/v1/messages/count_tokens`(127.0.0.1:39268)。接入零写入——包装器 [claude-connect.cmd](scripts/claude-connect.cmd) 用 `--settings` 会话级配置覆盖,**不读不改** `~/.claude` 的登录态与 settings.json(settings.json `env` 里的 `ANTHROPIC_BASE_URL` 优先级高于 shell 环境变量,shell 传参压不过它,必须走 `--settings` 这一层):
+
+```sh
+scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交互 / MCP 均可)
+```
+
+模型映射在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`,sonnet/opus/fable 位同主模型,`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`(WorkBuddy glm-5.3 实窗口 1M);想换模型直接改该文件。
+
+实现注记(踩过的坑):
+
+- Claude Code 会在 system 首块塞 `x-anthropic-billing-header` 计费元数据,WorkBuddy 上游对它做通道指纹匹配(11128,改词也绕不过);桥翻译时直接剥掉该块——它是纯传输元数据。
+- 官方身份声明("You are Claude Code…" / "You are a coding agent…")同样被指纹匹配;重试梯子把首处 "You are " 改写为 "You're " 即可绕过(语义无损)。
+- Claude Code 2.1.316 会把 hook 上下文作为 `role:"system"` 的 message 发来,Codex 0.166 把系统提示词挪进 `developer` 消息——桥对两者都已正确映射。
+
+回归测试:`node scripts/test-claude-bridge.mjs`(Anthropic 协议冒烟:文本/工具/多轮 tool_result/非流式/count_tokens)。
+
+## 七、各家速览
 
 | | WorkBuddy | Trae CN | Qoder CN | 千问办公 |
 |---|---|---|---|---|
@@ -143,7 +162,7 @@ profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.to
 
 各插件的完整文档(排障、命令、协议细节):[zcode-trae-connect](zcode-trae-connect/) · [zcode-workbuddy-connect](zcode-workbuddy-connect/) · [zcode-qoder-connect](zcode-qoder-connect/) · [zcode-qwenwork-connect](zcode-qwenwork-connect/)
 
-## 七、长回合为什么不会「突然不动」
+## 八、长回合为什么不会「突然不动」
 
 四个端点的流收尾是同一套规则,任何一个都不允许把「异常」说成「正常结束」:
 
@@ -160,7 +179,7 @@ profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.to
 
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
 
-## 八、「只说不做」的自动续跑
+## 九、「只说不做」的自动续跑
 
 模型常见的一种收尾是**宣布了下一步却直接停住**:
 
@@ -216,7 +235,7 @@ zcode-ai-connect/
 ├── sync-pi-models.mjs        # pi 供应商/名册同步脚本
 ├── hermes-connect-services/  # hermes 接入:config.yaml 同步 + 启动 hook + 收尾闸补丁
 ├── shared/                   # stall-detector 权威源:.mjs(ZCode/pi/dsh)+ .py(hermes)
-├── scripts/                  # sync-stall-guard.mjs(检测器分发)+ codex 桥/setup/冒烟脚本
+├── scripts/                  # sync-stall-guard.mjs + codex/claude 协议桥、setup、冒烟脚本
 └── tests/                    # 检测器回归 + JS↔Python 一致性(test-detector-parity.mjs)
 ```
 
