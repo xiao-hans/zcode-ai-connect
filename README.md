@@ -138,7 +138,7 @@ Claude Code 讲 Anthropic Messages 协议,同一个桥同样翻译:`POST /v1/mes
 scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交互 / MCP 均可)
 ```
 
-模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`,`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`(WorkBuddy glm-5.3 实窗口 1M)。`modelPicker` 提供四家 8 个模型的 `/model` 阵容,会话内随时切换;`--model <前缀>/<id>` 单次指定;想改默认值直接编辑该文件。
+模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`,`CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000`(WorkBuddy glm-5.3 实窗口 1M)。`modelPicker` 由 [sync-claude-models.mjs](scripts/sync-claude-models.mjs) 生成——四家**全量**模型(61+)进入 `/model` 阵容,默认模型带 ★;上游名册变化后重跑 `node scripts/sync-claude-models.mjs` 刷新(需端点在跑,已开会话要重开)。
 
 实现注记(踩过的坑):
 

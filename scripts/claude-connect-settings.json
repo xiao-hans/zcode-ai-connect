@@ -14,14 +14,311 @@
   "modelPicker": {
     "replaceBuiltInOptions": true,
     "options": [
-      { "model": "wb/glm-5.3", "label": "GLM-5.3 · WorkBuddy(主推)", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "wb/kimi-k3.1-pro", "label": "Kimi K3.1 Pro · WorkBuddy", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "wb/deepseek-v4.1-flash", "label": "DeepSeek V4.1 Flash · WorkBuddy", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "trae/glm-5.3", "label": "GLM-5.3 · Trae CN", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "qoder/glm-5.3", "label": "GLM-5.3 · Qoder CN", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "qoder/deepseek-v4-pro", "label": "DeepSeek V4 Pro · Qoder CN", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "qw/qwen3.8-max-preview", "label": "Qwen3.8 Max Preview · 千问办公", "behavesAs": "claude-sonnet-4-6" },
-      { "model": "qw/qwen3.8-flash", "label": "Qwen3.8 Flash · 千问办公(快速档)", "behavesAs": "claude-haiku-4-5" }
+      {
+        "model": "wb/auto",
+        "label": "Auto · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/hy4-preview",
+        "label": "Hy4 preview · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/hy3",
+        "label": "Hy3 · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/glm-5.3",
+        "label": "GLM-5.3 · WorkBuddy ★",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/glm-5.3-flash",
+        "label": "GLM-5.3-Flash · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/glm-5.2",
+        "label": "GLM-5.2 · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/kimi-k3.1-pro",
+        "label": "Kimi-K3.1-Pro · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/kimi-k3-1",
+        "label": "Kimi-K3 · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/kimi-k2.8-preview",
+        "label": "Kimi-K2.8-Preview · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/space-bunny",
+        "label": "Space-Bunny · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/minimax-m3.1-flash",
+        "label": "MiniMax-M3.1-Flash · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/deepseek-v4-pro",
+        "label": "DeepSeek-V4-Pro · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/step-5-preview",
+        "label": "Step-5-Preview · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "wb/mimo-v2.6-pro",
+        "label": "Xiaomi MiMo-V2.6-Pro · WorkBuddy",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/Doubao-Seed-2.1-Turbo",
+        "label": "Seed-2.1-Turbo · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/Doubao-Seed-2.1-Pro",
+        "label": "Seed-2.1-Pro-0915 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/Doubao-Seed-Evolving",
+        "label": "Seed-Evolving · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5.3-flash",
+        "label": "GLM-5.3-Flash · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5.3-flashx",
+        "label": "GLM-5.3-FlashX · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5.3",
+        "label": "GLM-5.3 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/deepseek-v4.1-flash",
+        "label": "DeepSeek-V4.1-Flash · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/DeepSeek-V4-Pro-Official",
+        "label": "DeepSeek-V4-Pro · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/kimi-k3.1-pro",
+        "label": "Kimi-K3.1-Pro · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/kimi-k3",
+        "label": "Kimi-K3 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/kimi-k2.6",
+        "label": "Kimi-K2.6 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/mimo-v2.6-flash",
+        "label": "MiMo-V2.6-Flash · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/mimo-v2.6-pro",
+        "label": "MiMo-V2.6-Pro · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/minimax-m3.1-flash",
+        "label": "MiniMax-M3.1-Flash · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/minimax-m3",
+        "label": "MiniMax-M3 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/step-5-preview",
+        "label": "Step-5-Preview · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/qwen3.8-max",
+        "label": "Qwen3.8-Max · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5.2",
+        "label": "GLM-5.2 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5",
+        "label": "GLM-5 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/DeepSeek-V4-Flash-Official",
+        "label": "DeepSeek-V4-Flash 正式版 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/DeepSeek-V4-Flash",
+        "label": "DeepSeek-V4-Flash · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/DeepSeek-V4-Pro",
+        "label": "DeepSeek-V4-Pro · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/kimi-k2.7-code",
+        "label": "Kimi-K2.7-Code · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/qwen-3.7-plus",
+        "label": "Qwen3.7-Plus · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/Doubao-Seed-Code",
+        "label": "Seed-Code · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/Doubao-Seed-2.0-Code",
+        "label": "Doubao-Seed-2.0-Code · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5.1",
+        "label": "GLM-5.1 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/glm-5v-turbo",
+        "label": "GLM-5V-Turbo · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/kimi-k2.5",
+        "label": "Kimi-K2.5 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/minimax-m2.7",
+        "label": "MiniMax-M2.7 · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/qwen-3.6-plus",
+        "label": "Qwen3.6-Plus · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "trae/qwen-3.5",
+        "label": "Qwen3.5-Plus · Trae CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/qoder-auto",
+        "label": "Auto · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/qoder-fast",
+        "label": "Fast · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/qwen3.8-max",
+        "label": "Qwen3.8-Max · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/qwen3.8-flash",
+        "label": "Qwen3.8-Flash · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/deepseek-v4-pro",
+        "label": "DeepSeek-V4-Pro · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/deepseek-flash",
+        "label": "DeepSeek-Flash · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/glm-5.3",
+        "label": "GLM-5.3 · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/glm-5.3-flash",
+        "label": "GLM-5.3-Flash · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/kimi-k3.1-pro",
+        "label": "Kimi-K3.1-Pro · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/kimi-k2.8-preview",
+        "label": "Kimi-K2.8-Preview · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qoder/minimax-m3.1-flash",
+        "label": "MiniMax-M3.1-Flash · Qoder CN",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qw/pro",
+        "label": "高级 · 千问办公",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qw/qwen3.8-flash",
+        "label": "标准｜Qwen3.8-Flash · 千问办公",
+        "behavesAs": "claude-sonnet-4-6"
+      },
+      {
+        "model": "qw/qwen3.8-max-preview",
+        "label": "Qwen3.8-Max · 千问办公",
+        "behavesAs": "claude-sonnet-4-6"
+      }
     ]
   }
 }
