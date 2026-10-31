@@ -14,7 +14,8 @@
     "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
     "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
     "CLAUDE_CODE_AUTO_MODE_SERVER": "0",
-    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1"
+    "CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT": "1",
+    "DISABLE_AUTO_COMPACT": "0"
   },
   "modelPicker": {
     "replaceBuiltInOptions": true,
@@ -325,5 +326,6 @@
         "behavesAs": "claude-sonnet-4-6"
       }
     ]
-  }
+  },
+  "autoCompactEnabled": true
 }
