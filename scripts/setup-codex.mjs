@@ -43,13 +43,13 @@ base_url = "http://127.0.0.1:39268/v1"
 wire_api = "responses"
 ${MARK_CLOSE}`;
 
-// ctx/out 取自各端点 /v1/models 实测值(2026-10-31):四家模型窗口均为 1M;
-// codex 无端点元数据可用(fallback 按 128k 假设会过早压缩),须显式声明
+// ctx/out:roster 声称的 1M 是目录默认值不可信——实测 wb 上游在 input≈187k 时拒绝
+// "Prompt is too long"(真实上限 ~190-200k 档),统一取安全值 180k 让 codex 及时压缩
 const PROFILES = [
-  { name: 'connect-wb', model: 'wb/glm-5.3', ctx: 1000000, out: 64000 },
-  { name: 'connect-trae', model: 'trae/glm-5.3', ctx: 1000000, out: 32000 },
-  { name: 'connect-qoder', model: 'qoder/glm-5.3', ctx: 1000000, out: 32000 },
-  { name: 'connect-qw', model: 'qw/qwen3.8-max-preview', ctx: 1000000, out: 32000 },
+  { name: 'connect-wb', model: 'wb/glm-5.3', ctx: 180000, out: 64000 },
+  { name: 'connect-trae', model: 'trae/glm-5.3', ctx: 180000, out: 32000 },
+  { name: 'connect-qoder', model: 'qoder/glm-5.3', ctx: 180000, out: 32000 },
+  { name: 'connect-qw', model: 'qw/qwen3.8-max-preview', ctx: 180000, out: 32000 },
 ];
 
 async function backup(file) {
