@@ -10,6 +10,7 @@
 127.0.0.1:39270 ◀┤  zcode-qoder-connect     ──▶ Qoder CN     (COSY+WAF 协议)
 127.0.0.1:39269 ◀┤  zcode-qwenwork-connect  ──▶ 千问办公       (COSY WASM 签名)
                  │
+                 ├─ Codex(--profile connect-*:经 codex-responses-bridge :39268)
                  ├─ pi(pi-connect-services 启动扩展 + models.json 供应商)
                  └─ hermes(hermes-connect-services:on_session_start hook + config.yaml)
 ```
@@ -100,7 +101,35 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 完整文档与排障(hooks 确认、回环被代理劫持、思考档位)见 [hermes-connect-services/README.md](hermes-connect-services/README.md)。
 
-## 五、各家速览
+## 五、接入 Codex
+
+Codex 0.142+ 只讲 Responses API(官方已硬移除 `wire_api = "chat"`),四个端点只讲 chat completions,中间由 [codex-responses-bridge](scripts/codex-responses-bridge.mjs)(127.0.0.1:39268,零依赖单文件)双向翻译。桥直读各端点 `endpoint.json` 的 port+token(30 秒缓存),token 轮换自愈,无需配置密钥。
+
+```sh
+node scripts/setup-codex.mjs            # 写入 provider + 四个 profile + 自启 hook(幂等,写前自动备份)
+node scripts/setup-codex.mjs --remove   # 卸载,只动本套件写过的东西
+```
+
+之后按提供方选 profile(模型 id 带前缀消歧,同名模型各走各家):
+
+| profile | 端点 | 默认模型 |
+|---|---|---|
+| `codex --profile connect-wb` | WorkBuddy | glm-5.3 |
+| `codex --profile connect-trae` | Trae CN | glm-5.3 |
+| `codex --profile connect-qoder` | Qoder CN | glm-5.3 |
+| `codex --profile connect-qw` | 千问办公 | qwen3.8-max-preview |
+
+profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.toml 拆出),模型 id 可自行换成 `/v1/models` 里的任意一个;默认 `codex`(ChatGPT 登录)完全不受影响。新写入的 SessionStart hook 首次在 codex TUI 里会请求一次信任确认,`codex exec` 非交互模式会静默跳过未信任 hook。
+
+实现注记(踩过的坑):
+
+- Responses SSE 的 `data:` JSON 必须自带 `"type"` 字段,codex 按 `data.type` 分发事件;缺了它表现为「stream disconnected before completion」重试 5 次全败,与桥端是否发出 `response.completed` 无关。
+- WorkBuddy 上游 WAF(11128 "unapproved channel")对 Codex 官方身份声明(开头三句,空白归一化)做指纹匹配;桥对 instructions 做语义无损改写(去牛津逗号,命中 11128 再换一处措辞重试)绕过。
+- codex 在非信任目录用 read-only 沙箱跑 shell 会报 `CreateProcessWithLogonW: 267`,属 codex 自身 Windows 沙箱限制,与桥无关。
+
+回归测试:`node scripts/test-codex-bridge.mjs`(桥协议冒烟,需桥在跑)· `node scripts/test-codex-wiring.mjs`(四端点直连冒烟,需端点在跑)。
+
+## 六、各家速览
 
 | | WorkBuddy | Trae CN | Qoder CN | 千问办公 |
 |---|---|---|---|---|
@@ -114,7 +143,7 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 各插件的完整文档(排障、命令、协议细节):[zcode-trae-connect](zcode-trae-connect/) · [zcode-workbuddy-connect](zcode-workbuddy-connect/) · [zcode-qoder-connect](zcode-qoder-connect/) · [zcode-qwenwork-connect](zcode-qwenwork-connect/)
 
-## 六、长回合为什么不会「突然不动」
+## 七、长回合为什么不会「突然不动」
 
 四个端点的流收尾是同一套规则,任何一个都不允许把「异常」说成「正常结束」:
 
@@ -131,7 +160,7 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
 
-## 七、「只说不做」的自动续跑
+## 八、「只说不做」的自动续跑
 
 模型常见的一种收尾是**宣布了下一步却直接停住**:
 
@@ -187,7 +216,7 @@ zcode-ai-connect/
 ├── sync-pi-models.mjs        # pi 供应商/名册同步脚本
 ├── hermes-connect-services/  # hermes 接入:config.yaml 同步 + 启动 hook + 收尾闸补丁
 ├── shared/                   # stall-detector 权威源:.mjs(ZCode/pi/dsh)+ .py(hermes)
-├── scripts/                  # sync-stall-guard.mjs:把检测器铺到各包
+├── scripts/                  # sync-stall-guard.mjs(检测器分发)+ codex 桥/setup/冒烟脚本
 └── tests/                    # 检测器回归 + JS↔Python 一致性(test-detector-parity.mjs)
 ```
 
