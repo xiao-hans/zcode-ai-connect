@@ -43,11 +43,13 @@ base_url = "http://127.0.0.1:39268/v1"
 wire_api = "responses"
 ${MARK_CLOSE}`;
 
+// ctx/out 取自各端点 /v1/models 实测值(2026-10-31):四家模型窗口均为 1M;
+// codex 无端点元数据可用(fallback 按 128k 假设会过早压缩),须显式声明
 const PROFILES = [
-  { name: 'connect-wb', model: 'wb/glm-5.3' },
-  { name: 'connect-trae', model: 'trae/glm-5.3' },
-  { name: 'connect-qoder', model: 'qoder/glm-5.3' },
-  { name: 'connect-qw', model: 'qw/qwen3.8-max-preview' },
+  { name: 'connect-wb', model: 'wb/glm-5.3', ctx: 1000000, out: 64000 },
+  { name: 'connect-trae', model: 'trae/glm-5.3', ctx: 1000000, out: 32000 },
+  { name: 'connect-qoder', model: 'qoder/glm-5.3', ctx: 1000000, out: 32000 },
+  { name: 'connect-qw', model: 'qw/qwen3.8-max-preview', ctx: 1000000, out: 32000 },
 ];
 
 async function backup(file) {
@@ -85,8 +87,10 @@ async function syncProfiles() {
 model_provider = "zc-connect"
 model = "${p.model}"
 model_reasoning_effort = "medium"
+model_context_window = ${p.ctx}
+model_max_output_tokens = ${p.out}
 `);
-    console.log(`${p.name}.config.toml: 已写入(model ${p.model})`);
+    console.log(`${p.name}.config.toml: 已写入(model ${p.model}, ctx ${p.ctx}, out ${p.out})`);
   }
 }
 

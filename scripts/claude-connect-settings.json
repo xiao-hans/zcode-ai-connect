@@ -12,7 +12,9 @@
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "ANTHROPIC_DEFAULT_SONNET_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
     "ANTHROPIC_DEFAULT_OPUS_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
-    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy"
+    "ANTHROPIC_DEFAULT_FABLE_MODEL_NAME": "DeepSeek V4.1 Flash · WorkBuddy",
+    "CLAUDE_CODE_MAX_OUTPUT_TOKENS": "128000",
+    "CLAUDE_CODE_AUTO_MODE_SERVER": "0"
   },
   "modelPicker": {
     "replaceBuiltInOptions": true,
