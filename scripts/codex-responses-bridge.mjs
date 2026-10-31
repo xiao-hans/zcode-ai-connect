@@ -1,7 +1,10 @@
 #!/usr/bin/env node
 /**
- * codex-responses-bridge.mjs — Codex(0.142+,仅 Responses API)↔ zcode-*-connect
- * 四个 chat/completions 端点之间的本地翻译桥。
+ * codex-responses-bridge.mjs — 本地协议桥(127.0.0.1:39268),把两类宿主的请求翻译成
+ * zcode-*-connect 四个 chat/completions 端点:
+ *   · Codex(0.142+,仅 Responses API):POST /v1/responses
+ *   · Claude Code:POST /v1/messages + /v1/messages/count_tokens(Anthropic Messages)
+ * 文件名沿用 codex 起名,现同时服务两类宿主。
  *
  * 背景:Codex 自 2026-02 起硬移除 wire_api="chat"(见 openai/codex discussion 7782),
  * 只讲 /v1/responses;而本套件四个端点只讲 /v1/chat/completions。本桥在 127.0.0.1:39268
@@ -433,6 +436,278 @@ async function* upstreamSseChunks(upstream) {
   }
 }
 
+// ---- Anthropic Messages(/v1/messages,Claude Code)→ Chat ----
+// 与 Codex 共用同一批上游路由/去指纹/SSE 读取;此处只做协议形状转换。
+// Claude Code 经环境变量接入:ANTHROPIC_BASE_URL=http://127.0.0.1:39268
+// + ANTHROPIC_AUTH_TOKEN=<任意非空> + ANTHROPIC_MODEL=<前缀>/<模型>。桥不校验鉴权。
+
+function anthropicTextOf(content) {
+  if (typeof content === 'string') return content;
+  if (!Array.isArray(content)) return '';
+  return content.filter(p => p && p.type === 'text' && typeof p.text === 'string').map(p => p.text).join('');
+}
+
+function toChatMessagesAnthropic(systemText, messages) {
+  const out = [];
+  if (systemText) out.push({ role: 'system', content: systemText });
+  for (const m of Array.isArray(messages) ? messages : []) {
+    if (!m || typeof m !== 'object') continue;
+    const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
+    if (m.role === 'user') {
+      const texts = [];
+      for (const p of parts) {
+        if (p?.type === 'text') texts.push(p.text ?? '');
+        else if (p?.type === 'tool_result') {
+          if (texts.length) { out.push({ role: 'user', content: texts.join('') }); texts.length = 0; }
+          out.push({ role: 'tool', tool_call_id: p.tool_use_id ?? '', content: anthropicTextOf(p.content) || (p.is_error ? '(tool error)' : '') });
+        }
+        // image 等无 chat 等价物,丢弃
+      }
+      if (texts.length) out.push({ role: 'user', content: texts.join('') });
+    } else if (m.role === 'assistant') {
+      let text = '';
+      const toolCalls = [];
+      for (const p of parts) {
+        if (p?.type === 'text') text += p.text ?? '';
+        else if (p?.type === 'tool_use') toolCalls.push({ id: p.id ?? `call_${toolCalls.length}`, type: 'function', function: { name: p.name ?? '', arguments: JSON.stringify(p.input ?? {}) } });
+        // thinking 不回传
+      }
+      const msg = { role: 'assistant', content: text || (toolCalls.length ? null : '') };
+      if (toolCalls.length) msg.tool_calls = toolCalls;
+      out.push(msg);
+    }
+  }
+  return out;
+}
+
+function toChatToolsAnthropic(tools) {
+  if (!Array.isArray(tools)) return undefined;
+  const mapped = tools
+    .filter(t => t && typeof t.name === 'string' && t.input_schema)
+    .map(t => ({ type: 'function', function: { name: t.name, description: t.description ?? '', parameters: t.input_schema } }));
+  return mapped.length ? mapped : undefined;
+}
+
+function anthropicToolChoice(tc) {
+  if (!tc) return undefined;
+  if (tc.type === 'auto') return 'auto';
+  if (tc.type === 'any') return 'required';
+  if (tc.type === 'none') return 'none';
+  if (tc.type === 'tool' && tc.name) return { type: 'function', function: { name: tc.name } };
+  return undefined;
+}
+
+const ANTHROPIC_STOP = { tool_calls: 'tool_use', stop: 'end_turn', length: 'max_tokens' };
+
+function safeJsonParse(s) {
+  try { return JSON.parse(s); } catch { return {}; }
+}
+
+class AnthropicStreamBuilder {
+  constructor(model, estInput) {
+    this.model = model;
+    this.blockIndex = 0;
+    this.cur = null;   // {kind:'text'|'thinking'|'tool', index, text, args, id, name}
+    this.blocks = [];
+    this.finish = null;
+    this.usage = null;
+    this.estInput = estInput;
+  }
+
+  msgStart(res) {
+    sseWrite(res, 'message_start', {
+      message: {
+        id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: this.model,
+        content: [], stop_reason: null, stop_sequence: null,
+        usage: { input_tokens: this.estInput, output_tokens: 0 },
+      },
+    });
+  }
+
+  closeBlock(res) {
+    if (!this.cur) return;
+    const i = this.cur.index;
+    if (this.cur.kind === 'text') {
+      sseWrite(res, 'content_block_stop', { index: i });
+      this.blocks.push({ type: 'text', text: this.cur.text });
+    } else if (this.cur.kind === 'thinking') {
+      sseWrite(res, 'content_block_stop', { index: i });
+      this.blocks.push({ type: 'thinking', thinking: this.cur.text, signature: '' });
+    } else if (this.cur.kind === 'tool') {
+      sseWrite(res, 'content_block_stop', { index: i });
+      this.blocks.push({ type: 'tool_use', id: this.cur.id, name: this.cur.name, input: safeJsonParse(this.cur.args || '{}') });
+    }
+    this.cur = null;
+    this.blockIndex = i + 1;
+  }
+
+  openBlock(res, kind, extra = {}) {
+    this.closeBlock(res);
+    const idx = this.blockIndex;
+    const block = kind === 'text' ? { type: 'text', text: '' }
+      : kind === 'thinking' ? { type: 'thinking', thinking: '', signature: '' }
+        : { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
+    sseWrite(res, 'content_block_start', { index: idx, content_block: block });
+    this.cur = { kind, index: idx, text: '', args: '', ...extra };
+  }
+
+  handleChunk(res, d) {
+    if (d.error) return d.error;
+    const choice = d.choices?.[0];
+    if (!choice) {
+      if (d.usage) this.usage = mapUsage(d.usage);
+      return null;
+    }
+    const delta = choice.delta ?? {};
+    if (choice.finish_reason) this.finish = choice.finish_reason;
+    if (d.usage) this.usage = mapUsage(d.usage);
+
+    const think = delta.reasoning_content ?? delta.reasoning?.content;
+    if (typeof think === 'string' && think) {
+      if (this.cur?.kind !== 'thinking') this.openBlock(res, 'thinking');
+      this.cur.text += think;
+      sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'thinking_delta', thinking: think } });
+    }
+    if (typeof delta.content === 'string' && delta.content) {
+      if (this.cur?.kind !== 'text') this.openBlock(res, 'text');
+      this.cur.text += delta.content;
+      sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'text_delta', text: delta.content } });
+    }
+    if (Array.isArray(delta.tool_calls)) {
+      for (const tc of delta.tool_calls) {
+        const idx = tc.index ?? 0;
+        if (!this.cur || this.cur.kind !== 'tool' || this.cur.upIdx !== idx) {
+          // 同一上游 tool index 已有块则续写;否则等拿到名字再开块
+          const existing = this.cur?.kind === 'tool' && this.cur.upIdx === idx;
+          if (!existing && tc.function?.name) {
+            this.closeBlock(res);
+            this.openBlock(res, 'tool', { upIdx: idx, id: tc.id || `call_${idx}_${Date.now().toString(36)}`, name: tc.function.name });
+          } else if (!existing) {
+            continue; // 还没拿到名字,等下一帧
+          }
+        }
+        if (tc.id) this.cur.id = tc.id;
+        if (tc.function?.arguments) {
+          this.cur.args += tc.function.arguments;
+          sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } });
+        }
+      }
+    }
+    return null;
+  }
+
+  finishAll(res) {
+    this.closeBlock(res);
+    const stopReason = ANTHROPIC_STOP[this.finish] ?? 'end_turn';
+    sseWrite(res, 'message_delta', {
+      delta: { stop_reason: stopReason, stop_sequence: null },
+      usage: { output_tokens: this.usage?.output_tokens ?? 0 },
+    });
+    sseWrite(res, 'message_stop', {});
+  }
+}
+
+async function handleMessages(req, res, body) {
+  const wireModel = body.model ?? '';
+  const slash = wireModel.indexOf('/');
+  if (slash <= 0) {
+    json(res, 400, { type: 'error', error: { type: 'invalid_request_error', message: `模型 id 需带提供方前缀(wb/trae/qoder/qw),收到:${wireModel}` } });
+    return;
+  }
+  const t = TOOLS.find(x => x.key === wireModel.slice(0, slash));
+  const chatModel = wireModel.slice(slash + 1);
+  const ep = t && endpointFor(t.tool);
+  if (!ep || !ep.port || !ep.token) {
+    json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t?.tool ?? wireModel} 端点未就绪(缺 endpoint.json),先拉起端点` } });
+    return;
+  }
+
+  const sysText = deFingerprint(anthropicTextOf(body.system), 0);
+  const chatPayload = {
+    model: chatModel,
+    messages: toChatMessagesAnthropic(sysText, body.messages),
+    stream: true,
+    stream_options: { include_usage: true },
+  };
+  const tools = toChatToolsAnthropic(body.tools);
+  if (tools) chatPayload.tools = tools;
+  const tc = anthropicToolChoice(body.tool_choice);
+  if (tc) chatPayload.tool_choice = tc;
+  const estInput = Math.ceil((JSON.stringify(body.system ?? '') + JSON.stringify(body.messages ?? '') + JSON.stringify(body.tools ?? '')).length / 4);
+
+  const callUpstream = (mutLevel, noStreamOptions) => {
+    const p = { ...chatPayload };
+    if (mutLevel > 0) p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(body.system), mutLevel), body.messages);
+    if (noStreamOptions) delete p.stream_options;
+    return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
+      body: JSON.stringify(p),
+    });
+  };
+
+  if (process.env.ZC_BRIDGE_DEBUG) {
+    await mkdir(stateDir, { recursive: true }).catch(() => {});
+    await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body).slice(0, 200_000)}\n`).catch(() => {});
+  }
+
+  let upstream;
+  try {
+    upstream = await callUpstream(0, false);
+  } catch (e) {
+    json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
+    return;
+  }
+  if (upstream.status === 400) {
+    const errText = await upstream.text().catch(() => '');
+    const channelBlocked = errText.includes('11128');
+    try {
+      upstream = await callUpstream(channelBlocked ? 1 : 0, !channelBlocked);
+    } catch (e) {
+      json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
+      return;
+    }
+    if (!upstream.ok) {
+      const text = await upstream.text().catch(() => '');
+      json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: text.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
+      return;
+    }
+  }
+  if (!upstream.ok) {
+    const text = await upstream.text().catch(() => '');
+    json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: text.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
+    return;
+  }
+
+  const builder = new AnthropicStreamBuilder(wireModel, estInput);
+  if (body.stream === false) {
+    for await (const d of upstreamSseChunks(upstream)) { builder.handleChunk({ write: () => {} }, d); }
+    builder.closeBlock({ write: () => {} });
+    const stopReason = ANTHROPIC_STOP[builder.finish] ?? 'end_turn';
+    json(res, 200, {
+      id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: wireModel,
+      content: builder.blocks, stop_reason: stopReason, stop_sequence: null,
+      usage: { input_tokens: builder.usage?.input_tokens ?? estInput, output_tokens: builder.usage?.output_tokens ?? 0 },
+    });
+    return;
+  }
+
+  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+  builder.msgStart(res);
+  let streamError = null;
+  for await (const d of upstreamSseChunks(upstream)) {
+    const err = builder.handleChunk(res, d);
+    if (err) { streamError = err; break; }
+  }
+  if (streamError) {
+    sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: String(streamError.message ?? JSON.stringify(streamError)).slice(0, 500) } });
+  } else {
+    builder.finishAll(res);
+  }
+  sseDone(res);
+  res.end();
+}
+
 // ---- 路由 / 服务 ----
 async function aggregateModels() {
   const data = [];
@@ -444,7 +719,8 @@ async function aggregateModels() {
       if (!r.ok) continue;
       const j = await r.json();
       for (const m of j.data ?? []) {
-        data.push({ id: `${t.key}/${m.id}`, object: 'model', created: 0, owned_by: `zc-${t.tool}` });
+        // 同一条目同时带 OpenAI(object)与 Anthropic(type/display_name)形状字段,两类客户端都能读
+        data.push({ id: `${t.key}/${m.id}`, object: 'model', type: 'model', display_name: `${t.key}/${m.id}`, created: 0, owned_by: `zc-${t.tool}` });
       }
     } catch { /* 端点不在,跳过 */ }
   }
@@ -484,7 +760,19 @@ async function handle(req, res) {
       await handleResponses(req, res, body.model ?? '', body);
       return;
     }
-    json(res, 404, { error: { message: `桥只支持 GET /healthz、GET /v1/models、POST /v1/responses(收到 ${req.method} ${p})` } });
+    if (req.method === 'POST' && (p === '/v1/messages' || p === '/messages')) {
+      const body = await readBody(req);
+      await handleMessages(req, res, body);
+      return;
+    }
+    if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
+      // 粗估(≈4 字符/ token);Claude Code 的上下文管理只需要量级正确
+      const body = await readBody(req);
+      const n = Math.ceil((JSON.stringify(body.system ?? '') + JSON.stringify(body.messages ?? '') + JSON.stringify(body.tools ?? '')).length / 4);
+      json(res, 200, { input_tokens: n });
+      return;
+    }
+    json(res, 404, { error: { message: `桥支持:GET /healthz、GET /v1/models、POST /v1/responses(Codex)、POST /v1/messages 与 /v1/messages/count_tokens(Claude Code)(收到 ${req.method} ${p})` } });
   } catch (e) {
     await log(`handler error: ${e.stack ?? e.message}`);
     if (!res.headersSent) json(res, 500, { error: { message: e.message } });

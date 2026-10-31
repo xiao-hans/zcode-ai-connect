@@ -9,7 +9,7 @@
  * Run: node zcode-ai-connect/tests/test-stall-detector.mjs
  */
 import assert from 'node:assert/strict';
-import { detectStall, CONTINUE_PROMPT } from '../shared/stall-detector.mjs';
+import { detectStall, CONTINUE_PROMPT, BARE_REPLY_PROMPT } from '../shared/stall-detector.mjs';
 
 let passed = 0;
 let failed = 0;
@@ -54,6 +54,17 @@ check('编号待办列表前宣布', () => {
 
 check('英文 Let me', () => {
   stalls('Let me check the config first, then patch the providers block:');
+});
+
+// 真实事故回放（pi 会话 01a18ce2，provider=trae）：用户发「继续」，模型原样回
+// "\n继续" 就 stop，零工具调用。全文只有 2 个字，会被 too-short 放过去。
+check('整条回复只有「继续」', () => {
+  for (const text of ['继续', '\n继续', '继续吧', 'continue']) {
+    const r = detectStall(text);
+    assert.equal(r.stall, true, `expected stall for ${JSON.stringify(text)}, got verdict=${r.verdict}`);
+    assert.equal(r.verdict, 'bare-continue');
+    assert.equal(r.prompt, BARE_REPLY_PROMPT);
+  }
 });
 
 check('我先…（无冒号，靠强未来 + 动词过线）', () => {

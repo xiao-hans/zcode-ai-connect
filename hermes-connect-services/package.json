@@ -1,6 +1,6 @@
 {
   "name": "hermes-connect-services",
-  "version": "1.3.4",
+  "version": "1.3.5",
   "description": "Bring zcode-ai-connect's four loopback endpoints to hermes, and add the missing turn-end gate that re-runs a turn when the model announces a next step but calls no tool.",
   "type": "module",
   "license": "MIT",
@@ -37,10 +37,10 @@
     "hermes-connect-stall-gate": "bin/patch-hermes-stall-gate.mjs"
   },
   "dependencies": {
-    "zcode-qoder-connect": "^1.2.4",
-    "zcode-qwenwork-connect": "^1.2.4",
-    "zcode-trae-connect": "^1.2.4",
-    "zcode-workbuddy-connect": "^1.2.4"
+    "zcode-qoder-connect": "^1.2.5",
+    "zcode-qwenwork-connect": "^1.2.5",
+    "zcode-trae-connect": "^1.2.5",
+    "zcode-workbuddy-connect": "^1.2.5"
   },
   "keywords": [
     "hermes",

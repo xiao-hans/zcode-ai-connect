@@ -16,7 +16,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
 import { existsSync } from 'node:fs';
-import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
+import { detectStall, EMPTY_TURN_PROMPT, BARE_REPLY_PROMPT } from '../shared/stall-detector.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const PY_DETECTOR = join(HERE, '..', 'shared', 'stall_detector.py');
@@ -166,6 +166,25 @@ try {
   } catch (error) {
     failed += 1;
     console.log(`  FAIL EMPTY_TURN_PROMPT\n       ${error.message.split('\n')[0]}`);
+  }
+}
+
+// BARE_REPLY_PROMPT 同理：整条回复只有「继续」时的提示，两边措辞必须一致。
+{
+  const pyDir = dirname(PY_DETECTOR).replaceAll('\\', '/');
+  const out = spawnSync(
+    python,
+    ['-c', `import sys, json; sys.path.insert(0, r"${pyDir}"); import stall_detector as d; print(json.dumps(d.BARE_REPLY_PROMPT))`],
+    { encoding: 'utf8', timeout: 20000 },
+  );
+  try {
+    assert.equal(out.status, 0, `python 读取 BARE_REPLY_PROMPT 失败: ${(out.stderr || '').slice(0, 200)}`);
+    assert.equal(JSON.parse(out.stdout), BARE_REPLY_PROMPT, 'BARE_REPLY_PROMPT 文本不一致');
+    passed += 1;
+    console.log('  ok   BARE_REPLY_PROMPT 逐字一致');
+  } catch (error) {
+    failed += 1;
+    console.log(`  FAIL BARE_REPLY_PROMPT\n       ${error.message.split('\n')[0]}`);
   }
 }
 

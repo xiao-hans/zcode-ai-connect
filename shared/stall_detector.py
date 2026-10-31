@@ -19,7 +19,7 @@ from __future__ import annotations
 import re
 from typing import Any, Dict
 
-__all__ = ["detect_stall", "CONTINUE_PROMPT"]
+__all__ = ["detect_stall", "CONTINUE_PROMPT", "EMPTY_TURN_PROMPT", "BARE_REPLY_PROMPT"]
 
 # 上限：只看最后两块 + 最多 600 字符。更早的内容是背景，不是收尾意图。
 TAIL_BLOCK_COUNT = 2
@@ -128,6 +128,14 @@ ACTION_VERB = [
 # 尾部形态加权。冒号不足以独立触发。
 COLON_TAIL = re.compile(r"[:：]\s*\Z")
 ELLIPSIS_TAIL = re.compile(r"(?:\.{3,}|…)\s*\Z")
+
+# 整条回复只有一个续跑词。实测（pi 会话 01a18ce2，provider=trae）：用户发「继续」，
+# 模型原样回了 "\n继续" 就 stop，零工具调用 —— 用户看到的就是「说继续就不动了」。
+# 这不是「太短所以不判」：它没有给出任何结论，是没作答。
+BARE_CONTINUE = re.compile(
+    r"^(?:继续|继续吧|接着|接着来|往下|go on|continue|keep going|proceed)[\s。.!！?？]*\Z",
+    re.IGNORECASE,
+)
 QUESTION_TAIL = re.compile(r"[?？]\s*\Z")
 
 # action-colon 判定用：末行收尾的冒号、分句切分、列表项前缀。
@@ -216,6 +224,17 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
         return _result("empty")
 
     text = _strip_noise(raw)
+
+    # 整条回复只是一个「继续」之类的续跑词：它是没作答，不是「太短所以不判」。
+    if BARE_CONTINUE.match(text):
+        return {
+            "stall": True,
+            "verdict": "bare-continue",
+            "score": 0.0,
+            "signals": ["bare-continue"],
+            "prompt": BARE_REPLY_PROMPT,
+        }
+
     if _weighted_length(text) < MIN_WEIGHTED_CHARS:
         return _result("too-short")
 
@@ -316,4 +335,11 @@ EMPTY_TURN_PROMPT = "\n".join([
     "你上一条回复只留下了思考过程，没有给出任何可见内容，也没有调用任何工具。",
     "请把你的结论直接说出来：已经做了什么、接下来要做什么，或者一句话说明这一轮的结果。",
     "不要重复思考过程，也不要只描述计划而不动手。",
+])
+
+# 整条回复只有「继续」这类续跑词时的提示。与 CONTINUE_PROMPT 的区别：那一条假设
+# 模型宣布了某个具体动作可以直接执行；这里连动作都没说，只能要求它真的做出来。
+BARE_REPLY_PROMPT = "\n".join([
+    "你上一条回复只有「继续」这类词，没有实际内容，也没有调用任何工具。",
+    "请直接执行你计划中的下一步；如果这一轮其实已经结束，用一句话说明结论，不要只回一个「继续」。",
 ])

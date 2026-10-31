@@ -134,6 +134,15 @@ const ACTION_VERB = [
 const COLON_TAIL = /[:：]\s*$/;
 const ELLIPSIS_TAIL = /(?:\.{3,}|…)\s*$/;
 
+/**
+ * 整条回复只有一个续跑词。
+ *
+ * 实测（pi 会话 01a18ce2，provider=trae）：用户发「继续」，模型原样回了 "\n继续"
+ * 就 stop，零工具调用 —— 用户看到的就是「说继续就不动了」。
+ * 这不是「太短所以不判」：它没有给出任何结论，是没作答。
+ */
+const BARE_CONTINUE = /^(?:继续|继续吧|接着|接着来|往下|go on|continue|keep going|proceed)[\s。.!！?？]*$/i;
+
 /** 阈值。只有弱未来标记时必须靠额外信号才能过线。 */
 const THRESHOLD_STRONG = 3;
 const THRESHOLD_WEAK_ONLY = 4.5;
@@ -196,6 +205,13 @@ export function detectStall(rawText, options = {}) {
   if (raw === '') return { ...empty, verdict: 'empty' };
 
   const text = stripNoise(raw);
+
+  // 整条回复只是一个「继续」之类的续跑词（实测：trae 回了 "\n继续" 就 stop，零工具调用）。
+  // 这不是「太短所以不判」—— 它不是结论，是没作答。too-short 会把它放过去。
+  if (BARE_CONTINUE.test(text)) {
+    return { stall: true, verdict: 'bare-continue', score: 0, signals: ['bare-continue'], prompt: BARE_REPLY_PROMPT };
+  }
+
   if (weightedLength(text) < MIN_WEIGHTED_CHARS) return { ...empty, verdict: 'too-short' };
 
   const tail = tailOf(text);
@@ -313,6 +329,17 @@ export const EMPTY_TURN_PROMPT = [
   '你上一条回复只留下了思考过程，没有给出任何可见内容，也没有调用任何工具。',
   '请把你的结论直接说出来：已经做了什么、接下来要做什么，或者一句话说明这一轮的结果。',
   '不要重复思考过程，也不要只描述计划而不动手。',
+].join('\n');
+
+/**
+ * 整条回复只有「继续」这类续跑词时的提示。
+ *
+ * 与 CONTINUE_PROMPT 的区别：那一条假设模型宣布了某个具体动作，可以直接执行；
+ * 这里连动作都没说，只能要求它把下一步真正做出来，或者说明已经结束。
+ */
+export const BARE_REPLY_PROMPT = [
+  '你上一条回复只有「继续」这类词，没有实际内容，也没有调用任何工具。',
+  '请直接执行你计划中的下一步；如果这一轮其实已经结束，用一句话说明结论，不要只回一个「继续」。',
 ].join('\n');
 
 export default detectStall;

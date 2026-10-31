@@ -1,6 +1,6 @@
 {
   "name": "zcode-trae-connect",
-  "version": "1.2.4",
+  "version": "1.2.5",
   "description": "Expose Trae desktop-app models (CN and international) through a loopback OpenAI-compatible endpoint, for use as a model provider in ZCode or any OpenAI-compatible client.",
   "type": "module",
   "license": "MIT",
