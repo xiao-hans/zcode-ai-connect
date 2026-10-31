@@ -86,14 +86,17 @@ function toChatMessages(instructions, input, mutLevel = 0) {
       const role = item.role === 'developer' ? 'system' : item.role ?? 'user';
       const text = textOfContent(item.content);
       if (text) {
-        // Codex 0.166 起把系统提示词放进 developer 消息,与 instructions 一样需要去指纹
-        messages.push({ role, content: role === 'system' ? deFingerprint(text, mutLevel) : text });
+        // system/assistant 都在网关扫描范围(dsh-connect-workbuddy #98 的测量):
+        // developer 是 Codex 0.166 的系统提示词;assistant 是模型自己的历史,
+        // 历史里复述过指纹会毒化会话后续每一轮且重试无效
+        messages.push({ role, content: role === 'user' ? text : deFingerprint(text, mutLevel) });
       }
     } else if (item.type === 'function_call') {
       messages.push({
         role: 'assistant',
         content: null,
-        tool_calls: [{ id: item.call_id ?? 'call_0', type: 'function', function: { name: item.name ?? '', arguments: item.arguments ?? '' } }],
+        // 工具参数也是被扫描的 assistant 内容;只做词级改写,不能加中性头(会破坏 JSON)
+        tool_calls: [{ id: item.call_id ?? 'call_0', type: 'function', function: { name: item.name ?? '', arguments: deFingerprintLexical(item.arguments ?? '', mutLevel) } }],
       });
     } else if (item.type === 'function_call_output') {
       messages.push({ role: 'tool', tool_call_id: item.call_id ?? 'call_0', content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '') });
@@ -282,24 +285,36 @@ function mapUsage(u) {
 }
 
 // ---- 上游 WAF 去指纹 ----
-// workbuddy 上游对已知 coding CLI 的官方特征做通道指纹匹配(命中即 400/11128),
-// 实测指纹(Claude Code 侧大小写、斜杠、空白均归一,只能改词):
-//   · Codex:开头身份三句("You are a coding agent running in the Codex CLI…")
-//   · Claude Code:x-anthropic-billing-header 计费块(见 stripBillingBlocks,直接剥)
-//     以及 system 里的官方反馈链接 github.com/anthropics/claude-code/issues
-// 语义无损的改写梯子:
+// workbuddy 上游对已知 coding CLI 的官方特征做通道指纹匹配(命中即 400/11128)。
+// 实测与机制(移植自 dsh-connect-workbuddy 的研究文档与 #98/#125/#163):
+//   · 扫描范围:system 与 assistant 双角色,精确子串命中正文任意位置
+//   · assistant 历史带指纹会毒化会话后续每一轮,宿主每轮重发逐字节相同的历史,
+//     重试无效——必须每轮在桥里改写
+//   · 2026-10-29 起网关匹配前归一化不可见字符(#163),零宽字符方案已死,只能同义改写
+// 实测指纹点:Codex 开头身份三句;Claude Code 的 x-anthropic-billing-header 计费块
+// (见 stripBillingBlocks,直接剥)与官方反馈链接 github.com/anthropics/claude-code/issues
+// 梯子(对应上游 forceNeutralHead / breakIdentityClauses 的现行形态):
 //   level 0:去牛津逗号 + 反馈链接周边措辞微调(链接本体不动、仍可点)
 //   level 1:首处 "You are "→"You're " + Codex 专用措辞 + 链接路径破形(兜底)
+//   level 2:中性头前置(前缀门兜底,对应上游 forceNeutralHead);工具参数不加头
+const NEUTRAL_HEAD = 'You are a helpful assistant.\n\n';
+
+function deFingerprintLexical(s, level = 0) {
+  if (typeof s !== 'string' || !s) return s;
+  let t = s.replace(/, and /g, ' and ');
+  t = t.replace(/report the issue at (https:\/\/github\.com\/anthropics\/claude-code\/issues)/, 'report issues at $1');
+  if (level >= 1) {
+    t = t.replace(/You are /, "You're ");
+    t = t.replace(/running in the Codex CLI/g, 'running within the Codex CLI');
+    t = t.replace(/anthropics\/claude-code\/issues/, 'anthropics/claude-code/claude-code/issues');
+  }
+  return t;
+}
+
 function deFingerprint(instructions, level = 0) {
   if (typeof instructions !== 'string' || !instructions) return instructions;
-  let s = instructions.replace(/, and /g, ' and ');
-  s = s.replace(/report the issue at (https:\/\/github\.com\/anthropics\/claude-code\/issues)/, 'report issues at $1');
-  if (level >= 1) {
-    s = s.replace(/You are /, "You're ");
-    s = s.replace(/running in the Codex CLI/g, 'running within the Codex CLI');
-    s = s.replace(/anthropics\/claude-code\/issues/, 'anthropics/claude-code/claude-code/issues');
-  }
-  return s;
+  const t = deFingerprintLexical(instructions, level);
+  return level >= 2 ? NEUTRAL_HEAD + t : t;
 }
 
 async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false } = {}) {
@@ -348,7 +363,7 @@ async function handleResponses(req, res, wireModel, body) {
   // 调试:ZC_BRIDGE_DEBUG=1 时把原始请求落盘(覆盖写),供排障比对
   if (process.env.ZC_BRIDGE_DEBUG) {
     await mkdir(stateDir, { recursive: true }).catch(() => {});
-    await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body).slice(0, 200_000)}\n`).catch(() => {});
+    await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body)}\n`).catch(() => {});
   }
 
   const callUpstream = (mutLevel, noStreamOptions) =>
@@ -363,16 +378,30 @@ async function handleResponses(req, res, wireModel, body) {
     return;
   }
   if (upstream.status === 400) {
-    // 400 分两条路:11128 = WAF 指纹命中,换第二梯子措辞重试;
-    // 否则视为个别通道不认 stream_options,去掉后重试。
-    const errText = await upstream.text().catch(() => '');
-    const channelBlocked = errText.includes('11128');
-    try {
-      upstream = await callUpstream(channelBlocked ? 1 : 0, !channelBlocked);
-    } catch (e) {
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
-      return;
+    let errText = await upstream.text().catch(() => '');
+    if (errText.includes('11128')) {
+      // 11128 同义改写梯子:level 1(措辞加强)→ level 2(中性头兜底)
+      for (let level = 1; level <= 2; level++) {
+        try {
+          upstream = await callUpstream(level, false);
+        } catch (e) {
+          res.writeHead(502, { 'content-type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
+          return;
+        }
+        if (upstream.status !== 400) break;
+        errText = await upstream.text().catch(() => '');
+        if (!errText.includes('11128')) break;
+      }
+    } else {
+      // 非 11128 的 400:个别通道不认 stream_options,去掉后重试一次
+      try {
+        upstream = await callUpstream(0, true);
+      } catch (e) {
+        res.writeHead(502, { 'content-type': 'application/json' });
+        res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
+        return;
+      }
     }
     if (upstream.failed || !upstream.ok) {
       const text = upstream.failed ? '' : await upstream.text().catch(() => '');
@@ -467,7 +496,7 @@ function stripBillingBlocks(system) {
   return system.filter(b => !(b?.type === 'text' && typeof b.text === 'string' && b.text.startsWith('x-anthropic-billing-header')));
 }
 
-function toChatMessagesAnthropic(systemText, messages) {
+function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
   const out = [];
   if (systemText) out.push({ role: 'system', content: systemText });
   for (const m of Array.isArray(messages) ? messages : []) {
@@ -485,13 +514,15 @@ function toChatMessagesAnthropic(systemText, messages) {
       }
       if (texts.length) out.push({ role: 'user', content: texts.join('') });
     } else if (m.role === 'assistant') {
+      // assistant 历史在网关扫描范围(#98):复述过指纹的回复会毒化后续每一轮
       let text = '';
       const toolCalls = [];
       for (const p of parts) {
         if (p?.type === 'text') text += p.text ?? '';
-        else if (p?.type === 'tool_use') toolCalls.push({ id: p.id ?? `call_${toolCalls.length}`, type: 'function', function: { name: p.name ?? '', arguments: JSON.stringify(p.input ?? {}) } });
+        else if (p?.type === 'tool_use') toolCalls.push({ id: p.id ?? `call_${toolCalls.length}`, type: 'function', function: { name: p.name ?? '', arguments: deFingerprintLexical(JSON.stringify(p.input ?? {}), mutLevel) } });
         // thinking 不回传
       }
+      text = deFingerprint(text, mutLevel);
       const msg = { role: 'assistant', content: text || (toolCalls.length ? null : '') };
       if (toolCalls.length) msg.tool_calls = toolCalls;
       out.push(msg);
@@ -661,7 +692,8 @@ async function handleMessages(req, res, body) {
 
   const callUpstream = (mutLevel, noStreamOptions) => {
     const p = { ...chatPayload };
-    if (mutLevel > 0) p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(body.system), mutLevel), body.messages);
+    // 每级都从原始 body 重建:billing 剥除 + 去指纹 + assistant 历史改写按当前档位重算
+    p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), mutLevel), body.messages, mutLevel);
     if (noStreamOptions) delete p.stream_options;
     return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
       method: 'POST',
@@ -672,7 +704,7 @@ async function handleMessages(req, res, body) {
 
   if (process.env.ZC_BRIDGE_DEBUG) {
     await mkdir(stateDir, { recursive: true }).catch(() => {});
-    await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body).slice(0, 200_000)}\n`).catch(() => {});
+    await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body)}\n`).catch(() => {});
   }
 
   let upstream;
@@ -683,13 +715,28 @@ async function handleMessages(req, res, body) {
     return;
   }
   if (upstream.status === 400) {
-    const errText = await upstream.text().catch(() => '');
-    const channelBlocked = errText.includes('11128');
-    try {
-      upstream = await callUpstream(channelBlocked ? 1 : 0, !channelBlocked);
-    } catch (e) {
-      json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
-      return;
+    let errText = await upstream.text().catch(() => '');
+    if (errText.includes('11128')) {
+      // 11128 同义改写梯子:level 1(措辞加强)→ level 2(中性头兜底)
+      for (let level = 1; level <= 2; level++) {
+        try {
+          upstream = await callUpstream(level, false);
+        } catch (e) {
+          json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
+          return;
+        }
+        if (upstream.status !== 400) break;
+        errText = await upstream.text().catch(() => '');
+        if (!errText.includes('11128')) break;
+      }
+    } else {
+      // 非 11128 的 400:个别通道不认 stream_options,去掉后重试一次
+      try {
+        upstream = await callUpstream(0, true);
+      } catch (e) {
+        json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
+        return;
+      }
     }
     if (!upstream.ok) {
       const text = await upstream.text().catch(() => '');
