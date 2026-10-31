@@ -1,3 +1,6 @@
 node_modules/
 *.bak
 *.log
+
+__pycache__/
+*.pyc
