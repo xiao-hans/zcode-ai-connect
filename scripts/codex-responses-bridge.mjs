@@ -72,6 +72,19 @@ function textOfContent(content) {
     .join('');
 }
 
+// ---- 工具输出截断 ----
+// 单条工具结果可达数百 KB(UI 自动化 dump、构建日志、大文件读取),一条就能把
+// 上下文顶过上游真实上限(~190k),且自动压缩只在轮间触发、救不了单轮暴涨。
+// 每条工具输出超过上限即截断:保留头 60% + 尾 40% 框架,注明丢弃量。
+const TOOL_OUTPUT_CAP = 20_000;
+
+function capToolOutput(s) {
+  if (typeof s !== 'string' || s.length <= TOOL_OUTPUT_CAP) return s;
+  const head = Math.floor(TOOL_OUTPUT_CAP * 0.6);
+  const tail = TOOL_OUTPUT_CAP - head - 60;
+  return s.slice(0, head) + `\n…[桥截断:单条工具输出 ${s.length} 字符超上限,中段省略 ${s.length - TOOL_OUTPUT_CAP} 字符]…\n` + s.slice(-tail);
+}
+
 function toChatMessages(instructions, input, mutLevel = 0) {
   const messages = [];
   if (typeof instructions === 'string' && instructions.trim()) {
@@ -99,7 +112,7 @@ function toChatMessages(instructions, input, mutLevel = 0) {
         tool_calls: [{ id: item.call_id ?? 'call_0', type: 'function', function: { name: item.name ?? '', arguments: deFingerprintLexical(item.arguments ?? '', mutLevel) } }],
       });
     } else if (item.type === 'function_call_output') {
-      messages.push({ role: 'tool', tool_call_id: item.call_id ?? 'call_0', content: typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '') });
+      messages.push({ role: 'tool', tool_call_id: item.call_id ?? 'call_0', content: capToolOutput(typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '')) });
     }
     // reasoning 等其他 item 无 chat 等价物,丢弃
   }
@@ -508,7 +521,7 @@ function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
         if (p?.type === 'text') texts.push(p.text ?? '');
         else if (p?.type === 'tool_result') {
           if (texts.length) { out.push({ role: 'user', content: texts.join('') }); texts.length = 0; }
-          out.push({ role: 'tool', tool_call_id: p.tool_use_id ?? '', content: anthropicTextOf(p.content) || (p.is_error ? '(tool error)' : '') });
+          out.push({ role: 'tool', tool_call_id: p.tool_use_id ?? '', content: capToolOutput(anthropicTextOf(p.content)) || (p.is_error ? '(tool error)' : '') });
         }
         // image 等无 chat 等价物,丢弃
       }
