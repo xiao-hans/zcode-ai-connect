@@ -151,6 +151,17 @@ scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交�
 
 回归测试:`node scripts/test-claude-bridge.mjs`(Anthropic 协议冒烟:文本/工具/多轮 tool_result/非流式/count_tokens)。
 
+### 复盘:「明明只用了 4.6%,为什么报 Context limit reached」
+
+一个真实场景:会话里 `acp_status` 显示计费输入仅 46,428(4.6%),模型窗口明明是 1M,Claude 却反复弹 "Context limit reached"。四个因素叠加,缺一不炸:
+
+1. **两个计数口径不是一回事**:`acp_status` 的计费输入是上游视角的真实用量;Claude **本地预检**用的是桥在 `message_start` 上报的估算。截图 base64 灌爆的是后者——46k 是真的,但 Claude 眼里的数字是 17.7 万。
+2. **窗口强制**:当时 profile 带窗口强制(180k),本地估算 17.7 万 ≥ 上限 → **Claude 本地拒发,请求根本不出桥**,上游从未被询问(上游真限制另计,目录 1M 与执行值不是一回事)。
+3. **`DISABLE_AUTO_COMPACT=1`**(全局 settings.json env):拒发后 Claude 不做任何自动恢复,只会重复举牌等手动 /compact。
+4. **死锁**:修复估算后,新用量要等一次**成功请求**才能回流纠正计量,而拒发恰恰挡住了所有请求——卡死的会话靠自身永远出不来。
+
+解法:桥已排除 base64(本仓库 1772f06)→ 新开的会话天然正常;**已卡死的旧会话**用 `/compact`(实测三次均可绕过拒发)或**重开进程 + `--resume`**解锁。`[1M]` 后缀说明:它只对 Claude 认识的模型 id 生效,给该模型开 1M 窗口;对本套件这类未知 id 无效——这正是要设 `DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 的原因。15,000,000 那个数是代理(bili)的预算标签,与上下文无关。
+
 ### 可选:让裸 `claude` 直接等于本套件
 
 把 npm 启动器 `C:\nvm4w\nodejs\claude.cmd`(以及 `claude.ps1`、无后缀的 `claude`)改写为转发器:
