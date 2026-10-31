@@ -126,6 +126,7 @@ profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.to
 
 - Responses SSE 的 `data:` JSON 必须自带 `"type"` 字段,codex 按 `data.type` 分发事件;缺了它表现为「stream disconnected before completion」重试 5 次全败,与桥端是否发出 `response.completed` 无关。
 - WorkBuddy 上游 WAF(11128 "unapproved channel")对 Codex 官方身份声明(开头三句,空白归一化)做指纹匹配;桥对 instructions 做语义无损改写(去牛津逗号,命中 11128 再换一处措辞重试)绕过。
+- roster/目录声称的 `contextWindow: 1_000_000` 是宣传值,实测上游在更小体量即拒 `prompt is too long`(11115,与 11128 是两个不同错误);故 profile 显式声明 `model_context_window=180000` 标定自动压缩时机,`model_max_output_tokens` 按各端点实测值。
 - codex 在非信任目录用 read-only 沙箱跑 shell 会报 `CreateProcessWithLogonW: 267`,属 codex 自身 Windows 沙箱限制,与桥无关。
 
 回归测试:`node scripts/test-codex-bridge.mjs`(桥协议冒烟,需桥在跑)· `node scripts/test-codex-wiring.mjs`(四端点直连冒烟,需端点在跑)。
@@ -138,7 +139,7 @@ Claude Code 讲 Anthropic Messages 协议,同一个桥同样翻译:`POST /v1/mes
 scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交互 / MCP 均可)
 ```
 
-模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/glm-5.3`,后台快速档(haiku 位)`qw/qwen3.8-flash`。上下文不设人为窗口——`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 让 Claude 以上游裁决为准:上游拒 "Prompt is too long"(Claude 认得该错误格式)时自动压缩恢复。注意 roster 声称的 1M 是目录宣传值,网关实际执行的限制更低且按它自家分词器计数(中文内容计数显著高于 chars/4 估算),故配套 20KB 工具输出截断防单轮爆仓。`modelPicker` 由 [sync-claude-models.mjs](scripts/sync-claude-models.mjs) 生成——四家**全量**模型(61+)进入 `/model` 阵容,默认模型带 ★;上游名册变化后重跑 `node scripts/sync-claude-models.mjs` 刷新(需端点在跑,已开会话要重开)。
+模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/deepseek-v4.1-flash`,后台快速档(haiku 位)`qw/qwen3.8-flash`。上下文不设人为窗口——`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 让 Claude 以上游裁决为准:上游拒 "Prompt is too long"(Claude 认得该错误格式)时自动压缩恢复。注意 roster 声称的 1M 是目录宣传值,网关实际执行的限制更低且按它自家分词器计数(中文内容计数显著高于 chars/4 估算),故配套 20KB 工具输出截断防单轮爆仓。免审批由包装器的 `--dangerously-skip-permissions` 与 settings 的 `permissions.defaultMode=bypassPermissions` 双重保证。自动压缩另有一个全局开关坑:若 `~/.claude/settings.json` env 里设了 `DISABLE_AUTO_COMPACT=1`,Claude 的自动压缩会被关掉,上游拒满后只能手动 /compact——包装器在 `--settings` 层覆盖为 0 并置 `autoCompactEnabled=true`;若你的环境仍不生效,删掉全局那行。`modelPicker` 由 [sync-claude-models.mjs](scripts/sync-claude-models.mjs) 生成——四家**全量**模型(61+)进入 `/model` 阵容,默认模型带 ★;上游名册变化后重跑 `node scripts/sync-claude-models.mjs` 刷新(需端点在跑,已开会话要重开)。
 
 实现注记(踩过的坑):
 
@@ -146,8 +147,20 @@ scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交�
 - system 里的官方反馈链接 `github.com/anthropics/claude-code/issues` 也是指纹(大小写、斜杠归一,只认原文);桥把周边措辞「report the issue at」微调为「report issues at」绕过,链接本体保持可点;重试梯子兜底会直接破形 URL。
 - Claude Code 2.1.316 会把 hook 上下文作为 `role:"system"` 的 message 发来,Codex 0.166 把系统提示词挪进 `developer` 消息——桥对两者都已正确映射。
 - 网关模型发现(`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`)会过滤掉 id 不含 claude/anthropic 的条目,对本套件的前缀 id 无效;选择器走 `modelPicker` 显式阵容。
+- Claude 会话里的截图以 base64 内嵌请求;桥翻译时丢弃图片(上游零成本),但**用量估算若按 JSON 长度计会把 base64 一并算入**——一张 1216x2640 截图(~25 万 base64 字符)虚增 6 万+ token,把 Claude 的上下文计量灌爆,触发与真实用量无关的本地拒发。估算已改为遍历请求结构、image 块计固定 400 字符。
 
 回归测试:`node scripts/test-claude-bridge.mjs`(Anthropic 协议冒烟:文本/工具/多轮 tool_result/非流式/count_tokens)。
+
+### 可选:让裸 `claude` 直接等于本套件
+
+把 npm 启动器 `C:\nvm4w\nodejs\claude.cmd`(以及 `claude.ps1`、无后缀的 `claude`)改写为转发器:
+
+```bat
+@echo off
+call C:\Users\HANXIAO\bin\claude.cmd %*
+```
+
+`bin\claude.cmd` 直调原生 exe(`node_modules\@anthropic-ai\claude-code\bin\claude.exe`)防递归,原启动器备份 `.orig-npm`。注意 npm 更新 claude-code 会重建该启动器,影子失效需重写;把 `C:\Users\HANXIAO\bin` 放进 PATH 末位不够——`C:\nvm4w\nodejs` 在系统 PATH 里,顺序永远压过用户 PATH。
 
 ## 七、各家速览
 
