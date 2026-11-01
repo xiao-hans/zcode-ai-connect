@@ -47,6 +47,25 @@ async function log(line) {
   } catch { /* 诊断尽力而为 */ }
 }
 
+/**
+ * 进程级兜底:桥是所有会话共用的单点,任何一次请求里的漏网异常都不该让它退出。
+ *
+ * Node 15+ 默认把 unhandledRejection 升级成致命错误;而这个进程一旦退出,所有
+ * 客户端同时变成 503 connect-refused(宿主侧还有代理熔断,恢复要等一轮探测)。
+ * 所以这里把两类逃逸都兜住并留痕,让进程继续服务 —— 单个请求失败可以重试,
+ * 守护进程死掉是所有人的事。
+ */
+function installCrashGuard() {
+  const note = (kind, error) => {
+    try {
+      fs.mkdirSync(stateDir, { recursive: true });
+      fs.appendFileSync(logPath, `${new Date().toISOString()} ${kind}: ${String(error?.stack ?? error).slice(0, 800)}\n`);
+    } catch { /* 写不进日志也不能再抛 */ }
+  };
+  process.on('uncaughtException', (error) => note('uncaughtException', error));
+  process.on('unhandledRejection', (error) => note('unhandledRejection', error));
+}
+
 // ---- 端点发现(带 TTL 缓存,token 轮换后自动跟上) ----
 const epCache = new Map(); // tool -> { at, ep }
 
@@ -539,7 +558,19 @@ async function* upstreamSseChunks(upstream) {
   const decoder = new TextDecoder();
   let buf = '';
   while (true) {
-    const { done, value } = await reader.read();
+    let step;
+    try {
+      step = await reader.read();
+    } catch (error) {
+      // 上游连接中途断掉(端点重启 / 网关掐断 / 客户端取消):这里必须自己咽掉。
+      // 异常一旦从 handleMessages 的 async 函数里逃出去就是 unhandledRejection,
+      // Node 22 默认直接结束进程 —— 一个请求出错会把整个桥(所有模型、所有会话)
+      // 一起拖死,用户侧表现为 503 connect-refused + 代理熔断。
+      // 咽掉不等于粉饰:合成一个 error 帧交回调用方,按原有错误路径收尾。
+      yield { error: { message: `upstream stream broke: ${String(error?.message ?? error)}`, type: 'upstream_broken' } };
+      return;
+    }
+    const { done, value } = step;
     if (done) break;
     buf += decoder.decode(value, { stream: true });
     let nl;
@@ -1121,6 +1152,7 @@ async function handle(req, res) {
 }
 
 async function serve(port) {
+  installCrashGuard();
   const server = createServer(handle);
   await new Promise((ok, bad) => {
     server.once('error', bad);
