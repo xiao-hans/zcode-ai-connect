@@ -127,7 +127,7 @@
       },
       {
         "model": "trae/deepseek-v4.1-flash",
-        "label": "DeepSeek-V4.1-Flash · Trae CN",
+        "label": "DeepSeek-V4.1-Flash · Trae CN ⚠长任务易停(实测12%)",
         "behavesAs": "claude-sonnet-4-6"
       },
       {
