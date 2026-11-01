@@ -180,7 +180,26 @@ console.log('[5] 放行场景');
   check('交回决定权 → 放行', !ask.blocked, ask.raw);
 }
 
-console.log('[6] 异常输入静默退出');
+console.log('[6] 同一个词发两次 = 两个回合,预算不共用');
+{
+  // 用户反复发「继续」时,只按 prompt 文本算回合会把两次输入算成同一轮,
+  // 第二轮的续跑预算一开始就被上一轮用光(实测 23:11/23:11/23:14/23:18 连续
+  // 四次「turn cap reached」)。回合身份必须带上时间戳。
+  const t1 = rawTranscript([
+    { type: 'user', timestamp: '2026-11-01T15:00:00.000Z', message: { role: 'user', content: '继续' } },
+    stallTurn('先读关键文件确认现状。'),
+  ]);
+  const t2 = rawTranscript([
+    { type: 'user', timestamp: '2026-11-01T15:18:00.000Z', message: { role: 'user', content: '继续' } },
+    stallTurn('先读关键文件确认现状。'),
+  ]);
+  const a = await stopEvent(t1, {}, 's-turn');
+  check('第一轮 → 续跑', a.blocked, a.raw);
+  const b = await stopEvent(t2, {}, 's-turn');   // 同 session、同文本、不同时间戳
+  check('第二轮同词同句 → 仍然续跑', b.blocked, b.raw);
+}
+
+console.log('[7] 异常输入静默退出');
 {
   const junk = await runHook('not json at all');
   check('非 JSON stdin → 无输出', junk.out.trim() === '' && junk.code === 0, `${junk.out} / ${junk.code}`);

@@ -41,6 +41,7 @@ import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
  */
 const FALLBACK_REASON = [
   '继续执行:直接调用工具把剩下的步骤做完。',
+  '工具调用走工具调用通道,不要写成 <Read>…</Read> 这类标签文本。',
   '不要复述本条消息,也不要把它当作任务内容。',
   '确实做完了就用一句话说明结论。',
 ].join('\n');
@@ -126,6 +127,7 @@ function lastTurnStats(entries) {
   let toolCalls = 0;
   let lastText = '';
   let turnStart = '';
+  let turnStartAt = '';
   for (let i = entries.length - 1; i >= 0; i--) {
     const o = entries[i];
     if (o.type === 'user' && o.message?.content !== undefined) {
@@ -136,6 +138,11 @@ function lastTurnStats(entries) {
           turnStart = typeof c === 'string'
             ? c
             : (Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text ?? '').join('') : '');
+          // 时间戳是回合身份的一部分:用户反复发同一个词(「继续」「好」)时,
+          // 只按文本算 turnKey 会把**不同回合**算成同一轮,续跑预算立刻被上一轮
+          // 用掉的额度顶满 —— 实测 2026-11-01 23:11/23:11/23:14/23:18 连续四次
+          // 一次就 "turn cap reached (20)"。
+          turnStartAt = String(o.timestamp ?? '');
           break; // 本轮起点(真人输入)
         }
         continue; // 注入消息不打断回溯
@@ -149,7 +156,7 @@ function lastTurnStats(entries) {
       }
     }
   }
-  return { toolCalls, lastText, turnStart };
+  return { toolCalls, lastText, turnStart, turnStartAt };
 }
 
 /**
@@ -193,9 +200,9 @@ async function main() {
     .filter(o => o && (o.type === 'assistant' || o.type === 'user'));
   if (!entries.length) return;
 
-  const { toolCalls, lastText, turnStart } = lastTurnStats(entries);
+  const { toolCalls, lastText, turnStart, turnStartAt } = lastTurnStats(entries);
   const sessionId = typeof event.session_id === 'string' && event.session_id ? event.session_id : 'unknown';
-  const turnKey = hashKey(sessionId, turnStart.slice(0, 400));
+  const turnKey = hashKey(sessionId, turnStart.slice(0, 400), turnStartAt);
 
   let reason = null;
   if (!lastText) {
