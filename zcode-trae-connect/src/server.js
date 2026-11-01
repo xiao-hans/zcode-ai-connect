@@ -46,6 +46,18 @@ const HEARTBEAT_MS = 10_000
  */
 const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
 
+/**
+ * 正文已经开始流出之后的静默宽限。
+ *
+ * 一次回复里"上游彻底不吭声"有两种完全不同的含义:
+ *   · 还没有任何正文 → 请求卡住了,等下去只会让宿主一直转圈,长超时 + 重试型错误帧;
+ *   · 正文已经写完 → 上游只是不发 done、也不关连接(实测 2026-11-01 21:38:09 正文
+ *     结束、21:41:10 才被 180s 看门狗斩断),这时候再等 3 分钟纯属浪费,而且最后
+ *     甩出的 error 帧会把宿主这一轮**已产出的内容**判成失败
+ *     ("Server error mid-response")。尾段改用短宽限,并按截断(length)收尾。
+ */
+const STREAM_TAIL_TIMEOUT_MS = Number(process.env['ZC_STREAM_TAIL_TIMEOUT_MS'] ?? 30_000)
+
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS = {
   hard_credit: 402,
@@ -273,8 +285,23 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
    */
   const armIdle = () => {
     if (idleTimer !== undefined) clearTimeout(idleTimer)
+    // 正文已经流出去之后的宽限要短得多:上游常常在正文结束后既不发 done 也不关
+    // 连接(实测 2026-11-01 21:38:09 正文结束 → 21:41:10 才被 180s 看门狗斩断),
+    // 等满 180s 再甩一个 error 帧,等于把一轮**已经产出内容**的回合作废,宿主只看到
+    // "Server error mid-response, the response above may be incomplete"。
+    // 正文已出即按截断收尾(length):客户端能据此判断"写了一半",而不是整轮失败。
+    const tailMode = contentStarted
+    const budget = tailMode ? STREAM_TAIL_TIMEOUT_MS : STREAM_IDLE_TIMEOUT_MS
     idleTimer = setTimeout(() => {
       if (done || settled) return
+      if (tailMode) {
+        logger?.warn?.(`[trae] upstream tail silent for ${budget}ms after content — closing as truncated`)
+        emitFinish('length')
+        done = true
+        if (res.writable) res.end('data: [DONE]\n\n')
+        onStall?.()
+        return
+      }
       logger?.warn?.(`[trae] upstream silent for ${STREAM_IDLE_TIMEOUT_MS}ms — aborting the turn`)
       write({
         error: {
@@ -289,7 +316,7 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
       // Telling the upstream is what frees the connection (and, for the
       // chat_sessions path, stops a remote turn we no longer read).
       onStall?.()
-    }, STREAM_IDLE_TIMEOUT_MS)
+    }, budget)
     idleTimer.unref?.()
   }
 
@@ -307,8 +334,12 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
   }
 
   const emitContent = text => {
+    const firstContent = !contentStarted
     contentStarted = true
     emitDelta({ content: text })
+    // 首帧正文落地后立刻改用尾段宽限:看门狗是按「上一帧」的状态武装的,
+    // 等到下一帧才换预算的话,"正文刚写完就静默"这一种(最常见)仍会等满 180s。
+    if (firstContent) armIdle()
   }
 
   /** Release the held content delta, behind any reasoning already emitted. */

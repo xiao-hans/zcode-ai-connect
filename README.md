@@ -195,12 +195,13 @@ call C:\Users\HANXIAO\bin\claude.cmd %*
 | 情况 | 收尾 |
 |---|---|
 | 已开流后上游 180 秒零字节 | `error` 帧 + `finish_reason: "network_error"` + `[DONE]`,并中止上游 |
+| 正文已出、上游 30 秒不发 `done`(尾段静默) | `finish_reason: "length"` + `[DONE]`,**不发 error 帧** —— 已经产出的内容不该被判成整轮失败 |
 | 上游没给 finish 帧就断流 | `finish_reason: "length"`(截断如实上报,绝不改写成 `stop`) |
 | 有 tool_calls 却标成 `stop` | 纠正为 `finish_reason: "tool_calls"` |
 | 整回合只有思考、没有任何产出 | `error` 帧(`empty_answer`),让下游重试 |
 | 客户端断开 | 中止上游请求 / 删除远端会话,不浪费额度也不占并发 |
 
-看门狗间隔:`ZC_STREAM_IDLE_TIMEOUT_MS`(默认 180000ms)。心跳只保活下游,不重置看门狗。
+看门狗间隔:`ZC_STREAM_IDLE_TIMEOUT_MS`(默认 180000ms);正文已流出后的尾段宽限是 `ZC_STREAM_TAIL_TIMEOUT_MS`(默认 30000ms)。心跳只保活下游,不重置看门狗。
 改动前的症状正是「长时间任务后模型忽然暂停、没有报错」:上游断流被补成 `stop`,下游便把截断当成模型自己收尾。
 
 **输出预算(max_tokens)**:桥现在转发客户端的 `max_tokens`(Codex 侧是 `max_output_tokens`),并夹在 `ZC_MAX_OUTPUT_TOKENS`(默认 32000)以内——上游对超限值的处置不一致(有的 400、有的静默截)。实测 wb 通道 60 tokens 请求 → `stop_reason: max_tokens`、恰好 60 输出 token;**trae 走的 `llm_utils_chat` 通道不接收这个字段**(协议里没有),所以 trae 侧仍以上游默认预算运行——这是通道能力边界,不是桥漏了。客户端若因此收到 400,桥会自动去掉 `stream_options` 与 `max_tokens` 重试一次。

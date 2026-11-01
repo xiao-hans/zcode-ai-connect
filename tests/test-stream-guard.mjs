@@ -12,6 +12,7 @@
 import assert from 'node:assert/strict'
 
 process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ??= '1200'
+process.env['ZC_STREAM_TAIL_TIMEOUT_MS'] ??= '1200'
 
 const { createTraeServer } = await import('../zcode-trae-connect/src/server.js')
 
@@ -201,6 +202,33 @@ const base = { model: 'test-model', messages: [{ role: 'user', content: 'hi' }],
     assert.equal(body.choices[0].message.content, '你好')
     await server.close()
     console.log('ok  5. omitted stream defaults to a JSON completion')
+  })
+}
+
+// --- 6. upstream goes silent AFTER the answer body (tail timeout) -----------
+// 实测(2026-11-01 21:38:09 → 21:41:10,trae/deepseek-v4.1-flash):正文写完,
+// 上游既不发 done 也不关连接。旧的单一 180s 看门狗在 3 分钟后补一个 error 帧,
+// 宿主看到 "Server error mid-response",一整轮已产出的内容被判失败。
+// 正文已出 → 短宽限 + 按截断(length)收尾:客户端知道"写了一半",不是整轮挂掉。
+{
+  const chunks = [
+    'data: {"choices":[{"index":0,"delta":{"content":"签名"},"finish_reason":null}]}\n\n',
+    'data: {"choices":[{"index":0,"delta":{"content":"失败。"},"finish_reason":null}]}\n\n',
+    30_000,
+  ]
+  const client = {
+    chatStream: async () => ({ ok: true, response: sseResponse(chunks, { endAfter: false }) }),
+  }
+  await withServer(client, async server => {
+    const started = Date.now()
+    const res = await post(server, base)
+    const { finishes, errors, sawDone } = await readSse(res)
+    assert.deepEqual(finishes, ['length'], `post-content stall must close as length, got ${JSON.stringify(finishes)}`)
+    assert.equal(errors.length, 0, 'a turn that already produced content must NOT be reported as an error')
+    assert.equal(sawDone, true)
+    assert.ok(Date.now() - started < 10_000, 'the tail watchdog must fire on the short budget, not the 180s one')
+    await server.close()
+    console.log('ok  6. silent upstream after the body closes as length (tail timeout)')
   })
 }
 

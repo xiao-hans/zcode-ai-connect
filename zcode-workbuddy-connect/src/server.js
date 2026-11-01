@@ -36,6 +36,12 @@ const HEARTBEAT_MS = 10_000
  * already-open stream is a stall, not a slow model.
  */
 const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
+/**
+ * 正文已经开始流出之后的静默宽限(含义见 trae 端点同名常量):正文已出说明这一次
+ * 回复有内容落地,上游不发 done 只说明它不肯收尾 —— 按截断(length)短超时收尾,
+ * 好过等 3 分钟再甩一个 error 帧把整轮判失败。
+ */
+const STREAM_TAIL_TIMEOUT_MS = Number(process.env['ZC_STREAM_TAIL_TIMEOUT_MS'] ?? 30_000)
 
 /** HTTP status each upstream failure class surfaces as. */
 const KIND_STATUS = {
@@ -309,8 +315,21 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
    */
   const armIdle = () => {
     if (idleTimer !== undefined) clearTimeout(idleTimer)
+    // 正文已出之后的宽限要短得多:上游常常在正文结束后既不发 done 也不关连接,
+    // 等满 180s 再甩 error 帧会把这一轮**已经产出的内容**判成失败
+    // (宿主侧显示 "Server error mid-response")。正文已出即按截断收尾。
+    const tailMode = contentStarted
+    const budget = tailMode ? STREAM_TAIL_TIMEOUT_MS : STREAM_IDLE_TIMEOUT_MS
     idleTimer = setTimeout(() => {
       if (done || settled) return
+      if (tailMode) {
+        logger?.warn?.(`[workbuddy] upstream tail silent for ${budget}ms after content — closing as truncated`)
+        emitToolCallsAndFinish('length')
+        done = true
+        if (res.writable) res.end('data: [DONE]\n\n')
+        onStall?.()
+        return
+      }
       logger?.warn?.(`[workbuddy] upstream silent for ${STREAM_IDLE_TIMEOUT_MS}ms — aborting the turn`)
       write({
         error: {
@@ -323,7 +342,7 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
       done = true
       if (res.writable) res.end('data: [DONE]\n\n')
       onStall?.()
-    }, STREAM_IDLE_TIMEOUT_MS)
+    }, budget)
     idleTimer.unref?.()
   }
 
@@ -341,8 +360,12 @@ function createStreamNormalizer(res, fallbackModel, { logger, onStall } = {}) {
   }
 
   const emitContent = text => {
+    const firstContent = !contentStarted
     contentStarted = true
     emitDelta({ content: text })
+    // 首帧正文落地后立刻换尾段宽限:看门狗按「上一帧」的状态武装,等下一帧再换
+    // 预算的话,"正文刚写完就静默"这一种(最常见)仍会等满 180s。
+    if (firstContent) armIdle()
   }
 
   /** Release the held content delta, behind any reasoning already emitted. */
