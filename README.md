@@ -203,6 +203,10 @@ call C:\Users\HANXIAO\bin\claude.cmd %*
 看门狗间隔:`ZC_STREAM_IDLE_TIMEOUT_MS`(默认 180000ms)。心跳只保活下游,不重置看门狗。
 改动前的症状正是「长时间任务后模型忽然暂停、没有报错」:上游断流被补成 `stop`,下游便把截断当成模型自己收尾。
 
+**输出预算(max_tokens)**:桥现在转发客户端的 `max_tokens`(Codex 侧是 `max_output_tokens`),并夹在 `ZC_MAX_OUTPUT_TOKENS`(默认 32000)以内——上游对超限值的处置不一致(有的 400、有的静默截)。实测 wb 通道 60 tokens 请求 → `stop_reason: max_tokens`、恰好 60 输出 token;**trae 走的 `llm_utils_chat` 通道不接收这个字段**(协议里没有),所以 trae 侧仍以上游默认预算运行——这是通道能力边界,不是桥漏了。客户端若因此收到 400,桥会自动去掉 `stream_options` 与 `max_tokens` 重试一次。
+
+**文本形态的工具调用**:DeepSeek 族偶发把工具调用写成 `<｜DSML｜…>` 标记塞进正文。桥做四道门恢复,门 2(工具名必须在本请求声明过)现在先剥离标记残渣再比对(`name="Grep"` 退化成 `<name>Grep</｜｜DSML｜｜ parameter>` 也能认出来),但**只接受唯一命中**。残渣已坏到无法安全解析的,桥不猜调用 —— 那一轮会退化成「文本戛然而止、没有工具调用」,由 §九 的自动续跑兜住;`ZC_BRIDGE_DEBUG=1` 时会往 `~/.zcode-codex-bridge/debug-dsml.log` 记一条待排查样本。
+
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`
 
 ## 九、「只说不做」的自动续跑
@@ -216,7 +220,7 @@ call C:\Users\HANXIAO\bin\claude.cmd %*
 | 宿主 | 挂载点 | 续跑方式 |
 |---|---|---|
 | ZCode(四个插件) | `Stop` hook | 输出 `{"decision":"block","reason":"…"}`,提示回灌上下文再请求一次 |
-| Claude Code | `Stop` hook | [claude-stall-guard.mjs](scripts/claude-stall-guard.mjs) 读 `transcript_path` 取本轮末条文本判定;`stop_hook_active` 限每轮续跑一次;经 claude-connect-settings.json 的 `hooks.Stop` 挂载 |
+| Claude Code | `Stop` hook | [claude-stall-guard.mjs](scripts/claude-stall-guard.mjs) 读 `transcript_path` 取本轮末条文本判定;同一段文本只续跑一次 + 每回合预算 3 次(原子指纹锁在 `~/.claude-stall-guard/`);**要挂进 `~/.claude/settings.json` 的 `hooks.Stop`,不能只挂在 `--settings` 层**——否则用 `claude` 直接启动(含经 bili 转发)时守卫根本不执行 |
 | pi | `turn_end` | 返回 `{continue:true, entries:[custom_message]}` |
 | dsh | `agent/turn-stopping` | `agent.steer(user 消息)` 塞进 `inbox.nextStep` |
 | hermes | **没有** —— 见下 | 补第 5 道收尾闸(`turn_stop_gates.py`) |
@@ -232,11 +236,29 @@ ZCode 侧的执行流程:
 
 **误判是这里唯一真正昂贵的事**,所以否决规则先于肯定规则求值:
 
-- 以问句收尾、把决定权交回你(`请你确认`/`是否要`/`shall I`)、明确的完成宣告(`已完成`/`all done`)——一律不续跑;
+- 以问句收尾、把决定权交回你(`请你确认`/`是否要我做`/`shall I`)、明确的完成宣告(`已完成`/`all done`)——一律不续跑；
+  **裸「是否」不算交权**:「验证是否不再崩溃」「我先确认 ui 是否已经引用」是模型自己的待办,中文技术叙述里遍地都是,曾因它被整类放行;
 - 同一段回复文本**只续跑一次**:四个插件并存时用原子指纹锁(默认 `~/.zcode-stall-guard/`,`ZCODE_STALL_GUARD_HOME` 可改)跨进程互斥,只会注入一条提示,不会四条;
+- 同一回合另有**续跑预算**(ZCode 2 次 / Claude 3 次):换个说法再说一遍「我先改…」也算新的一次停住,只靠文本去重挡不住,预算把最坏情况钉死;
 - 以冒号结尾只是加权项,不足以独立触发(说明性文字大量以冒号收尾)。
 
 **限制:Stop 载荷里没有 provider 信息**,所以这份 hook 影响 ZCode 里的所有模型,不只千问办公那一个。判定逻辑与 pi / dsh / hermes 侧共用同一套规则(`shared/stall-detector.mjs` 与 `shared/stall_detector.py`,由 `scripts/sync-stall-guard.mjs` 分发),四端阈值一致，`tests/test-detector-parity.mjs` 会逐字段比对两份实现。
+
+### Claude Code 侧必须挂进全局 settings
+
+`claude-connect.cmd` 只在自己的 `--settings` 层挂守卫。**用 `claude` 直接启动(或经 bili / billion-context 转发)时那一层根本不会被读**,守卫一次都不跑——实测会话里 24 次「宣布下一步就停」没有一条 Stop hook 反馈。所以同时把守卫写进 `~/.claude/settings.json`:
+
+```jsonc
+{
+  "hooks": {
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "node D:/path/to/zcode-ai-connect/scripts/claude-stall-guard.mjs", "timeout": 30 }] }
+    ]
+  }
+}
+```
+
+改完重开 Claude Code。回归测试:`node tests/test-claude-stall-guard.mjs`。
 
 ### hermes 为什么是个例外
 

@@ -384,7 +384,7 @@ function clampEffort(tool, level) {
   return ranked.find(eff => EFFORT_RANK.indexOf(eff) >= target) ?? ranked[ranked.length - 1];
 }
 
-async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false } = {}) {
+async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
   const payload = {
@@ -393,6 +393,9 @@ async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false } 
     stream: true,
   };
   if (!noStreamOptions) payload.stream_options = { include_usage: true };
+  // 输出预算(见 clampMaxOutput):Codex 的 max_output_tokens 夹到上游天花板
+  const maxOut = clampMaxOutput(body.max_output_tokens ?? body.max_tokens);
+  if (maxOut && !noMaxTokens) payload.max_tokens = maxOut;
   const tools = toChatTools(body.tools);
   if (tools) payload.tools = tools;
   const tc = toChatToolChoice(body.tool_choice);
@@ -439,8 +442,8 @@ async function handleResponses(req, res, wireModel, body) {
     await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body)}\n`).catch(() => {});
   }
 
-  const callUpstream = (mutLevel, noStreamOptions) =>
-    upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions });
+  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) =>
+    upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions, noMaxTokens });
 
   let upstream;
   try {
@@ -467,9 +470,9 @@ async function handleResponses(req, res, wireModel, body) {
         if (!errText.includes('11128')) break;
       }
     } else {
-      // 非 11128 的 400:个别通道不认 stream_options,去掉后重试一次
+      // 非 11128 的 400:个别通道不认 stream_options / max_tokens,去掉后重试一次
       try {
-        upstream = await callUpstream(0, true);
+        upstream = await callUpstream(0, true, true);
       } catch (e) {
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
@@ -588,6 +591,36 @@ class DSMLTextFilter {
 }
 
 /**
+ * 门 2 的工具名归一。
+ *
+ * 模型把标记写坏时,工具名会被残渣包裹(实测 `name="Grep"` 退化成
+ * `<name>Grep</｜｜DSML｜｜ parameter>`),逐字比对必然落空,整次调用丢失 ——
+ * 用户看到的是「任务没结束就停住」。这里先剥标记字符再比对,但**只接受唯一命中**:
+ * 模糊匹配会执行错的工具,比漏一次更贵(设计原则第 1 条)。
+ *
+ * @param {string} raw
+ * @param {Set<string>} declaredTools
+ * @returns {string} 归一后的工具名;空串 = 无法确定,不恢复
+ */
+function canonicalToolName(raw, declaredTools) {
+  const cleaned = String(raw ?? '')
+    .replace(/｜{1,2}\s*DSML\s*｜{1,2}/gi, '')
+    .replace(/[｜|\s"']/g, '')
+    .replace(/^</, '')
+    .replace(/<[^]*$/, '');
+  if (cleaned === '') return '';
+  if (declaredTools.has(cleaned)) return cleaned;
+  const lower = cleaned.toLowerCase();
+  const exact = [...declaredTools].filter((n) => String(n).toLowerCase() === lower);
+  if (exact.length === 1) return exact[0];
+  const prefixed = [...declaredTools].filter((n) => {
+    const nl = String(n).toLowerCase();
+    return nl.startsWith(lower) || lower.startsWith(nl);
+  });
+  return prefixed.length === 1 ? prefixed[0] : '';
+}
+
+/**
  * 四道门恢复:从剔除的 DSML 碎片中解析结构完好的 tool_calls 块。
  * @param {string} captured   被剔除的 DSML 片段(时序拼接)
  * @param {Set<string>} declaredTools 本请求声明的工具名(门 2/门 3)
@@ -610,11 +643,10 @@ function recoverDSMLToolCalls(captured, declaredTools) {
     // invoke 块:名称必须带 name="…"(门 2 前置)
     const invokeRe = /<｜{1,2}DSML｜{1,2}invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}invoke>/g;
     for (const inv of inner.matchAll(invokeRe)) {
-      const name = inv[1];
-      // 门 2:工具名必须在本请求声明过
-      if (!declaredTools.has(name)) continue;
+      // 门 2:工具名必须在本请求声明过(标记残渣先剥离再比对)
+      const name = canonicalToolName(inv[1], declaredTools);
+      if (name === '') continue;
       const params = {};
-      let ok = true;
       const paramRe = /<｜{1,2}DSML｜{1,2}parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}parameter>/g;
       for (const pm of inv[2].matchAll(paramRe)) {
         try { params[pm[1]] = JSON.parse(pm[2]); } catch { params[pm[1]] = pm[2]; }
@@ -626,6 +658,20 @@ function recoverDSMLToolCalls(captured, declaredTools) {
     }
   }
   return out;
+}
+
+/**
+ * 恢复失败的可诊断性:抓到了 tool_calls 块却一个 invoke 都没还原,说明模型这次
+ * 把标记写坏到了无法安全解析的程度(实测形态 `<name>Grep</｜｜DSML｜｜ parameter>`)。
+ * 这类本轮会退化成「文本戛然而止、没有工具调用」,由 Stop 守卫的自动续跑兜住;
+ * 这里只留一份可排查的记录,不合成任何调用 —— 猜错的工具调用比漏一次贵得多。
+ */
+function noteUnrecoveredDSML(captured, recovered) {
+  if (recovered.length > 0) return;
+  if (!/tool[\s_-]*calls/i.test(captured) && !/invoke/i.test(captured)) return;
+  if (process.env.ZC_BRIDGE_DEBUG) {
+    appendFile(path.join(stateDir, 'debug-dsml.log'), `${new Date().toISOString()} unrecovered: ${captured.slice(0, 400)}\n`).catch(() => {});
+  }
 }
 
 // ---- Anthropic Messages(/v1/messages,Claude Code)→ Chat ----
@@ -709,6 +755,21 @@ function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return {}; }
 }
 
+// ---- 输出预算 ----
+// 以前桥完全不转发客户端的 max_tokens:上游按自己的默认值生成,客户端却按自己的
+// 预算记账(Claude Code 的 CLAUDE_CODE_MAX_OUTPUT_TOKENS 常见 6000/128000 两档),
+// 于是「客户端以为早该截断的地方上游还在写」——上下文计量与实际输出脱节。
+// 现在转发,但夹在上游能接受的天花板内:各通道对超限 max_tokens 的处置不一致
+// (有的 400、有的静默按上限截),统一压到 ZC_MAX_OUTPUT_TOKENS(默认 32000)。
+const MAX_OUTPUT_CEILING = Number(process.env['ZC_MAX_OUTPUT_TOKENS'] ?? 32000);
+
+function clampMaxOutput(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  const ceiling = Number.isFinite(MAX_OUTPUT_CEILING) && MAX_OUTPUT_CEILING > 0 ? MAX_OUTPUT_CEILING : 32000;
+  return Math.min(Math.floor(n), ceiling);
+}
+
 class AnthropicStreamBuilder {
   constructor(model, estInput, declaredTools = new Set()) {
     this.model = model;
@@ -742,7 +803,9 @@ class AnthropicStreamBuilder {
         sseWrite(res, 'content_block_delta', { index: i, delta: { type: 'text_delta', text: tail } });
       }
       // DSML 四道门恢复:剔除的内容里若有结构完好的 tool_calls 块,转成可执行调用
-      for (const call of recoverDSMLToolCalls(this.dsml.capture, this.declaredTools)) {
+      const recovered = recoverDSMLToolCalls(this.dsml.capture, this.declaredTools);
+      noteUnrecoveredDSML(this.dsml.capture, recovered);
+      for (const call of recovered) {
         this.openBlock(res, 'tool', { id: call.id, name: call.name });
         this.cur.args = call.arguments;
         this.closeBlock(res);
@@ -890,13 +953,17 @@ async function handleMessages(req, res, body) {
   if (tools) chatPayload.tools = tools;
   const tc = anthropicToolChoice(body.tool_choice);
   if (tc) chatPayload.tool_choice = tc;
+  // 输出预算:Claude 的 max_tokens 夹到上游天花板(见 clampMaxOutput)
+  const maxOut = clampMaxOutput(body.max_tokens);
+  if (maxOut) chatPayload.max_tokens = maxOut;
   const estInput = estimateTokens(body);
 
-  const callUpstream = (mutLevel, noStreamOptions) => {
+  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
     const p = { ...chatPayload };
     // 每级都从原始 body 重建:billing 剥除 + 去指纹 + assistant 历史改写按当前档位重算
     p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), mutLevel), body.messages, mutLevel);
     if (noStreamOptions) delete p.stream_options;
+    if (noMaxTokens) delete p.max_tokens;
     return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
@@ -932,9 +999,9 @@ async function handleMessages(req, res, body) {
         if (!errText.includes('11128')) break;
       }
     } else {
-      // 非 11128 的 400:个别通道不认 stream_options,去掉后重试一次
+      // 非 11128 的 400:个别通道不认 stream_options / max_tokens,去掉后重试一次
       try {
-        upstream = await callUpstream(0, true);
+        upstream = await callUpstream(0, true, true);
       } catch (e) {
         json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
         return;

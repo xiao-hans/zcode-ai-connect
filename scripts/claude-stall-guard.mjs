@@ -4,7 +4,7 @@
  * /「只回了个『继续』」/「只留思考不说话」时,自动续跑一轮。
  *
  * 判定与 ZCode/pi/dsh/hermes 四个宿主共用同一套 shared/stall-detector.mjs
- * (test-detector-parity.mjs 保证 JS/Python 两实现一致);本文件只做 Claude 的 IO:
+ * (test-detector-parity.mjs 保证 JS/Python 两实现一致);本文件只做 Claude 的 IO。
  *
  * Claude Stop hook 契约:
  *   stdin:  {session_id, transcript_path, hook_event_name:"Stop", stop_hook_active, ...}
@@ -15,13 +15,23 @@
  *   1. stdout 只能是纯 JSON,任何一行杂音都会让整次输出作废;日志走 stderr。
  *   2. 绝不 exit 2:对 Stop 事件 exit 2 等价于把 stderr 当续跑指令,异常路径一律
  *      静默 exit 0(漏续跑的代价远小于错续跑)。
- *   3. stop_hook_active=true 说明本轮已续跑过一次,不再续(防循环)。
- *   4. 本轮只要有过工具调用就不判(stall 只针对「只说不做」)。
+ *   3. 同一段回复文本只续跑一次(跨进程原子指纹锁,默认 ~/.claude-stall-guard/)。
+ *   4. 同一回合最多续跑 MAX_AUTO_CONTINUES 次。
  *
- * 轮次起点判定:从尾部回溯,最近一条「真人输入」(content 非纯 tool_result 的
- * user 条目)为本轮起点——tool_result 条目是工具回传,属于轮内。
+ * 为什么不能只靠 stop_hook_active:它是「本轮已经续跑过」的布尔量,一次到手就
+ * 永久为真,于是**一轮只能救一次** —— 长任务里模型换句话再说一遍「我先改…」
+ * 就再也兜不住了。实测(2026-11-01,会话 45cdd3d3)同一轮里出现多次独立停住,
+ * 只有第 1 次被救。这里改成「文本指纹去重 + 每回合预算」,与 ZCode 侧同一套
+ * 机制,把最坏情况钉死在 MAX_AUTO_CONTINUES 次。
+ *
+ * 轮次起点判定:从尾部回溯,最近一条「真人输入」(content 非纯 tool_result、
+ * 且不是 isMeta 注入)的 user 条目为本轮起点 —— tool_result 条目是工具回传,
+ * isMeta 条目是宿主注入的合成消息,两者都属于轮内。
  */
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdirSync, openSync, closeSync, writeSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { homedir } from 'node:os';
+import { join } from 'node:path';
 import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
 
 const FALLBACK_REASON = [
@@ -29,21 +39,84 @@ const FALLBACK_REASON = [
   '请接着把刚才正在做的事做完;如果确实已经完成或需要用户决定,用一句话说明。',
 ].join('\n');
 
+/** 与 ZCode / pi / dsh 侧 MAX_AUTO_CONTINUES 对齐。 */
+const MAX_AUTO_CONTINUES = 3;
+const SIGNATURE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
+const LOCK_HOME = process.env['ZCLAUDE_STALL_GUARD_HOME'] ?? join(homedir(), '.claude-stall-guard');
+
+function log(message) {
+  try { process.stderr.write(`[claude-stall-guard] ${message}\n`); } catch { /* stderr 也不能影响结果 */ }
+}
+
+function hashKey(...parts) {
+  return createHash('sha256').update(parts.join('\u0000')).digest('hex').slice(0, 20);
+}
+
+/** 原子占位:只有第一个创建成功的进程拿到 true(`wx` 在 Windows/POSIX 都原子)。 */
+function tryClaim(name) {
+  try {
+    mkdirSync(LOCK_HOME, { recursive: true });
+    const fd = openSync(join(LOCK_HOME, name), 'wx');
+    try { writeSync(fd, `${new Date().toISOString()}\n`); } finally { closeSync(fd); }
+    return true;
+  } catch (error) {
+    if (error?.code !== 'EEXIST') log(`claim failed: ${String(error?.message ?? error)}`);
+    return false;
+  }
+}
+
+/** 领取本回合第几个续跑名额(1-based);0 = 预算耗尽。 */
+function claimTurnBudget(turnKey, max) {
+  for (let attempt = 1; attempt <= max; attempt += 1) {
+    if (tryClaim(`budget-${turnKey}-${attempt}`)) return attempt;
+  }
+  return 0;
+}
+
+function pruneOldSignatures() {
+  try {
+    const now = Date.now();
+    for (const entry of readdirSync(LOCK_HOME)) {
+      try {
+        if (now - statSync(join(LOCK_HOME, entry)).mtimeMs > SIGNATURE_TTL_MS) unlinkSync(join(LOCK_HOME, entry));
+      } catch { /* 并发占用,下轮再说 */ }
+    }
+  } catch { /* 目录还不存在 */ }
+}
+
 async function readStdin() {
+  if (process.stdin.isTTY) return '';
   const chunks = [];
   for await (const c of process.stdin) chunks.push(c);
   return Buffer.concat(chunks).toString('utf8');
 }
 
+function isToolResult(content) {
+  return Array.isArray(content) && content.length > 0 && content.every(p => p && p.type === 'tool_result');
+}
+
+/**
+ * 本轮统计:最后一条 assistant 文本、本轮工具调用数、本轮起点(真人输入)文本。
+ * @returns {{toolCalls:number, lastText:string, turnStart:string}}
+ */
 function lastTurnStats(entries) {
   let toolCalls = 0;
   let lastText = '';
+  let turnStart = '';
   for (let i = entries.length - 1; i >= 0; i--) {
     const o = entries[i];
     if (o.type === 'user' && o.message?.content !== undefined) {
       const c = o.message.content;
-      const isToolResult = Array.isArray(c) && c.length > 0 && c.every(p => p && p.type === 'tool_result');
-      if (!isToolResult) break; // 本轮起点(真人输入)
+      if (!isToolResult(c)) {
+        // isMeta 是宿主注入的合成消息(Stop hook feedback / 系统提示),不是真人输入
+        if (!o.isMeta) {
+          turnStart = typeof c === 'string'
+            ? c
+            : (Array.isArray(c) ? c.filter(p => p?.type === 'text').map(p => p.text ?? '').join('') : '');
+          break; // 本轮起点(真人输入)
+        }
+        continue; // 注入消息不打断回溯
+      }
     }
     if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
       for (const p of o.message.content) {
@@ -53,51 +126,77 @@ function lastTurnStats(entries) {
       }
     }
   }
-  return { toolCalls, lastText };
+  return { toolCalls, lastText, turnStart };
 }
 
-try {
+async function main() {
   const raw = await readStdin();
   let event = {};
-  try { event = JSON.parse(raw); } catch { process.exit(0); }
-  if (event.stop_hook_active) process.exit(0); // 本轮已续跑过,防循环
-  if (!event.transcript_path) process.exit(0);
+  try { event = JSON.parse(raw); } catch { return; }
+  if (!event.transcript_path) return;
 
-  const entries = readFileSync(event.transcript_path, 'utf8')
-    .trim().split('\n')
+  let lines;
+  try {
+    lines = readFileSync(event.transcript_path, 'utf8').trim().split('\n');
+  } catch (error) {
+    log(`transcript unreadable: ${String(error?.message ?? error)}`);
+    return;
+  }
+  const entries = lines
     .map(l => { try { return JSON.parse(l); } catch { return null; } })
-    .filter(o => o && o.type === 'assistant' || o && o.type === 'user');
-  if (!entries.length) process.exit(0);
+    .filter(o => o && (o.type === 'assistant' || o.type === 'user'));
+  if (!entries.length) return;
 
-  const { toolCalls, lastText } = lastTurnStats(entries);
+  const { toolCalls, lastText, turnStart } = lastTurnStats(entries);
+  const sessionId = typeof event.session_id === 'string' && event.session_id ? event.session_id : 'unknown';
+  const turnKey = hashKey(sessionId, turnStart.slice(0, 400));
+
+  let reason = null;
   if (!lastText) {
     // 纯思考/空回合:零工具调用零文本 → 要求把结论说出来(EMPTY_TURN_PROMPT,
     // 对应实测的「思考着,突然不工作了」)
-    if (toolCalls === 0) {
-      process.stdout.write(JSON.stringify({ decision: 'block', reason: EMPTY_TURN_PROMPT }));
+    if (toolCalls === 0) reason = EMPTY_TURN_PROMPT;
+  } else {
+    // 用户偏好(2026-11-01 明确要求):**默认续跑**。逐措辞补信号是打地鼠 ——
+    // 每次说法都不同,永远补不齐。翻转为:除非收尾明确属于「已完成/向用户提问/
+    // 把决定权交回/复述长期规则」,一律续跑一轮。有工具的轮次同样适用 ——
+    // 「干完半截活就停」正是 post-tool 停止的主要形态。
+    const verdict = detectStall(lastText, { toolCallCount: 0 });
+    if (verdict.verdict === 'too-short') {
+      // 过短(加权 <14):只有命中完成态或问句才放行——「修好了,测试通过。」放行,
+      // 「首页出来了。」(工作中途)续跑。完成态/问句判定留在守卫本地,不改 shared 的 MIN。
+      // 问句必须在这里判:detectStall 的长度闸门排在否决规则之前,「要我接着做哪条？」
+      // 只有 8 个字,过不了 MIN,拿不到 question 裁决,会被误续跑。
+      const tail = lastText.trim();
+      const doneish = /(?:修好|改好|写好|做完|弄好|完成|搞定|通过|跑通|绿了|收工)[。.!！]?\s*$/.test(tail);
+      const isQuestion = /[?？]\s*$/.test(tail);
+      if (!doneish && !isQuestion) reason = FALLBACK_REASON;
+    } else {
+      const PASS_VERDICTS = ['already-done', 'question', 'asked-user', 'standing-rule'];
+      if (!PASS_VERDICTS.includes(verdict.verdict)) reason = verdict.prompt ?? FALLBACK_REASON;
     }
-    process.exit(0);
   }
-  // 用户偏好(2026-11-01 明确要求):**默认续跑**。逐措辞补信号是打地鼠——
-  // 「我把通知栏收起后再装。」「看导航宿主怎么组织。」每次说法都不同,永远补不齐。
-  // 翻转为:除非收尾明确属于「已完成/向用户提问/把决定权交回/复述长期规则」,
-  // 一律续跑一轮(stop_hook_active 限每轮一次,防循环)。有工具的轮次同样适用
-  // —— 「干完半截活就停」正是 post-tool 停止的主要形态。
-  const verdict = detectStall(lastText, { toolCallCount: 0 });
-  // 过短(加权 <14):只有命中完成态才放行,否则续跑——「修好了,测试通过。」放行,
-  // 「首页出来了。」(工作中途)续跑。完成态判定留在守卫本地,不改 shared 的 MIN。
-  if (verdict.verdict === 'too-short') {
-    const doneish = /(?:修好|改好|写好|做完|弄好|完成|搞定|通过|跑通|绿了|收工)[。.!！]?\s*$/.test(lastText.trim());
-    if (doneish) process.exit(0);
-    process.stdout.write(JSON.stringify({ decision: 'block', reason: FALLBACK_REASON }));
-    process.exit(0);
+
+  if (!reason) return;
+
+  // 先去重再领名额:同一段文本只会救一次,换句话再中才算新的一次停住。
+  if (!tryClaim(`text-${hashKey(sessionId, lastText)}`)) {
+    log('same reply already continued once; leaving it alone');
+    return;
   }
-  const PASS_VERDICTS = ['already-done', 'question', 'asked-user', 'standing-rule'];
-  if (!PASS_VERDICTS.includes(verdict.verdict)) {
-    const reason = verdict.prompt ?? FALLBACK_REASON;
-    process.stdout.write(JSON.stringify({ decision: 'block', reason }));
+  const attempt = claimTurnBudget(turnKey, MAX_AUTO_CONTINUES);
+  if (attempt === 0) {
+    log(`auto-continue budget exhausted for this turn (${MAX_AUTO_CONTINUES})`);
+    return;
   }
-  process.exit(0);
-} catch {
-  process.exit(0); // 任何异常都静默放行:漏续跑的代价远小于错续跑
+  pruneOldSignatures();
+  log(`stall → continue (${attempt}/${MAX_AUTO_CONTINUES})`);
+  process.stdout.write(JSON.stringify({ decision: 'block', reason }));
 }
+
+main()
+  .catch(error => log(`unexpected: ${String(error?.message ?? error)}`))
+  .finally(() => {
+    // exit 2 对 Stop 意味着「要求继续」,任何情况下都正常退出。
+    process.exit(0);
+  });
