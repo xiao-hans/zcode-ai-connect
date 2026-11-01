@@ -795,8 +795,8 @@ async function handleMessages(req, res, body) {
     reasoningEffort = clampEffort(t.tool, level);
   } else if (body.thinking?.type === 'adaptive') {
     // Claude 2.1.316 对未知模型发 adaptive 自适应思考(不带强度信号);
-    // 固定映射 high,保证思考可见——否则 WorkBuddy 默认不思考
-    reasoningEffort = clampEffort(t.tool, 'high');
+    // 默认映射 max(用户偏好:思考强度默认拉满),保证思考可见
+    reasoningEffort = clampEffort(t.tool, 'max');
   }
   const chatPayload = {
     model: chatModel,
