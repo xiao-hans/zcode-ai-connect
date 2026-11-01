@@ -119,17 +119,27 @@ console.log('[3] 每回合预算');
     '再补一条回归测试。',
     '然后写交接总结。',
     '顺手更新一下文档。',
+    '重跑一遍构建。',
+    '再核对一次真机日志。',
+    '最后收尾撤掉探针。',
   ];
   const results = [];
   for (const reply of replies) {
     // 同一轮:turn 文本与 session_id 必须一致,才能命中同一份预算
     results.push(await stopEvent(transcript('跑一遍验证', reply), { stop_hook_active: true }, 's-budget'));
   }
-  check('第 1-3 次续跑', results.slice(0, 3).every((r) => r.blocked), JSON.stringify(results.map((r) => r.blocked)));
-  check('第 4 次预算耗尽后放行', !results[3].blocked, results[3].raw);
+  check('第 1-6 次续跑', results.slice(0, 6).every((r) => r.blocked), JSON.stringify(results.map((r) => r.blocked)));
+  check('第 7 次预算耗尽后放行', !results[6].blocked, results[6].raw);
 }
 
-console.log('[4] 放行场景');
+console.log('[4] 空消息收尾(轮内已有工具调用也要救)');
+{
+  const file = transcript('继续装', '');
+  const { blocked, raw } = await stopEvent(file, { stop_hook_active: false }, 's-empty');
+  check('末条消息内容为空 → 续跑', blocked, raw);
+}
+
+console.log('[5] 放行场景');
 {
   const done = await stopEvent(transcript('改完了吗', '两处改动都已落盘，编译和 785 例测试全部通过。修好了。'));
   check('明确完成态 → 放行', !done.blocked, done.raw);
@@ -139,7 +149,7 @@ console.log('[4] 放行场景');
   check('交回决定权 → 放行', !ask.blocked, ask.raw);
 }
 
-console.log('[5] 异常输入静默退出');
+console.log('[6] 异常输入静默退出');
 {
   const junk = await runHook('not json at all');
   check('非 JSON stdin → 无输出', junk.out.trim() === '' && junk.code === 0, `${junk.out} / ${junk.code}`);

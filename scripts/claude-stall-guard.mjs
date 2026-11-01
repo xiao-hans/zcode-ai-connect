@@ -39,8 +39,16 @@ const FALLBACK_REASON = [
   '请接着把刚才正在做的事做完;如果确实已经完成或需要用户决定,用一句话说明。',
 ].join('\n');
 
-/** 与 ZCode / pi / dsh 侧 MAX_AUTO_CONTINUES 对齐。 */
-const MAX_AUTO_CONTINUES = 3;
+/**
+ * 同一回合最多自动续跑几次。
+ *
+ * 从 3 提到 6 的依据(2026-11-01 会话 8d662da8 全量统计):trae/deepseek-v4.1-flash
+ * 的空收尾率 8.1%(6/74),wb/deepseek-v4.1-flash 2.0%(16/796)。长任务里一轮
+ * 用户输入会跑几十个工具轮,8% 意味着平均每轮都要撞一两次;3 次预算在长任务上
+ * 不够用,用完就只能眼看着停在半路。去重仍按「同一回合 + 同一段文本」,所以
+ * 真正的死循环(模型反复说同一句话)依然只救一次。
+ */
+const MAX_AUTO_CONTINUES = 6;
 const SIGNATURE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_HOME = process.env['ZCLAUDE_STALL_GUARD_HOME'] ?? join(homedir(), '.claude-stall-guard');
 
@@ -153,9 +161,11 @@ async function main() {
 
   let reason = null;
   if (!lastText) {
-    // 纯思考/空回合:零工具调用零文本 → 要求把结论说出来(EMPTY_TURN_PROMPT,
-    // 对应实测的「思考着,突然不工作了」)
-    if (toolCalls === 0) reason = EMPTY_TURN_PROMPT;
+    // 纯思考 / 空消息收尾:一轮的最后一个 assistant 消息一个字符都没有,这从来不是
+    // 合法的收尾(要么模型只思考了、要么正文被上游丢了)。**不再要求本轮零工具调用**
+    // —— 长任务里几乎每一轮都有工具调用,那个条件会让这类空收尾整类漏掉
+    // (实测 #7397:轮内已有 4 次工具调用,末条消息内容为空,无人兜)。
+    reason = EMPTY_TURN_PROMPT;
   } else {
     // 用户偏好(2026-11-01 明确要求):**默认续跑**。逐措辞补信号是打地鼠 ——
     // 每次说法都不同,永远补不齐。翻转为:除非收尾明确属于「已完成/向用户提问/
@@ -179,8 +189,10 @@ async function main() {
 
   if (!reason) return;
 
-  // 先去重再领名额:同一段文本只会救一次,换句话再中才算新的一次停住。
-  if (!tryClaim(`text-${hashKey(sessionId, lastText)}`)) {
+  // 先去重再领名额:同一回合内同一段文本只会救一次;换句话再中才算新的一次停住。
+  // 指纹里必须带 turnKey —— 只按 session+文本去重的话,「我先看一下。」这种套话
+  // 在本会话里第二次出现就永远不救了(空文本更是全session共用一个键)。
+  if (!tryClaim(`text-${hashKey(turnKey, lastText)}`)) {
     log('same reply already continued once; leaving it alone');
     return;
   }
