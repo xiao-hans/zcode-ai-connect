@@ -24,6 +24,11 @@
 import { readFileSync } from 'node:fs';
 import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
 
+const FALLBACK_REASON = [
+  '你上一条回复在任务进行到一半时停住了,没有宣布结束,也没有调用工具继续。',
+  '请接着把刚才正在做的事做完;如果确实已经完成或需要用户决定,用一句话说明。',
+].join('\n');
+
 async function readStdin() {
   const chunks = [];
   for await (const c of process.stdin) chunks.push(c);
@@ -73,16 +78,24 @@ try {
     }
     process.exit(0);
   }
-  // Claude 侧策略(与 ZCode 的「有工具一律放行」不同):有工具的轮次也对末条
-  // 文本判定,但只拦「强未来宣言/待办陈述」(verdict==='stall'),弱信号
-  // (weak-only)与正常收尾放行 —— dengying 实测的「干完半截活宣布需要修就停」
-  // 正是这条规则要拦的形态。漏续跑可手动补救,错续跑会重做已完成的事。
+  // 用户偏好(2026-11-01 明确要求):**默认续跑**。逐措辞补信号是打地鼠——
+  // 「我把通知栏收起后再装。」「看导航宿主怎么组织。」每次说法都不同,永远补不齐。
+  // 翻转为:除非收尾明确属于「已完成/向用户提问/把决定权交回/复述长期规则」,
+  // 一律续跑一轮(stop_hook_active 限每轮一次,防循环)。有工具的轮次同样适用
+  // —— 「干完半截活就停」正是 post-tool 停止的主要形态。
   const verdict = detectStall(lastText, { toolCallCount: 0 });
-  const shouldBlock = toolCalls === 0
-    ? verdict.stall
-    : verdict.stall && verdict.verdict === 'stall' && !!verdict.prompt;
-  if (shouldBlock && verdict.prompt) {
-    process.stdout.write(JSON.stringify({ decision: 'block', reason: verdict.prompt }));
+  // 过短(加权 <14):只有命中完成态才放行,否则续跑——「修好了,测试通过。」放行,
+  // 「首页出来了。」(工作中途)续跑。完成态判定留在守卫本地,不改 shared 的 MIN。
+  if (verdict.verdict === 'too-short') {
+    const doneish = /(?:修好|改好|写好|做完|弄好|完成|搞定|通过|跑通|绿了|收工)[。.!！]?\s*$/.test(lastText.trim());
+    if (doneish) process.exit(0);
+    process.stdout.write(JSON.stringify({ decision: 'block', reason: FALLBACK_REASON }));
+    process.exit(0);
+  }
+  const PASS_VERDICTS = ['already-done', 'question', 'asked-user', 'standing-rule'];
+  if (!PASS_VERDICTS.includes(verdict.verdict)) {
+    const reason = verdict.prompt ?? FALLBACK_REASON;
+    process.stdout.write(JSON.stringify({ decision: 'block', reason }));
   }
   process.exit(0);
 } catch {

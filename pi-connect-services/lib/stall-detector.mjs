@@ -82,6 +82,8 @@ const DONE_PATTERNS = [
   /\b(?:finished|completed|ready to go)\b/i,
   /\bnothing (?:else|more) (?:to do|needed)\b/i,
   /\ball (?:tests? )?pass(?:ed|ing)?\b/i,
+  /(?:修好|改好|写好|做完|弄好)(?:了)?[。.!！]?\s*$/,
+  /(?:测试|检验)(?:全部)?(?:通过|跑通|绿了)[。.!！]?\s*$/,
 ];
 
 /**

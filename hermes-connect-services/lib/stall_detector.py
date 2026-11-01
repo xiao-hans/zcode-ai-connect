@@ -77,6 +77,8 @@ DONE_PATTERNS = [
     r"\b(?:finished|completed|ready to go)\b",
     r"\bnothing (?:else|more) (?:to do|needed)\b",
     r"\ball (?:tests? )?pass(?:ed|ing)?\b",
+    r"(?:修好|改好|写好|做完|弄好)(?:了)?[。.!！]?\s*$",
+    r"(?:测试|检验)(?:全部)?(?:通过|跑通|绿了)[。.!！]?\s*$",
 ]
 
 # 待办陈述：末尾声明存在未完成的工作（「…需要修。」「…还没验证。」）——
