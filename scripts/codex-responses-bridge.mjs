@@ -85,6 +85,19 @@ function capToolOutput(s) {
   return s.slice(0, head) + `\n…[桥截断:单条工具输出 ${s.length} 字符超上限,中段省略 ${s.length - TOOL_OUTPUT_CAP} 字符]…\n` + s.slice(-tail);
 }
 
+// ---- 历史净化 ----
+// 长会话实测(dengying 45cdd3d3):模型退化后会把**整个会话历史**当正文复述
+// (82KB 文本、316 个 <result> 块),这些毒进入历史后每轮回喂,模型越学越偏,
+// 恶性循环。回放历史时对 assistant 文本净化:剥假 <result> 块与 DSML 残留。
+function sanitizeAssistantHistory(text) {
+  if (typeof text !== 'string' || text.length < 40) return text;
+  return text
+    .replace(/<result>[\s\S]*?<\/result>/g, ' ')
+    .replace(/<｜DSML｜[\s\S]{0,400}?(?:>|\n)/g, ' ')
+    .replace(/｜{1,2}DSML｜{1,2}[^\n]{0,300}/g, ' ')
+    .replace(/ {3,}/g, '  ');
+}
+
 function toChatMessages(instructions, input, mutLevel = 0) {
   const messages = [];
   if (typeof instructions === 'string' && instructions.trim()) {
@@ -102,7 +115,7 @@ function toChatMessages(instructions, input, mutLevel = 0) {
         // system/assistant 都在网关扫描范围(dsh-connect-workbuddy #98 的测量):
         // developer 是 Codex 0.166 的系统提示词;assistant 是模型自己的历史,
         // 历史里复述过指纹会毒化会话后续每一轮且重试无效
-        messages.push({ role, content: role === 'user' ? text : deFingerprint(text, mutLevel) });
+        messages.push({ role, content: role === 'user' ? text : deFingerprint(sanitizeAssistantHistory(text), mutLevel) });
       }
     } else if (item.type === 'function_call') {
       messages.push({
@@ -651,7 +664,8 @@ function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
       }
       if (texts.length) out.push({ role: 'user', content: texts.join('') });
     } else if (m.role === 'assistant') {
-      // assistant 历史在网关扫描范围(#98):复述过指纹的回复会毒化后续每一轮
+      // assistant 历史在网关扫描范围(#98):复述过指纹的回复会毒化后续每一轮;
+      // 另需净化回放毒(假 <result> 块/DSML 残留)——模型退化复述历史会恶性循环
       let text = '';
       const toolCalls = [];
       for (const p of parts) {
@@ -659,7 +673,7 @@ function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
         else if (p?.type === 'tool_use') toolCalls.push({ id: p.id ?? `call_${toolCalls.length}`, type: 'function', function: { name: p.name ?? '', arguments: deFingerprintLexical(JSON.stringify(p.input ?? {}), mutLevel) } });
         // thinking 不回传
       }
-      text = deFingerprint(text, mutLevel);
+      text = deFingerprint(sanitizeAssistantHistory(text), mutLevel);
       const msg = { role: 'assistant', content: text || (toolCalls.length ? null : '') };
       if (toolCalls.length) msg.tool_calls = toolCalls;
       out.push(msg);
