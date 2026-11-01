@@ -28,15 +28,21 @@
  * 且不是 isMeta 注入)的 user 条目为本轮起点 —— tool_result 条目是工具回传,
  * isMeta 条目是宿主注入的合成消息,两者都属于轮内。
  */
-import { readFileSync, mkdirSync, openSync, closeSync, writeSync, readdirSync, statSync, unlinkSync } from 'node:fs';
+import { readFileSync, mkdirSync, openSync, closeSync, writeSync, readdirSync, statSync, unlinkSync, appendFileSync } from 'node:fs';
 import { createHash } from 'node:crypto';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
 
+/**
+ * 续跑提示。刻意短:这是回灌给模型的一条 user 消息,写得越长越容易被弱模型当成
+ * 正文复述(实测 2026-11-01 会话 56720125,trae/deepseek-v4.1-flash 把整段提示
+ * 抄进了自己的回复,于是又一轮"停住")。
+ */
 const FALLBACK_REASON = [
-  '你上一条回复在任务进行到一半时停住了,没有宣布结束,也没有调用工具继续。',
-  '请接着把刚才正在做的事做完;如果确实已经完成或需要用户决定,用一句话说明。',
+  '继续执行:直接调用工具把剩下的步骤做完。',
+  '不要复述本条消息,也不要把它当作任务内容。',
+  '确实做完了就用一句话说明结论。',
 ].join('\n');
 
 /**
@@ -51,9 +57,21 @@ const FALLBACK_REASON = [
 const MAX_AUTO_CONTINUES = 6;
 const SIGNATURE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_HOME = process.env['ZCLAUDE_STALL_GUARD_HOME'] ?? join(homedir(), '.claude-stall-guard');
+const LOG_PATH = join(LOCK_HOME, 'guard.log');
 
+/**
+ * 诊断日志只写文件,不写 stderr。
+ *
+ * 原先按「stdout 纯 JSON、日志走 stderr」的老规矩办,但 Claude Code 会把这类
+ * 阻塞型 hook 的 stderr 一并以 "Stop hook blocking error from command: …" 的
+ * 形式塞回上下文 —— 模型看见一段陌生文本,弱模型(实测 trae 的 flash 档)会直接
+ * 把它当成正文复述。诊断信息不值得污染上下文。
+ */
 function log(message) {
-  try { process.stderr.write(`[claude-stall-guard] ${message}\n`); } catch { /* stderr 也不能影响结果 */ }
+  try {
+    mkdirSync(LOCK_HOME, { recursive: true });
+    appendFileSync(LOG_PATH, `${new Date().toISOString()} ${message}\n`);
+  } catch { /* 诊断尽力而为,绝不影响 hook 结果 */ }
 }
 
 function hashKey(...parts) {
