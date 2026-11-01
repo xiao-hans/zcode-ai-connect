@@ -330,6 +330,25 @@ function deFingerprint(instructions, level = 0) {
   return level >= 2 ? NEUTRAL_HEAD + t : t;
 }
 
+// ---- 思考强度映射 ----
+// 各提供商线上档位(qoder 逐模型有差异,取并集就近);Claude/Codex 的档位经
+// 「就近取整」映射——目标档位不存在时向上取最近档(如 trae 无 xhigh → max),
+// 超出顶格取最高档。不带 thinking/reasoning 配置则不加字段(上游按默认行为)。
+const PROVIDER_EFFORTS = {
+  workbuddy: ['low', 'medium', 'high', 'xhigh', 'max'],
+  trae: ['low', 'medium', 'high', 'max'],
+  qoder: ['low', 'medium', 'high', 'max'],
+  qwenwork: ['low', 'medium', 'high'],
+};
+const EFFORT_RANK = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+function clampEffort(tool, level) {
+  const ladder = PROVIDER_EFFORTS[tool] ?? ['low', 'medium', 'high'];
+  const target = EFFORT_RANK.indexOf(level);
+  const ranked = ladder.slice().sort((a, b) => EFFORT_RANK.indexOf(a) - EFFORT_RANK.indexOf(b));
+  return ranked.find(eff => EFFORT_RANK.indexOf(eff) >= target) ?? ranked[ranked.length - 1];
+}
+
 async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
@@ -373,11 +392,10 @@ async function handleResponses(req, res, wireModel, body) {
   }
   const chatModel = wireModel.slice(slash + 1);
 
-  // Codex 的 reasoning.effort(minimal/low/medium/high)直接映射 WorkBuddy 线上的
-  // reasoning_effort(low/medium/high/xhigh/max)——不带该字段上游默认不思考
+  // Codex 的 reasoning.effort(minimal/low/medium/high)按提供商档位就近映射
   if (body.reasoning?.effort) {
     const e = body.reasoning.effort;
-    body = { ...body, reasoning_effort: e === 'minimal' ? 'low' : ['low', 'medium', 'high', 'xhigh', 'max'].includes(e) ? e : 'medium' };
+    body = { ...body, reasoning_effort: clampEffort(t.tool, e === 'minimal' ? 'low' : e) };
   }
 
   // 调试:ZC_BRIDGE_DEBUG=1 时把原始请求落盘(覆盖写),供排障比对
@@ -723,7 +741,9 @@ async function handleMessages(req, res, body) {
   let reasoningEffort;
   if (body.thinking?.type === 'enabled') {
     const budget = body.thinking.budget_tokens ?? 0;
-    reasoningEffort = budget >= 24000 ? 'high' : budget >= 8000 ? 'medium' : 'low';
+    // Claude /effort 的五档经 budget 阈值分档,再按提供商档位就近取整
+    const level = budget >= 64000 ? 'max' : budget >= 48000 ? 'xhigh' : budget >= 24000 ? 'high' : budget >= 8000 ? 'medium' : 'low';
+    reasoningEffort = clampEffort(t.tool, level);
   }
   const chatPayload = {
     model: chatModel,

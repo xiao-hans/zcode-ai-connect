@@ -330,5 +330,18 @@
   "autoCompactEnabled": true,
   "permissions": {
     "defaultMode": "bypassPermissions"
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "node D:/HANXIAO/tools/zcode-ai-connect/scripts/claude-stall-guard.mjs",
+            "timeout": 30
+          }
+        ]
+      }
+    ]
   }
 }
