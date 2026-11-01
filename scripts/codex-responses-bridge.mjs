@@ -812,6 +812,8 @@ class AnthropicStreamBuilder {
     this.finish = null;
     this.usage = null;
     this.estInput = estInput;
+    /** 上游 tool_call 增量先到的 id/参数,按上游 index 存,等 name 到达再开块。 */
+    this.pendingTools = new Map();
   }
 
   msgStart(res) {
@@ -893,15 +895,29 @@ class AnthropicStreamBuilder {
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index ?? 0;
-        if (!this.cur || this.cur.kind !== 'tool' || this.cur.upIdx !== idx) {
-          // 同一上游 tool index 已有块则续写;否则等拿到名字再开块
-          const existing = this.cur?.kind === 'tool' && this.cur.upIdx === idx;
-          if (!existing && tc.function?.name) {
-            this.closeBlock(res);
-            this.openBlock(res, 'tool', { upIdx: idx, id: tc.id || `call_${idx}_${Date.now().toString(36)}`, name: tc.function.name });
-          } else if (!existing) {
-            continue; // 还没拿到名字,等下一帧
+        const isCur = this.cur?.kind === 'tool' && this.cur.upIdx === idx;
+        if (!isCur) {
+          // 名字没到之前先把 id / 参数攒起来。旧实现直接 `continue` 丢掉这一段,
+          // 结果:名字晚一帧到达时开的是空参数块(工具用错参数执行),名字压根不来
+          // 时整条调用蒸发,只剩一个 stop_reason=tool_use 的空回合 ——
+          // 宿主既没有工具可执行,也看不到正文,于是"任务没结束就停住"。
+          const buf = this.pendingTools.get(idx) ?? { id: '', args: '' };
+          if (tc.id) buf.id = tc.id;
+          if (tc.function?.arguments) buf.args += tc.function.arguments;
+          this.pendingTools.set(idx, buf);
+          if (!tc.function?.name) continue; // 等名字
+          this.closeBlock(res);
+          this.openBlock(res, 'tool', {
+            upIdx: idx,
+            id: buf.id || `call_${idx}_${Date.now().toString(36)}`,
+            name: tc.function.name,
+          });
+          if (buf.args) {
+            this.cur.args += buf.args;
+            sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'input_json_delta', partial_json: buf.args } });
           }
+          this.pendingTools.delete(idx);
+          continue;
         }
         if (tc.id) this.cur.id = tc.id;
         if (tc.function?.arguments) {
@@ -915,12 +931,27 @@ class AnthropicStreamBuilder {
 
   finishAll(res) {
     this.closeBlock(res);
-    const stopReason = ANTHROPIC_STOP[this.finish] ?? 'end_turn';
+    const stopReason = this.resolveStop();
     sseWrite(res, 'message_delta', {
       delta: { stop_reason: stopReason, stop_sequence: null },
       usage: { output_tokens: this.usage?.output_tokens ?? 0 },
     });
     sseWrite(res, 'message_stop', {});
+  }
+
+  /**
+   * stop_reason 必须和真正发出去的块自洽。
+   *
+   * 上游说「这一轮有工具调用」,但我们一个 tool_use 块都没落地(名字始终没来、
+   * 或被 DSML 门 2 挡掉)时,照实报 tool_use 会让宿主陷入一个不可能的状态:
+   * 该执行工具的回合里没有任何工具 → 它只能结束回合,用户看到的就是
+   * 「任务没结束就停住」。退回 end_turn 才是诚实的:这一轮确实什么也没做成,
+   * 宿主(以及 Stop 守卫)据此还能再要一次。
+   */
+  resolveStop() {
+    const mapped = ANTHROPIC_STOP[this.finish] ?? 'end_turn';
+    if (mapped === 'tool_use' && !this.blocks.some(b => b.type === 'tool_use')) return 'end_turn';
+    return mapped;
   }
 }
 
@@ -1054,7 +1085,7 @@ async function handleMessages(req, res, body) {
   if (body.stream !== true) {
     for await (const d of upstreamSseChunks(upstream)) { builder.handleChunk({ write: () => {} }, d); }
     builder.closeBlock({ write: () => {} });
-    const stopReason = ANTHROPIC_STOP[builder.finish] ?? 'end_turn';
+    const stopReason = builder.resolveStop();
     json(res, 200, {
       id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: wireModel,
       content: builder.blocks, stop_reason: stopReason, stop_sequence: null,
