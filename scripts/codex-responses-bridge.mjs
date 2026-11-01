@@ -373,6 +373,13 @@ async function handleResponses(req, res, wireModel, body) {
   }
   const chatModel = wireModel.slice(slash + 1);
 
+  // Codex 的 reasoning.effort(minimal/low/medium/high)直接映射 WorkBuddy 线上的
+  // reasoning_effort(low/medium/high/xhigh/max)——不带该字段上游默认不思考
+  if (body.reasoning?.effort) {
+    const e = body.reasoning.effort;
+    body = { ...body, reasoning_effort: e === 'minimal' ? 'low' : ['low', 'medium', 'high', 'xhigh', 'max'].includes(e) ? e : 'medium' };
+  }
+
   // 调试:ZC_BRIDGE_DEBUG=1 时把原始请求落盘(覆盖写),供排障比对
   if (process.env.ZC_BRIDGE_DEBUG) {
     await mkdir(stateDir, { recursive: true }).catch(() => {});
@@ -712,12 +719,19 @@ async function handleMessages(req, res, body) {
   }
 
   const sysText = deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), 0);
+  // Claude 的 thinking 配置 → WorkBuddy 线上的 reasoning_effort;不带该字段上游默认不思考
+  let reasoningEffort;
+  if (body.thinking?.type === 'enabled') {
+    const budget = body.thinking.budget_tokens ?? 0;
+    reasoningEffort = budget >= 24000 ? 'high' : budget >= 8000 ? 'medium' : 'low';
+  }
   const chatPayload = {
     model: chatModel,
     messages: toChatMessagesAnthropic(sysText, body.messages),
     stream: true,
     stream_options: { include_usage: true },
   };
+  if (reasoningEffort) chatPayload.reasoning_effort = reasoningEffort;
   const tools = toChatToolsAnthropic(body.tools);
   if (tools) chatPayload.tools = tools;
   const tc = anthropicToolChoice(body.tool_choice);
@@ -785,7 +799,7 @@ async function handleMessages(req, res, body) {
   }
 
   const builder = new AnthropicStreamBuilder(wireModel, estInput);
-  if (body.stream === false) {
+  if (body.stream !== true) {
     for await (const d of upstreamSseChunks(upstream)) { builder.handleChunk({ write: () => {} }, d); }
     builder.closeBlock({ write: () => {} });
     const stopReason = ANTHROPIC_STOP[builder.finish] ?? 'end_turn';
