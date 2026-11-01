@@ -148,6 +148,7 @@ scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交�
 - Claude Code 2.1.316 会把 hook 上下文作为 `role:"system"` 的 message 发来,Codex 0.166 把系统提示词挪进 `developer` 消息——桥对两者都已正确映射。
 - 网关模型发现(`CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY`)会过滤掉 id 不含 claude/anthropic 的条目,对本套件的前缀 id 无效;选择器走 `modelPicker` 显式阵容。
 - Claude 会话里的截图以 base64 内嵌请求;桥翻译时丢弃图片(上游零成本),但**用量估算若按 JSON 长度计会把 base64 一并算入**——一张 1216x2640 截图(~25 万 base64 字符)虚增 6 万+ token,把 Claude 的上下文计量灌爆,触发与真实用量无关的本地拒发。估算已改为遍历请求结构、image 块计固定 400 字符。
+- 思考开关:WorkBuddy 线上用 `reasoning_effort`(low/medium/high/xhigh/max)控制,**不带该字段模型默认不思考**;Claude 原生 `thinking` 字段与 `enable_thinking` 拼写上游均不认。桥的映射:Claude `thinking.enabled` 按 budget_tokens(≥24k→high、≥8k→medium、否则 low);Codex `reasoning.effort` 直映(minimal→low)。
 
 回归测试:`node scripts/test-claude-bridge.mjs`(Anthropic 协议冒烟:文本/工具/多轮 tool_result/非流式/count_tokens)。
 
