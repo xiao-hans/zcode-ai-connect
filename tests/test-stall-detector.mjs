@@ -56,6 +56,22 @@ check('英文 Let me', () => {
   stalls('Let me check the config first, then patch the providers block:');
 });
 
+// 待办陈述（2026-11-01，dengying 会话 45cdd3d3，trae/deepseek-v4.1-flash）：
+// 模型干完半截活后以「…需要修。」收尾 —— 没有任何时间性未来措辞，
+// 旧信号集全部漏过（verdict no-future-cue）。
+check('待办陈述:需要修（真实事故回放）', () => {
+  stalls('diff 显示 doubanRanking 被插到了 doubanAnime 的 KDoc 和函数之间，结果原 KDoc 变成了 doubanRanking 的文档，doubanAnime 反而没有文档了。需要修。');
+});
+
+check('待办陈述:还没验证', () => {
+  stalls('主流程改完了，边界情况还没验证。');
+});
+
+// 描述条件不算待办：「需要修改才能生效」的尾部是「生效」，是在陈述条件
+check('描述性「需要修改才能生效」（不该续跑）', () => {
+  quiet('这个配置需要修改才能生效。', '尾部是条件描述，不是待办');
+});
+
 // 真实事故回放（pi 会话 01a18ce2，provider=trae）：用户发「继续」，模型原样回
 // "\n继续" 就 stop，零工具调用。全文只有 2 个字，会被 too-short 放过去。
 check('整条回复只有「继续」', () => {

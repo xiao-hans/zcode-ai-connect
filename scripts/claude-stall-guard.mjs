@@ -22,7 +22,7 @@
  * user 条目)为本轮起点——tool_result 条目是工具回传,属于轮内。
  */
 import { readFileSync } from 'node:fs';
-import { detectStall } from '../shared/stall-detector.mjs';
+import { detectStall, EMPTY_TURN_PROMPT } from '../shared/stall-detector.mjs';
 
 async function readStdin() {
   const chunks = [];
@@ -43,7 +43,8 @@ function lastTurnStats(entries) {
     if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
       for (const p of o.message.content) {
         if (p?.type === 'tool_use') toolCalls++;
-        if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim()) lastText = p.text;
+        // 逆序回溯:第一条找到的文本就是时间上最末的 assistant 文本,不可被更早的覆盖
+        if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim() && !lastText) lastText = p.text;
       }
     }
   }
@@ -64,10 +65,23 @@ try {
   if (!entries.length) process.exit(0);
 
   const { toolCalls, lastText } = lastTurnStats(entries);
-  if (!lastText) process.exit(0); // 纯工具轮/无文本,无可判内容
-
-  const verdict = detectStall(lastText, { toolCallCount: toolCalls });
-  if (verdict.stall && verdict.prompt) {
+  if (!lastText) {
+    // 纯思考/空回合:零工具调用零文本 → 要求把结论说出来(EMPTY_TURN_PROMPT,
+    // 对应实测的「思考着,突然不工作了」)
+    if (toolCalls === 0) {
+      process.stdout.write(JSON.stringify({ decision: 'block', reason: EMPTY_TURN_PROMPT }));
+    }
+    process.exit(0);
+  }
+  // Claude 侧策略(与 ZCode 的「有工具一律放行」不同):有工具的轮次也对末条
+  // 文本判定,但只拦「强未来宣言/待办陈述」(verdict==='stall'),弱信号
+  // (weak-only)与正常收尾放行 —— dengying 实测的「干完半截活宣布需要修就停」
+  // 正是这条规则要拦的形态。漏续跑可手动补救,错续跑会重做已完成的事。
+  const verdict = detectStall(lastText, { toolCallCount: 0 });
+  const shouldBlock = toolCalls === 0
+    ? verdict.stall
+    : verdict.stall && verdict.verdict === 'stall' && !!verdict.prompt;
+  if (shouldBlock && verdict.prompt) {
     process.stdout.write(JSON.stringify({ decision: 'block', reason: verdict.prompt }));
   }
   process.exit(0);

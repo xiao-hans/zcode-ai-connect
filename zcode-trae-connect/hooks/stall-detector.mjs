@@ -84,6 +84,26 @@ const DONE_PATTERNS = [
   /\ball (?:tests? )?pass(?:ed|ing)?\b/i,
 ];
 
+/**
+ * 待办陈述：末尾声明存在未完成的工作（「…需要修。」「…还没验证。」）——
+ * 没有任何「接下来/我先」式时间性措辞，旧信号集全部漏过。
+ *
+ * 实测（2026-11-01，dengying 会话 45cdd3d3，trae/deepseek-v4.1-flash）：
+ * 模型干完半截活后以「diff 显示…原 KDoc 变成了…反而没有文档了。需要修。」
+ * 收尾 —— pending-work 单独即可触发（强类，权重与 future-strong 相同）。
+ *
+ * 刻意要求动词紧贴尾标点：「需要修改才能生效。」的尾部是「生效」，不命中 ——
+ * 那是在描述条件，不是宣布待办。按设计原则第 1 条，宁可漏掉也不能把
+ * 说明性文字当成漏执行。
+ */
+const PENDING_WORK = [
+  /需要(?:修复|修改|调整|处理|完善|重构|重写|迁移|补(?:上|充)?|修|改)[。.!！]?\s*$/,
+  /(?:还差|还缺|还没)(?:修|改|处理|完成|做完|验证|跑|补|迁移)[^。！？\n]{0,16}[。.!！]?\s*$/,
+  /(?:待|尚未)(?:修复|修改|处理|完成|验证|完善|补|迁移)[。.!！]?\s*$/,
+  /(?:需要|得)再?(?:跑|过|走)(?:一遍|一次)?[^。！？\n]{0,16}[。.!！]?\s*$/,
+  /\b(?:needs?|requires?)\s+(?:to\s+be\s+)?(?:fix|repair|adjust|handl\w*|rewrit\w*|refactor\w*|migrat\w*)\w*[.!?]?\s*$/i,
+];
+
 /** 强未来标记：明确宣布「我即将做」。单独出现即高置信。 */
 const FUTURE_STRONG = [
   // 「我先…」「我这就…」是中文里最典型的「宣布即将动手」，不必再跟动词。
@@ -229,9 +249,10 @@ export function detectStall(rawText, options = {}) {
 
   const hasStrongFuture = anyMatch(FUTURE_STRONG, tail);
   const hasWeakFuture = anyMatch(FUTURE_WEAK, tail);
+  const hasPendingWork = anyMatch(PENDING_WORK, tail);
 
-  // ── 否决 ④：明确宣告完成且没有未来时 ─────────────────────────────────────
-  if (!hasStrongFuture && !hasWeakFuture && anyMatch(DONE_PATTERNS, tail)) {
+  // ── 否决 ④：明确宣告完成且没有未来时/待办时 ─────────────────────────────
+  if (!hasStrongFuture && !hasWeakFuture && !hasPendingWork && anyMatch(DONE_PATTERNS, tail)) {
     return { ...empty, verdict: 'already-done' };
   }
 
@@ -261,6 +282,10 @@ export function detectStall(rawText, options = {}) {
     score += 0.5;
     signals.push('ellipsis-tail');
   }
+  if (hasPendingWork) {
+    score += 3;
+    signals.push('pending-work');
+  }
 
   // 末行非列表项以「动作动词 + 冒号」收尾（例如「……整份重写干净：」）：
   // 即使省略了显式「我先/接下来」代词，也是典型的即将发起工具调用。
@@ -278,11 +303,11 @@ export function detectStall(rawText, options = {}) {
     signals.push('action-colon');
   }
 
-  if (!hasStrongFuture && !hasWeakFuture && !isActionColon) {
+  if (!hasStrongFuture && !hasWeakFuture && !isActionColon && !hasPendingWork) {
     return { stall: false, verdict: 'no-future-cue', score, signals, prompt: null };
   }
 
-  const threshold = hasStrongFuture || isActionColon ? THRESHOLD_STRONG : THRESHOLD_WEAK_ONLY;
+  const threshold = hasStrongFuture || isActionColon || hasPendingWork ? THRESHOLD_STRONG : THRESHOLD_WEAK_ONLY;
   if (score < threshold) {
     return { stall: false, verdict: 'weak-only', score, signals, prompt: null };
   }

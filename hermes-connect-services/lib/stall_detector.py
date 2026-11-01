@@ -79,6 +79,24 @@ DONE_PATTERNS = [
     r"\ball (?:tests? )?pass(?:ed|ing)?\b",
 ]
 
+# 待办陈述：末尾声明存在未完成的工作（「…需要修。」「…还没验证。」）——
+# 没有任何「接下来/我先」式时间性措辞，旧信号集全部漏过。
+#
+# 实测（2026-11-01，dengying 会话 45cdd3d3，trae/deepseek-v4.1-flash）：
+# 模型干完半截活后以「diff 显示…原 KDoc 变成了…反而没有文档了。需要修。」
+# 收尾 —— pending-work 单独即可触发（强类，权重与 future-strong 相同）。
+#
+# 刻意要求动词紧贴尾标点：「需要修改才能生效。」的尾部是「生效」，不命中 ——
+# 那是在描述条件，不是宣布待办。按设计原则第 1 条，宁可漏掉也不能把
+# 说明性文字当成漏执行。
+PENDING_WORK_PATTERNS = [
+    r"需要(?:修复|修改|调整|处理|完善|重构|重写|迁移|补(?:上|充)?|修|改)[。.!！]?\s*$",
+    r"(?:还差|还缺|还没)(?:修|改|处理|完成|做完|验证|跑|补|迁移)[^。！？\n]{0,16}[。.!！]?\s*$",
+    r"(?:待|尚未)(?:修复|修改|处理|完成|验证|完善|补|迁移)[。.!！]?\s*$",
+    r"(?:需要|得)再?(?:跑|过|走)(?:一遍|一次)?[^。！？\n]{0,16}[。.!！]?\s*$",
+    r"\b(?:needs?|requires?)\s+(?:to\s+be\s+)?(?:fix|repair|adjust|handl\w*|rewrit\w*|refactor\w*|migrat\w*)\w*[.!?]?\s*$",
+]
+
 # 强未来标记：明确宣布「我即将做」。单独出现即高置信。
 FUTURE_STRONG = [
     # 「我先…」「我这就…」是中文里最典型的「宣布即将动手」，不必再跟动词。
@@ -171,6 +189,7 @@ _PATTERN_GROUPS = {
     "request": REQUEST_PATTERNS,
     "standing_rule": STANDING_RULE_PATTERNS,
     "done": DONE_PATTERNS,
+    "pending_work": PENDING_WORK_PATTERNS,
     "future_strong": FUTURE_STRONG,
     "future_weak": FUTURE_WEAK,
     "action_verb": ACTION_VERB,
@@ -254,9 +273,10 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
 
     has_strong = _any_match("future_strong", tail)
     has_weak = _any_match("future_weak", tail)
+    has_pending_work = _any_match("pending_work", tail)
 
-    # ── 否决 ④：明确宣告完成且没有未来时 ──────────────────────────────────
-    if not has_strong and not has_weak and _any_match("done", tail):
+    # ── 否决 ④：明确宣告完成且没有未来时/待办时 ──────────────────────────
+    if not has_strong and not has_weak and not has_pending_work and _any_match("done", tail):
         return _result("already-done")
 
     # ── 打分 ──────────────────────────────────────────────────────────────
@@ -280,6 +300,9 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
     if ELLIPSIS_TAIL.search(raw):
         score += 0.5
         signals.append("ellipsis-tail")
+    if has_pending_work:
+        score += 3.0
+        signals.append("pending-work")
 
     # 末行非列表项以「动作动词 + 冒号」收尾（例如「……整份重写干净：」）：
     # 即使省略了显式「我先/接下来」代词，也是典型的即将发起工具调用。
@@ -301,10 +324,10 @@ def detect_stall(raw_text: Any, tool_call_count: int = 0) -> Dict[str, Any]:
         score += 1.0
         signals.append("action-colon")
 
-    if not has_strong and not has_weak and not is_action_colon:
+    if not has_strong and not has_weak and not is_action_colon and not has_pending_work:
         return _result("no-future-cue", score, signals)
 
-    threshold = THRESHOLD_STRONG if (has_strong or is_action_colon) else THRESHOLD_WEAK_ONLY
+    threshold = THRESHOLD_STRONG if (has_strong or is_action_colon or has_pending_work) else THRESHOLD_WEAK_ONLY
     if score < threshold:
         return _result("weak-only", score, signals)
 
