@@ -30,6 +30,9 @@ const CASES = [
   { text: 'Let me check the config first, then patch the providers block:' },
   { text: '我先读取 config.yaml 里的 providers 段，再定位重复的那两个键。' },
   { text: 'Now I\'ll patch the file...' },
+  // 把字句祈使式宣布:无时间性未来措辞,靠 future-strong 的把字句模式(2026-11-01 实测)
+  { text: '把分类名从 IndexScreen 传给 VideoGrid,再传给 RankingRow。' },
+  { text: '主流程改完了,分类名已传给 VideoGrid。' },
   // 待办陈述：没有时间性未来措辞，靠 pending-work 信号（2026-11-01 实测）
   { text: 'diff 显示 doubanRanking 被插到了 doubanAnime 的 KDoc 和函数之间，结果原 KDoc 变成了 doubanRanking 的文档，doubanAnime 反而没有文档了。需要修。' },
   { text: '主流程改完了，边界情况还没验证。' },
