@@ -151,8 +151,9 @@ function sseDone(res) {
 }
 
 class ResponseBuilder {
-  constructor(model) {
+  constructor(model, declaredTools = new Set()) {
     this.model = model;
+    this.declaredTools = declaredTools;
     this.dsml = new DSMLTextFilter();
     this.items = [];
     this.outputIndex = 0;
@@ -291,6 +292,18 @@ class ResponseBuilder {
       sseWrite(res, 'response.function_call_arguments.done', { item_id: `fc_${call.outputIndex}`, output_index: call.outputIndex, arguments: call.args });
       const item = { id: `fc_${call.outputIndex}`, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.args };
       sseWrite(res, 'response.output_item.done', { output_index: call.outputIndex, item });
+      this.items.push(item);
+    }
+    // DSML 四道门恢复:剔除内容里结构完好的 tool_calls 块 → function_call 条目
+    const recovered = recoverDSMLToolCalls(this.dsml.capture, this.declaredTools);
+    this.dsml.capture = '';
+    for (const call of recovered) {
+      const idx = this.outputIndex++;
+      sseWrite(res, 'response.output_item.added', { output_index: idx, item: { id: `dsc_${idx}`, type: 'function_call', status: 'in_progress', call_id: call.id, name: call.name, arguments: '' } });
+      sseWrite(res, 'response.function_call_arguments.delta', { item_id: `dsc_${idx}`, output_index: idx, delta: call.arguments });
+      sseWrite(res, 'response.function_call_arguments.done', { item_id: `dsc_${idx}`, output_index: idx, arguments: call.arguments });
+      const item = { id: `dsc_${idx}`, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.arguments };
+      sseWrite(res, 'response.output_item.done', { output_index: idx, item });
       this.items.push(item);
     }
   }
@@ -467,7 +480,7 @@ async function handleResponses(req, res, wireModel, body) {
   const clientWantsStream = body.stream !== false;
   if (!clientWantsStream) {
     // 聚合成单个 JSON response(codex 恒为流式;此路径便于 curl 调试)
-    const builder = new ResponseBuilder(wireModel);
+    const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
     for await (const d of upstreamSseChunks(upstream)) {
       const err = builder.handleChunk({ write: () => {} }, d);
       if (err?.error) break;
@@ -483,7 +496,7 @@ async function handleResponses(req, res, wireModel, body) {
     'cache-control': 'no-cache',
     connection: 'keep-alive',
   });
-  const builder = new ResponseBuilder(wireModel);
+  const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
   sseWrite(res, 'response.created', { response: builder.responsePayload('in_progress') });
   sseWrite(res, 'response.in_progress', { response: builder.responsePayload('in_progress') });
 
@@ -525,22 +538,27 @@ async function* upstreamSseChunks(upstream) {
   }
 }
 
-// ---- DSML 泄漏过滤 ----
+// ---- DSML 泄漏过滤与恢复 ----
 // DeepSeek 模型族偶发把内部标记(<｜DSML｜…>/｜｜DSML｜｜…)写进正文——上游
 // dsh-connect-workbuddy 的 DSML-LEAK-RESEARCH 结论:长上下文下的模型族缺陷,
 // 官方客户端解析并隐藏,裸 API 消费者看到垃圾标签且「工具调用」不执行。
-// 流式安全剔除:逐片剔完整标记;尾部疑似标记开头(≤40 字符)扣下与下一片拼合;
-// 收尾时含 DSML 的残片丢弃。
+// 两层处理(移植自上游 dsml-recovery.ts 的四道门设计):
+//   ① 流式过滤:逐片剔除标记(本类);
+//   ② 恢复:被剔除的内容若含「结构完好的 tool_calls 块」,按四道门转换为
+//      可执行调用——(1)块已闭合 (2)工具名在本请求 tools 里声明过
+//      (3)请求声明过工具 (4)参数可解析;任何疑虑回滚为纯文本。
+// 退化形态(工具名覆盖 invoke 子句,如 <｜DSML｜ validate>)无工具名,
+// 过不了门 2 —— 上游同款判定,交给停止闸的自动续跑。
 class DSMLTextFilter {
-  constructor() { this.carry = ''; }
-  static strip(s) {
+  constructor() { this.carry = ''; this.capture = ''; }
+  static strip(s, capture) {
     return s
-      .replace(/<｜DSML｜[^>\n]{0,200}>?/g, '')
-      .replace(/｜{1,2}DSML｜{1,2}[^\n]{0,200}/g, '');
+      .replace(/<｜DSML｜[^>\n]{0,400}>?/g, (m) => { if (capture) capture.push(m); return ''; })
+      .replace(/｜{1,2}DSML｜{1,2}[^\n]{0,400}/g, (m) => { if (capture) capture.push(m); return ''; });
   }
   push(s) {
     s = this.carry + s;
-    const stripped = DSMLTextFilter.strip(s);
+    const stripped = DSMLTextFilter.strip(s, this.capture);
     const hold = Math.max(stripped.lastIndexOf('<'), stripped.lastIndexOf('｜'));
     if (hold >= 0 && stripped.length - hold <= 40 && !stripped.slice(hold).includes('\n')) {
       this.carry = stripped.slice(hold);
@@ -554,6 +572,47 @@ class DSMLTextFilter {
     this.carry = '';
     return tail.includes('DSML') ? '' : tail;
   }
+}
+
+/**
+ * 四道门恢复:从剔除的 DSML 碎片中解析结构完好的 tool_calls 块。
+ * @param {string} captured   被剔除的 DSML 片段(时序拼接)
+ * @param {Set<string>} declaredTools 本请求声明的工具名(门 2/门 3)
+ * @returns {{id,name,arguments}[]}
+ */
+function recoverDSMLToolCalls(captured, declaredTools) {
+  if (!captured || !declaredTools || declaredTools.size === 0) return [];
+  const out = [];
+  const openRe = /<｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/g;
+  const closeRe = /<\/｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/g;
+  const opens = [...captured.matchAll(openRe)];
+  const closes = [...captured.matchAll(closeRe)];
+  // 门 1:开闭配对(开闭数量相等,逐对取块)
+  const n = Math.min(opens.length, closes.length);
+  for (let i = 0; i < n; i++) {
+    const start = opens[i].index + opens[i][0].length;
+    const end = closes[i].index;
+    if (end <= start) continue;
+    const inner = captured.slice(start, end);
+    // invoke 块:名称必须带 name="…"(门 2 前置)
+    const invokeRe = /<｜{1,2}DSML｜{1,2}invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}invoke>/g;
+    for (const inv of inner.matchAll(invokeRe)) {
+      const name = inv[1];
+      // 门 2:工具名必须在本请求声明过
+      if (!declaredTools.has(name)) continue;
+      const params = {};
+      let ok = true;
+      const paramRe = /<｜{1,2}DSML｜{1,2}parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}parameter>/g;
+      for (const pm of inv[2].matchAll(paramRe)) {
+        try { params[pm[1]] = JSON.parse(pm[2]); } catch { params[pm[1]] = pm[2]; }
+      }
+      // 门 4:参数对象可序列化(序列化失败即回滚)
+      let args;
+      try { args = JSON.stringify(params); } catch { continue; }
+      out.push({ id: `dsml_${out.length}_${Date.now().toString(36)}`, name, arguments: args });
+    }
+  }
+  return out;
 }
 
 // ---- Anthropic Messages(/v1/messages,Claude Code)→ Chat ----
@@ -637,8 +696,9 @@ function safeJsonParse(s) {
 }
 
 class AnthropicStreamBuilder {
-  constructor(model, estInput) {
+  constructor(model, estInput, declaredTools = new Set()) {
     this.model = model;
+    this.declaredTools = declaredTools;
     this.dsml = new DSMLTextFilter();
     this.blockIndex = 0;
     this.cur = null;   // {kind:'text'|'thinking'|'tool', index, text, args, id, name}
@@ -667,6 +727,13 @@ class AnthropicStreamBuilder {
         this.cur.text += tail;
         sseWrite(res, 'content_block_delta', { index: i, delta: { type: 'text_delta', text: tail } });
       }
+      // DSML 四道门恢复:剔除的内容里若有结构完好的 tool_calls 块,转成可执行调用
+      for (const call of recoverDSMLToolCalls(this.dsml.capture, this.declaredTools)) {
+        this.openBlock(res, 'tool', { id: call.id, name: call.name });
+        this.cur.args = call.arguments;
+        this.closeBlock(res);
+      }
+      this.dsml.capture = '';
       sseWrite(res, 'content_block_stop', { index: i });
       this.blocks.push({ type: 'text', text: this.cur.text });
     } else if (this.cur.kind === 'thinking') {
@@ -871,7 +938,7 @@ async function handleMessages(req, res, body) {
     return;
   }
 
-  const builder = new AnthropicStreamBuilder(wireModel, estInput);
+  const builder = new AnthropicStreamBuilder(wireModel, estInput, new Set((tools ?? []).map(t2 => t2.function.name)));
   if (body.stream !== true) {
     for await (const d of upstreamSseChunks(upstream)) { builder.handleChunk({ write: () => {} }, d); }
     builder.closeBlock({ write: () => {} });
