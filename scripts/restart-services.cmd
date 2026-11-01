@@ -1,16 +1,21 @@
 @echo off
-rem 一键拉起/确认本套件的三个本地服务(幂等:健康的直接跳过,不健康的 detached 拉起)。
+rem Restart the three local services this suite depends on.
+rem Idempotent: a healthy service is skipped, a dead one is spawned detached.
 rem
-rem   :39268  codex-responses-bridge  —— Claude Code / Codex 的协议桥
-rem   :39272  trae 端点
-rem   :39271  workbuddy 端点
+rem   :39268  codex-responses-bridge  (Claude Code / Codex protocol bridge)
+rem   :39272  trae endpoint
+rem   :39271  workbuddy endpoint
 rem
-rem 用法(任意终端,或双击):
+rem Usage: double-click, or from any terminal:
 rem   D:\HANXIAO\tools\zcode-ai-connect\scripts\restart-services.cmd
 rem
-rem 为什么要单独一个脚本:这三个服务是常驻进程,必须由**你自己的终端/宿主**
-rem 拉起。从自动化会话里 spawn 出来的子进程会随会话被回收,表现为
-rem "刚说 started 就 503 connect-refused"。
+rem Why a separate script: these are long-lived processes and must be started
+rem from YOUR terminal or host app. Children spawned from an automation session
+rem get reaped when that call ends -- the symptom is "started on :39268"
+rem followed by 503 connect-refused seconds later.
+rem
+rem NOTE: keep this file ASCII-only. cmd.exe reads .cmd with the OEM codepage
+rem (936 on zh-CN); UTF-8 Chinese comments get mis-decoded into stray commands.
 
 node "%~dp0codex-responses-bridge.mjs" ensure
 node "%~dp0..\zcode-trae-connect\hooks\service-ensure.mjs"
