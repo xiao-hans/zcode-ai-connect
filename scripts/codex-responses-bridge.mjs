@@ -153,6 +153,7 @@ function sseDone(res) {
 class ResponseBuilder {
   constructor(model) {
     this.model = model;
+    this.dsml = new DSMLTextFilter();
     this.items = [];
     this.outputIndex = 0;
     this.msg = null;   // 进行中的 assistant message
@@ -193,6 +194,11 @@ class ResponseBuilder {
 
   finishMsg(res) {
     if (!this.msg) return;
+    const tail = this.dsml.flush();
+    if (tail) {
+      this.msg.text += tail;
+      sseWrite(res, 'content_block_delta', { index: this.msg.outputIndex, delta: { type: 'text_delta', text: tail } });
+    }
     sseWrite(res, 'response.output_text.done', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, text: this.msg.text });
     sseWrite(res, 'response.content_part.done', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, part: { type: 'output_text', text: this.msg.text, annotations: [] } });
     const item = { id: this.msg.id, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: this.msg.text, annotations: [] }] };
@@ -243,8 +249,11 @@ class ResponseBuilder {
     if (typeof delta.content === 'string' && delta.content) {
       this.finishReasoning(res);
       this.announceMsg(res);
-      this.msg.text += delta.content;
-      sseWrite(res, 'response.output_text.delta', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, delta: delta.content });
+      const filtered = this.dsml.push(delta.content);
+      if (filtered) {
+        this.msg.text += filtered;
+        sseWrite(res, 'response.output_text.delta', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, delta: filtered });
+      }
     }
     if (Array.isArray(delta.tool_calls)) {
       this.finishReasoning(res);
@@ -516,6 +525,37 @@ async function* upstreamSseChunks(upstream) {
   }
 }
 
+// ---- DSML 泄漏过滤 ----
+// DeepSeek 模型族偶发把内部标记(<｜DSML｜…>/｜｜DSML｜｜…)写进正文——上游
+// dsh-connect-workbuddy 的 DSML-LEAK-RESEARCH 结论:长上下文下的模型族缺陷,
+// 官方客户端解析并隐藏,裸 API 消费者看到垃圾标签且「工具调用」不执行。
+// 流式安全剔除:逐片剔完整标记;尾部疑似标记开头(≤40 字符)扣下与下一片拼合;
+// 收尾时含 DSML 的残片丢弃。
+class DSMLTextFilter {
+  constructor() { this.carry = ''; }
+  static strip(s) {
+    return s
+      .replace(/<｜DSML｜[^>\n]{0,200}>?/g, '')
+      .replace(/｜{1,2}DSML｜{1,2}[^\n]{0,200}/g, '');
+  }
+  push(s) {
+    s = this.carry + s;
+    const stripped = DSMLTextFilter.strip(s);
+    const hold = Math.max(stripped.lastIndexOf('<'), stripped.lastIndexOf('｜'));
+    if (hold >= 0 && stripped.length - hold <= 40 && !stripped.slice(hold).includes('\n')) {
+      this.carry = stripped.slice(hold);
+      return stripped.slice(0, hold);
+    }
+    this.carry = '';
+    return stripped;
+  }
+  flush() {
+    const tail = this.carry;
+    this.carry = '';
+    return tail.includes('DSML') ? '' : tail;
+  }
+}
+
 // ---- Anthropic Messages(/v1/messages,Claude Code)→ Chat ----
 // 与 Codex 共用同一批上游路由/去指纹/SSE 读取;此处只做协议形状转换。
 // Claude Code 经环境变量接入:ANTHROPIC_BASE_URL=http://127.0.0.1:39268
@@ -599,6 +639,7 @@ function safeJsonParse(s) {
 class AnthropicStreamBuilder {
   constructor(model, estInput) {
     this.model = model;
+    this.dsml = new DSMLTextFilter();
     this.blockIndex = 0;
     this.cur = null;   // {kind:'text'|'thinking'|'tool', index, text, args, id, name}
     this.blocks = [];
@@ -621,6 +662,11 @@ class AnthropicStreamBuilder {
     if (!this.cur) return;
     const i = this.cur.index;
     if (this.cur.kind === 'text') {
+      const tail = this.dsml.flush();
+      if (tail) {
+        this.cur.text += tail;
+        sseWrite(res, 'content_block_delta', { index: i, delta: { type: 'text_delta', text: tail } });
+      }
       sseWrite(res, 'content_block_stop', { index: i });
       this.blocks.push({ type: 'text', text: this.cur.text });
     } else if (this.cur.kind === 'thinking') {
@@ -663,8 +709,11 @@ class AnthropicStreamBuilder {
     }
     if (typeof delta.content === 'string' && delta.content) {
       if (this.cur?.kind !== 'text') this.openBlock(res, 'text');
-      this.cur.text += delta.content;
-      sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'text_delta', text: delta.content } });
+      const filtered = this.dsml.push(delta.content);
+      if (filtered) {
+        this.cur.text += filtered;
+        sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'text_delta', text: filtered } });
+      }
     }
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
@@ -744,6 +793,10 @@ async function handleMessages(req, res, body) {
     // Claude /effort 的五档经 budget 阈值分档,再按提供商档位就近取整
     const level = budget >= 64000 ? 'max' : budget >= 48000 ? 'xhigh' : budget >= 24000 ? 'high' : budget >= 8000 ? 'medium' : 'low';
     reasoningEffort = clampEffort(t.tool, level);
+  } else if (body.thinking?.type === 'adaptive') {
+    // Claude 2.1.316 对未知模型发 adaptive 自适应思考(不带强度信号);
+    // 固定映射 high,保证思考可见——否则 WorkBuddy 默认不思考
+    reasoningEffort = clampEffort(t.tool, 'high');
   }
   const chatPayload = {
     model: chatModel,
