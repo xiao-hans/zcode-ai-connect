@@ -224,6 +224,10 @@ call C:\Users\HANXIAO\bin\claude.cmd %*
 
 **输出预算(max_tokens)**:桥现在转发客户端的 `max_tokens`(Codex 侧是 `max_output_tokens`),并夹在 `ZC_MAX_OUTPUT_TOKENS`(默认 32000)以内——上游对超限值的处置不一致(有的 400、有的静默截)。实测 wb 通道 60 tokens 请求 → `stop_reason: max_tokens`、恰好 60 输出 token;**trae 走的 `llm_utils_chat` 通道不接收这个字段**(协议里没有),所以 trae 侧仍以上游默认预算运行——这是通道能力边界,不是桥漏了。客户端若因此收到 400,桥会自动去掉 `stream_options` 与 `max_tokens` 重试一次。
 
+**强制继续(trae 专用)**:当请求上下文里刚出现 `Stop hook feedback`(即上一轮被 §九 的守卫判定为「宣布了下一步却停住」)时,桥把**这一轮**改成 `tool_choice: required`,逼模型必须发起工具调用,而不是再写一段计划。
+
+触发面刻意收窄到「刚停过的那一轮」:如果无脑对每个 `tool_result` 之后都强制,模型就永远没机会给最终答复,会退化成无限工具循环。强制完的下一轮自动恢复 `auto`。代价是偶尔会逼出一次没必要的工具调用(模型为了满足约束而试探性读文件),比"整轮停住"仍然划算。`ZC_FORCE_TOOL_CONTINUE=0` 可关闭。
+
 **文本形态的工具调用**:DeepSeek 族偶发把工具调用写成 `<｜DSML｜…>` 标记塞进正文。桥做四道门恢复,门 2(工具名必须在本请求声明过)现在先剥离标记残渣再比对(`name="Grep"` 退化成 `<name>Grep</｜｜DSML｜｜ parameter>` 也能认出来),但**只接受唯一命中**。残渣已坏到无法安全解析的,桥不猜调用 —— 那一轮会退化成「文本戛然而止、没有工具调用」,由 §九 的自动续跑兜住;`ZC_BRIDGE_DEBUG=1` 时会往 `~/.zcode-codex-bridge/debug-dsml.log` 记一条待排查样本。
 
 回归测试:`node tests/test-stream-guard.mjs` · `node tests/test-stream-guard-qoder.mjs`

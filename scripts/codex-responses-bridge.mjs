@@ -782,6 +782,27 @@ function anthropicToolChoice(tc) {
 
 const ANTHROPIC_STOP = { tool_calls: 'tool_use', stop: 'end_turn', length: 'max_tokens' };
 
+/**
+ * 这一轮是不是紧接着一次「宣布了下一步却停住」。
+ *
+ * Claude Code 的 Stop 守卫拦下来时,会把续跑提示作为一条合成消息塞进上下文
+ * (role 可能是 user,也可能是 2.1.316 之后的 system)。看到它就说明上一次
+ * 上游给了"零工具调用的 end_turn",这一次必须逼它真动手。
+ *
+ * 只看最后三条:更早的提示属于历史,不能一直逼。
+ */
+function recentlyStalled(messages) {
+  const arr = Array.isArray(messages) ? messages : [];
+  const tail = arr.slice(-3);
+  return tail.some((m) => {
+    if (!m || (m.role !== 'user' && m.role !== 'system')) return false;
+    const text = typeof m.content === 'string'
+      ? m.content
+      : (Array.isArray(m.content) ? m.content.filter(p => p?.type === 'text').map(p => p.text ?? '').join('') : '');
+    return text.includes('Stop hook feedback');
+  });
+}
+
 function safeJsonParse(s) {
   try { return JSON.parse(s); } catch { return {}; }
 }
@@ -1014,18 +1035,30 @@ async function handleMessages(req, res, body) {
   const tools = toChatToolsAnthropic(body.tools);
   if (tools) chatPayload.tools = tools;
   const tc = anthropicToolChoice(body.tool_choice);
-  if (tc) chatPayload.tool_choice = tc;
+  // 「刚停过一次」→ 这一轮强制模型必须发起工具调用(tool_choice: required)。
+  //
+  // 只对 trae 开:它的 DeepSeek-V4.1-Flash 空收尾率 12%(wb 同模型 3.5%),靠提示
+  // 复述已经压不住。触发条件刻意收紧到「上下文里刚出现 Stop hook feedback」——
+  // 如果无脑对每个 tool_result 之后都 required,模型永远没机会给最终答复,
+  // 会变成无限工具循环;绑在"刚被守卫拦下"这一轮,强制完下一轮就恢复 auto。
+  const forceContinue = !!tools && t.tool === 'trae'
+    && process.env['ZC_FORCE_TOOL_CONTINUE'] !== '0'
+    && recentlyStalled(body.messages);
+  if (forceContinue) chatPayload.tool_choice = 'required';
+  else if (tc) chatPayload.tool_choice = tc;
   // 输出预算:Claude 的 max_tokens 夹到上游天花板(见 clampMaxOutput)
   const maxOut = clampMaxOutput(body.max_tokens);
   if (maxOut) chatPayload.max_tokens = maxOut;
   const estInput = estimateTokens(body);
 
-  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
+  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false, noToolChoice = false) => {
     const p = { ...chatPayload };
     // 每级都从原始 body 重建:billing 剥除 + 去指纹 + assistant 历史改写按当前档位重算
     p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), mutLevel), body.messages, mutLevel);
     if (noStreamOptions) delete p.stream_options;
     if (noMaxTokens) delete p.max_tokens;
+    // 400 兜底:个别通道不认 tool_choice(required),去掉后重试,别让整轮失败
+    if (noToolChoice) delete p.tool_choice;
     return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
@@ -1061,9 +1094,10 @@ async function handleMessages(req, res, body) {
         if (!errText.includes('11128')) break;
       }
     } else {
-      // 非 11128 的 400:个别通道不认 stream_options / max_tokens,去掉后重试一次
+      // 非 11128 的 400:个别通道不认 stream_options / max_tokens / tool_choice,
+      // 全去掉后重试一次(宁可少一点约束,也别让整轮直接失败)
       try {
-        upstream = await callUpstream(0, true, true);
+        upstream = await callUpstream(0, true, true, true);
       } catch (e) {
         json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
         return;
