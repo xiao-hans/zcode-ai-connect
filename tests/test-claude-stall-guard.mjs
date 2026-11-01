@@ -75,6 +75,29 @@ function transcript(turnText, replyText) {
   return path;
 }
 
+const userPrompt = (text) => ({ type: 'user', message: { role: 'user', content: text } });
+const toolTurn = () => ({
+  type: 'assistant',
+  message: { role: 'assistant', stop_reason: 'tool_use', content: [{ type: 'tool_use', id: 'c1', name: 'Bash', input: {} }] },
+});
+const stallTurn = (text) => ({
+  type: 'assistant',
+  message: { role: 'assistant', stop_reason: 'end_turn', content: [{ type: 'text', text }] },
+});
+const hookFeedback = () => ({
+  type: 'user',
+  isMeta: true,
+  message: { role: 'user', content: 'Stop hook feedback:\n继续执行:直接调用工具把剩下的步骤做完。' },
+});
+
+/** 写一份任意条目序列的 transcript。 */
+function rawTranscript(items) {
+  seq += 1;
+  const path = join(WORK, `r${seq}.jsonl`);
+  writeFileSync(path, `${items.map((o) => JSON.stringify(o)).join('\n')}\n`, 'utf8');
+  return path;
+}
+
 async function stopEvent(file, extra = {}, sessionId = `s-${file}`) {
   const { out, err, code } = await runHook({
     session_id: sessionId,
@@ -112,24 +135,32 @@ console.log('[2] 同一段回复文本只续跑一次');
   check('同一文本第二次不续跑', !second.blocked, second.raw);
 }
 
-console.log('[3] 每回合预算');
+console.log('[3] 续跑预算按「有没有真干活」算,不按次数算');
 {
-  const replies = [
-    '接下来把缓存键换成分类 id。',
-    '再补一条回归测试。',
-    '然后写交接总结。',
-    '顺手更新一下文档。',
-    '重跑一遍构建。',
-    '再核对一次真机日志。',
-    '最后收尾撤掉探针。',
-  ];
-  const results = [];
-  for (const reply of replies) {
-    // 同一轮:turn 文本与 session_id 必须一致,才能命中同一份预算
-    results.push(await stopEvent(transcript('跑一遍验证', reply), { stop_hook_active: true }, 's-budget'));
-  }
-  check('第 1-6 次续跑', results.slice(0, 6).every((r) => r.blocked), JSON.stringify(results.map((r) => r.blocked)));
-  check('第 7 次预算耗尽后放行', !results[6].blocked, results[6].raw);
+  // 救完之后模型真的调过工具 → 下一次停住是新的,应该继续救
+  const progressed = rawTranscript([
+    userPrompt('跑一遍验证'),
+    toolTurn(),
+    stallTurn('接下来把缓存键换成分类 id。'),
+    hookFeedback(),
+    toolTurn(),                                   // 干了活
+    stallTurn('再补一条回归测试。'),                 // 又停了
+  ]);
+  const a = await stopEvent(progressed, {}, 's-progress');
+  check('中间有工具调用 → 继续续跑', a.blocked, a.raw);
+
+  // 救完原地不动,连续两次 → 死循环,不再烧额度
+  const looping = rawTranscript([
+    userPrompt('跑一遍验证'),
+    toolTurn(),
+    stallTurn('接下来改适配器。'),
+    hookFeedback(),
+    stallTurn('接下来改适配器。'),
+    hookFeedback(),
+    stallTurn('接下来改适配器。'),
+  ]);
+  const b = await stopEvent(looping, {}, 's-loop');
+  check('连续两次没干活 → 判定死循环放行', !b.blocked, b.raw);
 }
 
 console.log('[4] 空消息收尾(轮内已有工具调用也要救)');

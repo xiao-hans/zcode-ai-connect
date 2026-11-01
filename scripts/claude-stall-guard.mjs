@@ -46,15 +46,12 @@ const FALLBACK_REASON = [
 ].join('\n');
 
 /**
- * 同一回合最多自动续跑几次。
- *
- * 从 3 提到 6 的依据(2026-11-01 会话 8d662da8 全量统计):trae/deepseek-v4.1-flash
- * 的空收尾率 8.1%(6/74),wb/deepseek-v4.1-flash 2.0%(16/796)。长任务里一轮
- * 用户输入会跑几十个工具轮,8% 意味着平均每轮都要撞一两次;3 次预算在长任务上
- * 不够用,用完就只能眼看着停在半路。去重仍按「同一回合 + 同一段文本」,所以
- * 真正的死循环(模型反复说同一句话)依然只救一次。
+ * 连续多少次「没干活的停住」之后判定为死循环、不再救。
+ * 只要中间模型真调过工具,计数就清零(见 feedbacksSinceLastWork)。
  */
-const MAX_AUTO_CONTINUES = 6;
+const MAX_CONSECUTIVE_STALLS = 2;
+/** 每回合的绝对上限,只做保险丝,正常长任务永远碰不到。 */
+const MAX_PER_TURN = 20;
 const SIGNATURE_TTL_MS = 7 * 24 * 60 * 60 * 1000;
 const LOCK_HOME = process.env['ZCLAUDE_STALL_GUARD_HOME'] ?? join(homedir(), '.claude-stall-guard');
 const LOG_PATH = join(LOCK_HOME, 'guard.log');
@@ -155,6 +152,29 @@ function lastTurnStats(entries) {
   return { toolCalls, lastText, turnStart };
 }
 
+/**
+ * 数「上一次真正干活之后」出现过几条 Stop hook feedback。
+ *
+ * 「真正干活」= 带 tool_use 的 assistant 消息。这是判断续跑该不该继续的唯一
+ * 有意义的口径:救一次之后模型真的动了手,下一次再停就是**新的**一次停住,
+ * 应该继续救;救完还是原地不动(没有任何工具调用)才是死循环。
+ *
+ * 实测依据(2026-11-01 会话 56720125,trae/deepseek-v4.1-flash):一轮 13 分钟
+ * 的长任务里连续撞了 6 次停住,按「每轮固定 6 次预算」算直接见底 → 22:34 停在
+ * 半路;而这 6 次之间模型每次都干了活,是六次独立停住,不是循环。
+ */
+function feedbacksSinceLastWork(entries) {
+  let count = 0;
+  for (let i = entries.length - 1; i >= 0; i--) {
+    const o = entries[i];
+    if (o.type === 'assistant' && Array.isArray(o.message?.content)
+      && o.message.content.some(p => p?.type === 'tool_use')) break;
+    if (o.type === 'user' && o.isMeta && typeof o.message?.content === 'string'
+      && o.message.content.includes('Stop hook feedback')) count += 1;
+  }
+  return count;
+}
+
 async function main() {
   const raw = await readStdin();
   let event = {};
@@ -207,20 +227,26 @@ async function main() {
 
   if (!reason) return;
 
-  // 先去重再领名额:同一回合内同一段文本只会救一次;换句话再中才算新的一次停住。
-  // 指纹里必须带 turnKey —— 只按 session+文本去重的话,「我先看一下。」这种套话
-  // 在本会话里第二次出现就永远不救了(空文本更是全session共用一个键)。
-  if (!tryClaim(`text-${hashKey(turnKey, lastText)}`)) {
-    log('same reply already continued once; leaving it alone');
+  // 连续性判定先于一切:救完还是原地不动 → 死循环,别再烧额度。
+  const consecutive = feedbacksSinceLastWork(entries);
+  if (consecutive >= MAX_CONSECUTIVE_STALLS) {
+    log(`no tool call since ${consecutive} prior continuation(s) — treating as a loop, leaving the turn alone`);
     return;
   }
-  const attempt = claimTurnBudget(turnKey, MAX_AUTO_CONTINUES);
+
+  // 再去重:同一回合内、同样工具进度、同一段文本只救一次;换句话或又干了活
+  // 才算新的一次停住。
+  if (!tryClaim(`text-${hashKey(turnKey, toolCalls, lastText)}`)) {
+    log('same reply already continued at this tool progress; leaving it alone');
+    return;
+  }
+  const attempt = claimTurnBudget(turnKey, MAX_PER_TURN);
   if (attempt === 0) {
-    log(`auto-continue budget exhausted for this turn (${MAX_AUTO_CONTINUES})`);
+    log(`turn cap reached (${MAX_PER_TURN}); leaving the turn alone`);
     return;
   }
   pruneOldSignatures();
-  log(`stall → continue (${attempt}/${MAX_AUTO_CONTINUES})`);
+  log(`stall → continue (#${attempt} this turn, ${consecutive} consecutive without work)`);
   process.stdout.write(JSON.stringify({ decision: 'block', reason }));
 }
 
