@@ -277,6 +277,47 @@ export function classifyLlmError(failure) {
 	return { kind: 'server', status: 502, message }
 }
 
+const TOOL_CHOICE_UNSUPPORTED = Symbol('tool-choice-unsupported')
+
+/**
+ * 私有线只认 auto 或省略 tool_choice(其它值不再回 400)。
+ *
+ * 以前这里硬拒 required/any,直接后果是 Claude Code 的守卫续跑(桥对 trae 强制
+ * tool_choice=required)每一轮都整轮失败,修好的东西反而成了 blocker。
+ * 现在降级成「auto + 本轮约束提示」:硬约束保不住(线上没有这个参数),但至少
+ * 把意图注入这一轮的指令里,并且不再打死整轮。
+ *
+ * 返回 null 表示无需干预;返回字符串表示要追加的约束提示;返回哨兵表示无法识别的形状。
+ */
+export function toolChoiceDirective(toolChoice) {
+	if (toolChoice === undefined || toolChoice === null || toolChoice === 'auto') return null
+	if (toolChoice === 'required' || toolChoice === 'any') return '【本轮要求】必须调用工具继续,不要只用文字回复。'
+	if (toolChoice === 'none') return '【本轮要求】不要调用工具,直接用文字回复。'
+	if (typeof toolChoice === 'object') {
+		// OpenAI 形状 {type:'function',function:{name}} 与 Anthropic 形状 {type:'tool',name}
+		const name = toolChoice.type === 'function' ? toolChoice.function?.name
+			: toolChoice.type === 'tool' ? toolChoice.name
+				: undefined
+		if (typeof name === 'string' && name !== '') return `【本轮要求】必须调用工具 ${name},不要只用文字回复。`
+		// {type:'auto'} 与 Anthropic 的默认值等价
+		if (toolChoice.type === 'auto') return null
+	}
+	return TOOL_CHOICE_UNSUPPORTED
+}
+
+/** 把约束提示并进系统消息(没有系统消息就补一条),不新增第二条 system。 */
+function appendToolDirective(messages, text) {
+	const block = { type: 'text', text }
+	const first = messages[0]
+	if (first && first.role === 'system') {
+		if (Array.isArray(first.content)) first.content = [...first.content, block]
+		else if (typeof first.content === 'string') first.content = [{ type: 'text', text: first.content }, block]
+		else first.content = [block]
+		return
+	}
+	messages.unshift({ role: 'system', content: [block] })
+}
+
 /** One chat turn over llm_utils_chat, re-emitted as an OpenAI-shaped SSE
  * stream (choices[].delta.{content, reasoning_content, tool_calls}) so the
  * loopback server's existing normalizer consumes it unchanged. Resolves with
@@ -285,13 +326,15 @@ export function classifyLlmError(failure) {
  * first output frame. */
 export async function llmChatStream({ credential, identity, baseUrl, openaiBody, ownedFunction, signal }) {
 	const input = typeof openaiBody === 'string' ? JSON.parse(openaiBody) : openaiBody
-	// No non-default tool_choice mapping has been verified for this private wire.
-	if (input.tool_choice !== undefined && input.tool_choice !== 'auto') {
-		return { ok: false, kind: 'client', status: 400, message: 'llm_utils_chat: unsupported tool_choice; only "auto" or an omitted tool_choice is supported' }
+	const directive = toolChoiceDirective(input.tool_choice)
+	if (directive === TOOL_CHOICE_UNSUPPORTED) {
+		return { ok: false, kind: 'client', status: 400, message: `llm_utils_chat: unsupported tool_choice ${JSON.stringify(input.tool_choice)}; use "auto" / "required" / "any" / "none" or {type:"function",function:{name}}` }
 	}
 	const model = typeof input.model === 'string' && input.model.trim() !== '' ? input.model.trim() : 'glm-5.2'
+	const wireMessages = toLlmMessages(input.messages)
+	if (directive) appendToolDirective(wireMessages, directive)
 	const wire = {
-		messages: toLlmMessages(input.messages),
+		messages: wireMessages,
 		model,
 		config_name: model,
 		function: ownedFunction ?? 'solo_work_lite',

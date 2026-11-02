@@ -128,7 +128,11 @@ function toChatMessages(instructions, input, mutLevel = 0) {
     : Array.isArray(input) ? input : [];
   for (const item of items) {
     if (!item || typeof item !== 'object') continue;
-    if (item.type === 'message') {
+    // Responses 的 EasyInputMessage 允许省略 type:只带 role/content 也是一条消息。
+    // 以前只认 type === 'message',这种条目会被静默丢掉,直到 messages 变空、上游
+    // 回一句 "messages is required" —— 从报错完全看不出是桥丢的。
+    const kind = typeof item.type === 'string' && item.type !== '' ? item.type : 'message';
+    if (kind === 'message') {
       const role = item.role === 'developer' ? 'system' : item.role ?? 'user';
       const text = textOfContent(item.content);
       if (text) {
@@ -467,6 +471,14 @@ async function handleResponses(req, res, wireModel, body, signal) {
     signal.throwIfAborted();
     return upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions, noMaxTokens, signal });
   };
+
+  // 入口校验:翻译后一条消息都没有就别打上游了。上游只会回一句笼统的
+  // "messages is required" / 4001,既暴露内部实现又难定位,这里直接说清是 input 的问题。
+  if (toChatMessages(body.instructions, body.input, 0).length === 0) {
+    res.writeHead(400, { 'content-type': 'application/json' });
+    res.end(JSON.stringify({ error: { message: 'input 里没有可转换的消息:每一项需要 role/content(可省略 type),或为 function_call / function_call_output' } }));
+    return;
+  }
 
   let upstream;
   try {
