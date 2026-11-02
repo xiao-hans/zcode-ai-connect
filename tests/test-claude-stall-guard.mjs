@@ -20,15 +20,16 @@
  */
 
 import { spawn } from 'node:child_process';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOOK = join(HERE, '..', 'scripts', 'claude-stall-guard.mjs');
-const WORK = mkdtempSync(join(tmpdir(), 'zc-claude-guard-'));
+const WORK = mkdtempSync(join(process.env.TMPDIR ?? tmpdir(), 'zc-claude-guard-'));
 const LOCK_HOME = join(WORK, 'locks');
+process.on('exit', () => rmSync(WORK, { recursive: true, force: true }));
 
 let passed = 0;
 let failed = 0;
@@ -207,6 +208,95 @@ console.log('[7] 异常输入静默退出');
   check('transcript 缺失 → 无输出', missing.raw.trim() === '' && missing.code === 0, missing.raw);
   const noPath = await runHook({ hook_event_name: 'Stop', stop_hook_active: false });
   check('缺 transcript_path → 无输出', noPath.out.trim() === '' && noPath.code === 0, noPath.out);
+}
+
+console.log('[8] R14: 连续停住计数只属于当前真人回合');
+{
+  const oldLoop = [
+    { ...userPrompt('继续'), timestamp: '2026-11-01T15:00:00.000Z' },
+    stallTurn('接下来改适配器。'),
+    hookFeedback(),
+    stallTurn('再补一条回归测试。'),
+    hookFeedback(),
+  ];
+  const pending = stallTurn('我先读关键文件确认现状。');
+  const toolResult = {
+    type: 'user',
+    message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'ok' }] },
+  };
+  const meta = { ...userPrompt('宿主提示'), isMeta: true };
+  const cases = [
+    ['旧回合两次 feedback 后，真人新任务仍救援', [
+      ...oldLoop, userPrompt('修复缓存问题'), pending,
+    ], true],
+    ['旧回合两次 feedback 后，真人再次「继续」仍救援', [
+      ...oldLoop,
+      { ...userPrompt('继续'), timestamp: '2026-11-01T15:18:00.000Z' }, pending,
+    ], true],
+    ['真人 text 块消息也重置连续计数', [
+      ...oldLoop,
+      userPrompt([{ type: 'text', text: '继续修复缓存' }]), pending,
+    ], true],
+    ['显式 isMeta=false 的真人输入也重置连续计数', [
+      ...oldLoop, { ...userPrompt('继续'), isMeta: false }, pending,
+    ], true],
+    ['同轮只有一次无工作续跑仍可救援', [
+      userPrompt('修复缓存'), pending, hookFeedback(), stallTurn('接下来检查缓存键。'),
+    ], true],
+    ['同轮两次无工作续跑仍限流', [...oldLoop, pending], false],
+    ['纯 tool_result 不重置连续计数', [...oldLoop, toolResult, pending], false],
+    ['普通 isMeta 注入不重置连续计数', [...oldLoop, meta, pending], false],
+    ['第二条 Stop feedback 不被误认作真人边界', [
+      ...oldLoop, pending, hookFeedback(), pending,
+    ], false],
+    ['同轮真正调用工具后重新救援', [...oldLoop, toolTurn(), toolResult, pending], true],
+  ];
+  for (const [name, items, expected] of cases) {
+    const result = await stopEvent(rawTranscript(items));
+    check(name, result.blocked === expected && result.parseable && result.code === 0 && result.err === '',
+      JSON.stringify(result));
+  }
+}
+
+console.log('[9] R15: 只判最终 assistant 的全部正文，不回退旧正文');
+{
+  const earlierWork = [
+    userPrompt('修复缓存并验证'),
+    stallTurn('上一处改动已经完成，测试全部通过。修好了。'),
+    toolTurn(),
+    {
+      type: 'user',
+      message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: 'c1', content: 'ok' }] },
+    },
+  ];
+  const text = (value) => ({ type: 'text', text: value });
+  const cases = [
+    ['较早完成正文 + 工具 + 最终 thinking-only → 救援', [
+      { type: 'thinking', thinking: '继续分析缓存键' },
+    ], true],
+    ['较早完成正文 + 工具 + 最终空 content → 救援', [], true],
+    ['较早完成正文 + 工具 + 最终空白 text → 救援', [text(' \n\t')], true],
+    ['最终多 text 块保留末块待办，不只取首块完成态', [
+      text('完成。'), { type: 'thinking', thinking: '检查剩余工作' },
+      text('接下来补上缓存失效回归测试。'),
+    ], true],
+    ['最终多 text 块保留首块待办，不只取末块完成态', [
+      text('接下来补上缓存失效回归测试。'), text('上一处完成。'),
+    ], true],
+    ['完成回复的多个 text 块完整收集后放行', [
+      text('两处改动都已落盘，'), text('编译和回归测试全部通过。'),
+    ], false],
+    ['完成关键词跨 text 块时仍完整拼接', [text('完'), text('成。')], false],
+    ['最终单块正常完成回复放行', [text('完成。')], false],
+  ];
+  for (const [name, content, expected] of cases) {
+    const items = [...earlierWork, {
+      type: 'assistant', message: { role: 'assistant', stop_reason: 'end_turn', content },
+    }];
+    const result = await stopEvent(rawTranscript(items));
+    check(name, result.blocked === expected && result.parseable && result.code === 0 && result.err === '',
+      JSON.stringify(result));
+  }
 }
 
 console.log(`\n${passed} passed, ${failed} failed`);

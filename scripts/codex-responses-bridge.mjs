@@ -26,6 +26,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { hostIsLoopback, originIsLoopback } from '../zcode-trae-connect/src/loopback.js';
 
 const DEFAULT_PORT = 39268;
 const EP_CACHE_TTL_MS = 30_000;
@@ -403,7 +404,7 @@ function clampEffort(tool, level) {
   return ranked.find(eff => EFFORT_RANK.indexOf(eff) >= target) ?? ranked[ranked.length - 1];
 }
 
-async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false } = {}) {
+async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false, signal } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
   const payload = {
@@ -425,10 +426,11 @@ async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, n
     method: 'POST',
     headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
     body: JSON.stringify(payload),
+    signal,
   });
 }
 
-async function handleResponses(req, res, wireModel, body) {
+async function handleResponses(req, res, wireModel, body, signal) {
   const slash = wireModel.indexOf('/');
   if (slash <= 0) {
     res.writeHead(400, { 'content-type': 'application/json' });
@@ -461,52 +463,57 @@ async function handleResponses(req, res, wireModel, body) {
     await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body)}\n`).catch(() => {});
   }
 
-  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) =>
-    upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions, noMaxTokens });
+  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
+    signal.throwIfAborted();
+    return upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions, noMaxTokens, signal });
+  };
 
   let upstream;
   try {
     upstream = await callUpstream(0, false);
   } catch (e) {
+    signal.throwIfAborted();
     res.writeHead(502, { 'content-type': 'application/json' });
     res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
     return;
   }
   if (upstream.status === 400) {
-    let errText = await upstream.text().catch(() => '');
+    let errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     if (errText.includes('11128')) {
       // 11128 同义改写梯子:level 1(措辞加强)→ level 2(中性头兜底)
       for (let level = 1; level <= 2; level++) {
         try {
           upstream = await callUpstream(level, false);
         } catch (e) {
+          signal.throwIfAborted();
           res.writeHead(502, { 'content-type': 'application/json' });
           res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
           return;
         }
         if (upstream.status !== 400) break;
-        errText = await upstream.text().catch(() => '');
+        errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
         if (!errText.includes('11128')) break;
       }
-    } else {
-      // 非 11128 的 400:个别通道不认 stream_options / max_tokens,去掉后重试一次
+    } else if (!/tool_choice/i.test(errText) && /(?:unsupported|unknown|unrecognized)[^\n]*(?:stream_options|max_tokens)|(?:stream_options|max_tokens)[^\n]*(?:not supported|unsupported|unknown|unrecognized)/i.test(errText)) {
+      // 只对明确不支持的兼容字段重试;工具选择约束始终保留。
       try {
         upstream = await callUpstream(0, true, true);
       } catch (e) {
+        signal.throwIfAborted();
         res.writeHead(502, { 'content-type': 'application/json' });
         res.end(JSON.stringify({ error: { message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } }));
         return;
       }
+      if (!upstream.ok) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     }
-    if (upstream.failed || !upstream.ok) {
-      const text = upstream.failed ? '' : await upstream.text().catch(() => '');
-      res.writeHead(502, { 'content-type': 'application/json' });
-      res.end(text || JSON.stringify({ error: { message: `${t.tool} 端点重试仍失败:${upstream.failed?.cause?.code ?? `HTTP ${upstream.status ?? '?'}`}` } }));
+    if (!upstream.ok) {
+      if (!upstream.bodyUsed) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
+      json(res, upstream.status, { error: { message: errText.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
       return;
     }
   }
   if (!upstream.ok) {
-    const text = await upstream.text().catch(() => '');
+    const text = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     res.writeHead(upstream.status, { 'content-type': 'application/json' });
     res.end(text || JSON.stringify({ error: { message: `upstream HTTP ${upstream.status}` } }));
     return;
@@ -516,13 +523,18 @@ async function handleResponses(req, res, wireModel, body) {
   if (!clientWantsStream) {
     // 聚合成单个 JSON response(codex 恒为流式;此路径便于 curl 调试)
     const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
-    for await (const d of upstreamSseChunks(upstream)) {
-      const err = builder.handleChunk({ write: () => {} }, d);
-      if (err?.error) break;
+    const sink = { write: () => {} };
+    let streamError = null;
+    for await (const d of upstreamSseChunks(upstream, signal)) {
+      const err = builder.handleChunk(sink, d);
+      if (err?.error) { streamError = err.error; break; }
     }
-    builder.finishAll(res, 'completed');
-    res.writeHead(200, { 'content-type': 'application/json' });
-    res.end(JSON.stringify(builder.responsePayload('completed')));
+    builder.finishAll(sink);
+    const status = streamError ? 'failed' : builder.finish === 'length' ? 'incomplete' : 'completed';
+    json(res, streamError ? 502 : 200, builder.responsePayload(status, {
+      error: streamError,
+      incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
+    }));
     return;
   }
 
@@ -536,7 +548,7 @@ async function handleResponses(req, res, wireModel, body) {
   sseWrite(res, 'response.in_progress', { response: builder.responsePayload('in_progress') });
 
   let streamError = null;
-  for await (const d of upstreamSseChunks(upstream)) {
+  for await (const d of upstreamSseChunks(upstream, signal)) {
     const err = builder.handleChunk(res, d);
     if (err?.error) { streamError = err.error; break; }
   }
@@ -553,35 +565,47 @@ async function handleResponses(req, res, wireModel, body) {
   res.end();
 }
 
-async function* upstreamSseChunks(upstream) {
+async function* upstreamSseChunks(upstream, signal) {
   const reader = upstream.body.getReader();
   const decoder = new TextDecoder();
   let buf = '';
-  while (true) {
-    let step;
-    try {
-      step = await reader.read();
-    } catch (error) {
-      // 上游连接中途断掉(端点重启 / 网关掐断 / 客户端取消):这里必须自己咽掉。
-      // 异常一旦从 handleMessages 的 async 函数里逃出去就是 unhandledRejection,
-      // Node 22 默认直接结束进程 —— 一个请求出错会把整个桥(所有模型、所有会话)
-      // 一起拖死,用户侧表现为 503 connect-refused + 代理熔断。
-      // 咽掉不等于粉饰:合成一个 error 帧交回调用方,按原有错误路径收尾。
-      yield { error: { message: `upstream stream broke: ${String(error?.message ?? error)}`, type: 'upstream_broken' } };
-      return;
+  let cancellation;
+  // cancel() wakes a pending read even when the stream has not produced a frame.
+  const cancel = () => cancellation ??= reader.cancel().catch(() => {});
+  signal.addEventListener('abort', cancel, { once: true });
+  try {
+    signal.throwIfAborted();
+    while (true) {
+      let step;
+      try {
+        step = await reader.read();
+      } catch (error) {
+        signal.throwIfAborted();
+        // Upstream failures remain protocol errors, not successful empty replies.
+        yield { error: { message: `upstream stream broke: ${String(error?.message ?? error)}`, type: 'upstream_broken' } };
+        return;
+      }
+      signal.throwIfAborted();
+      const { done, value } = step;
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let nl;
+      while ((nl = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, nl).replace(/\r$/, '');
+        buf = buf.slice(nl + 1);
+        if (!line.startsWith('data:')) continue;
+        const data = line.slice(5).trim();
+        if (!data) continue;
+        if (data === '[DONE]') return;
+        signal.throwIfAborted();
+        try { yield JSON.parse(data); } catch { /* 跳过坏帧 */ }
+      }
     }
-    const { done, value } = step;
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    let nl;
-    while ((nl = buf.indexOf('\n')) >= 0) {
-      const line = buf.slice(0, nl).replace(/\r$/, '');
-      buf = buf.slice(nl + 1);
-      if (!line.startsWith('data:')) continue;
-      const data = line.slice(5).trim();
-      if (!data || data === '[DONE]') continue;
-      try { yield JSON.parse(data); } catch { /* 跳过坏帧 */ }
-    }
+  } finally {
+    signal.removeEventListener('abort', cancel);
+    try { await cancel(); }
+    finally { reader.releaseLock(); }
+    signal.throwIfAborted();
   }
 }
 
@@ -598,21 +622,39 @@ async function* upstreamSseChunks(upstream) {
 // 过不了门 2 —— 上游同款判定,交给停止闸的自动续跑。
 class DSMLTextFilter {
   constructor() { this.carry = ''; this.capture = ''; }
-  static strip(s, capture) {
-    return s
-      .replace(/<｜DSML｜[^>\n]{0,400}>?/g, (m) => { if (capture) capture.push(m); return ''; })
-      .replace(/｜{1,2}DSML｜{1,2}[^\n]{0,400}/g, (m) => { if (capture) capture.push(m); return ''; });
-  }
   push(s) {
     s = this.carry + s;
-    const stripped = DSMLTextFilter.strip(s, this.capture);
-    const hold = Math.max(stripped.lastIndexOf('<'), stripped.lastIndexOf('｜'));
-    if (hold >= 0 && stripped.length - hold <= 40 && !stripped.slice(hold).includes('\n')) {
-      this.carry = stripped.slice(hold);
-      return stripped.slice(0, hold);
-    }
     this.carry = '';
-    return stripped;
+    let text = '';
+    const prefixes = ['<｜DSML｜', '</｜DSML｜', '<｜｜DSML｜｜', '</｜｜DSML｜｜'];
+    while (s) {
+      const start = s.search(/<\/?｜{1,2}DSML｜{1,2}/);
+      if (start < 0) {
+        // 只暂存可能成为 DSML 标记的后缀;普通 <tag> / ｜ 文本原样通过。
+        let hold = s.length;
+        for (let i = Math.max(0, s.length - 14); i < s.length; i++) {
+          if (prefixes.some(p => p.startsWith(s.slice(i)))) { hold = i; break; }
+        }
+        text += s.slice(0, hold);
+        this.carry = s.slice(hold);
+        break;
+      }
+      text += s.slice(0, start);
+      s = s.slice(start);
+      const end = s.indexOf('>');
+      if (end < 0) { this.carry = s; break; }
+      if (/^<｜{1,2}DSML｜{1,2}tool[\s_-]*calls>$/.test(s.slice(0, end + 1))) {
+        const close = /<\/｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/.exec(s.slice(end + 1));
+        if (!close) { this.carry = s; break; }
+        const stop = end + 1 + close.index + close[0].length;
+        // capture 始终为字符串,保留整个闭合块(包括参数正文),不是零散标签。
+        this.capture += s.slice(0, stop);
+        s = s.slice(stop);
+      } else {
+        s = s.slice(end + 1); // 不完整/孤立标记只过滤,绝不合成调用。
+      }
+    }
+    return text;
   }
   flush() {
     const tail = this.carry;
@@ -644,11 +686,7 @@ function canonicalToolName(raw, declaredTools) {
   const lower = cleaned.toLowerCase();
   const exact = [...declaredTools].filter((n) => String(n).toLowerCase() === lower);
   if (exact.length === 1) return exact[0];
-  const prefixed = [...declaredTools].filter((n) => {
-    const nl = String(n).toLowerCase();
-    return nl.startsWith(lower) || lower.startsWith(nl);
-  });
-  return prefixed.length === 1 ? prefixed[0] : '';
+  return ''; // 前缀相似不等于请求声明过的工具名。
 }
 
 /**
@@ -660,32 +698,27 @@ function canonicalToolName(raw, declaredTools) {
 function recoverDSMLToolCalls(captured, declaredTools) {
   if (!captured || !declaredTools || declaredTools.size === 0) return [];
   const out = [];
-  const openRe = /<｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/g;
-  const closeRe = /<\/｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/g;
-  const opens = [...captured.matchAll(openRe)];
-  const closes = [...captured.matchAll(closeRe)];
-  // 门 1:开闭配对(开闭数量相等,逐对取块)
-  const n = Math.min(opens.length, closes.length);
-  for (let i = 0; i < n; i++) {
-    const start = opens[i].index + opens[i][0].length;
-    const end = closes[i].index;
-    if (end <= start) continue;
-    const inner = captured.slice(start, end);
-    // invoke 块:名称必须带 name="…"(门 2 前置)
+  const blockRe = /<｜{1,2}DSML｜{1,2}tool[\s_-]*calls>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}tool[\s_-]*calls>/g;
+  for (const block of captured.matchAll(blockRe)) {
     const invokeRe = /<｜{1,2}DSML｜{1,2}invoke\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}invoke>/g;
-    for (const inv of inner.matchAll(invokeRe)) {
-      // 门 2:工具名必须在本请求声明过(标记残渣先剥离再比对)
+    // 未闭合 invoke 或额外结构不能被正则跳过后当作有效调用。
+    if (block[1].replace(invokeRe, '').trim()) continue;
+    for (const inv of block[1].matchAll(invokeRe)) {
       const name = canonicalToolName(inv[1], declaredTools);
       if (name === '') continue;
-      const params = {};
-      const paramRe = /<｜{1,2}DSML｜{1,2}parameter\s+name="([^"]+)"[^>]*>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}parameter>/g;
+      const params = Object.create(null);
+      const paramRe = /<｜{1,2}DSML｜{1,2}parameter\s+name="([^"]+)"([^>]*)>([\s\S]*?)<\/｜{1,2}DSML｜{1,2}parameter>/g;
+      if (inv[2].replace(paramRe, '').trim()) continue;
+      let valid = true;
       for (const pm of inv[2].matchAll(paramRe)) {
-        try { params[pm[1]] = JSON.parse(pm[2]); } catch { params[pm[1]] = pm[2]; }
+        if (/\bstring="true"/.test(pm[2])) params[pm[1]] = pm[3];
+        else {
+          try { params[pm[1]] = JSON.parse(pm[3]); }
+          catch { valid = false; break; }
+        }
       }
-      // 门 4:参数对象可序列化(序列化失败即回滚)
-      let args;
-      try { args = JSON.stringify(params); } catch { continue; }
-      out.push({ id: `dsml_${out.length}_${Date.now().toString(36)}`, name, arguments: args });
+      if (!valid) continue;
+      out.push({ id: `dsml_${out.length}_${Date.now().toString(36)}`, name, arguments: JSON.stringify(params) });
     }
   }
   return out;
@@ -789,22 +822,21 @@ const ANTHROPIC_STOP = { tool_calls: 'tool_use', stop: 'end_turn', length: 'max_
  * (role 可能是 user,也可能是 2.1.316 之后的 system)。看到它就说明上一次
  * 上游给了"零工具调用的 end_turn",这一次必须逼它真动手。
  *
- * 只看最后三条:更早的提示属于历史,不能一直逼。
+ * 工具工作或新真人输入会结束这次续跑约束;普通 assistant/system 消息不会。
  */
 function recentlyStalled(messages) {
   const arr = Array.isArray(messages) ? messages : [];
-  const tail = arr.slice(-3);
-  return tail.some((m) => {
-    if (!m || (m.role !== 'user' && m.role !== 'system')) return false;
-    const text = typeof m.content === 'string'
-      ? m.content
-      : (Array.isArray(m.content) ? m.content.filter(p => p?.type === 'text').map(p => p.text ?? '').join('') : '');
-    return text.includes('Stop hook feedback');
-  });
-}
-
-function safeJsonParse(s) {
-  try { return JSON.parse(s); } catch { return {}; }
+  for (let i = arr.length - 1; i >= 0; i--) {
+    const m = arr[i];
+    if (!m) continue;
+    const parts = Array.isArray(m.content) ? m.content : [];
+    if (m.role === 'assistant' && parts.some(p => p?.type === 'tool_use')) return false;
+    if (m.role === 'user' && parts.some(p => p?.type === 'tool_result')) return false;
+    if (m.role !== 'user' && m.role !== 'system') continue;
+    if (anthropicTextOf(m.content).includes('Stop hook feedback')) return true;
+    if (m.role === 'user' && !m.isMeta) return false;
+  }
+  return false;
 }
 
 // ---- 输出预算 ----
@@ -828,12 +860,12 @@ class AnthropicStreamBuilder {
     this.declaredTools = declaredTools;
     this.dsml = new DSMLTextFilter();
     this.blockIndex = 0;
-    this.cur = null;   // {kind:'text'|'thinking'|'tool', index, text, args, id, name}
+    this.cur = null;   // {kind:'text'|'thinking', index, text}
     this.blocks = [];
     this.finish = null;
     this.usage = null;
     this.estInput = estInput;
-    /** 上游 tool_call 增量先到的 id/参数,按上游 index 存,等 name 到达再开块。 */
+    /** 工具按上游 index 聚合到流结束;index 切换不代表参数已结束。 */
     this.pendingTools = new Map();
   }
 
@@ -856,36 +888,23 @@ class AnthropicStreamBuilder {
         this.cur.text += tail;
         sseWrite(res, 'content_block_delta', { index: i, delta: { type: 'text_delta', text: tail } });
       }
-      // DSML 四道门恢复:剔除的内容里若有结构完好的 tool_calls 块,转成可执行调用
-      const recovered = recoverDSMLToolCalls(this.dsml.capture, this.declaredTools);
-      noteUnrecoveredDSML(this.dsml.capture, recovered);
-      for (const call of recovered) {
-        this.openBlock(res, 'tool', { id: call.id, name: call.name });
-        this.cur.args = call.arguments;
-        this.closeBlock(res);
-      }
-      this.dsml.capture = '';
       sseWrite(res, 'content_block_stop', { index: i });
       this.blocks.push({ type: 'text', text: this.cur.text });
     } else if (this.cur.kind === 'thinking') {
       sseWrite(res, 'content_block_stop', { index: i });
       this.blocks.push({ type: 'thinking', thinking: this.cur.text, signature: '' });
-    } else if (this.cur.kind === 'tool') {
-      sseWrite(res, 'content_block_stop', { index: i });
-      this.blocks.push({ type: 'tool_use', id: this.cur.id, name: this.cur.name, input: safeJsonParse(this.cur.args || '{}') });
     }
     this.cur = null;
     this.blockIndex = i + 1;
   }
 
-  openBlock(res, kind, extra = {}) {
+  openBlock(res, kind) {
     this.closeBlock(res);
     const idx = this.blockIndex;
     const block = kind === 'text' ? { type: 'text', text: '' }
-      : kind === 'thinking' ? { type: 'thinking', thinking: '', signature: '' }
-        : { type: 'tool_use', id: extra.id, name: extra.name, input: {} };
+      : { type: 'thinking', thinking: '', signature: '' };
     sseWrite(res, 'content_block_start', { index: idx, content_block: block });
-    this.cur = { kind, index: idx, text: '', args: '', ...extra };
+    this.cur = { kind, index: idx, text: '' };
   }
 
   handleChunk(res, d) {
@@ -916,42 +935,48 @@ class AnthropicStreamBuilder {
     if (Array.isArray(delta.tool_calls)) {
       for (const tc of delta.tool_calls) {
         const idx = tc.index ?? 0;
-        const isCur = this.cur?.kind === 'tool' && this.cur.upIdx === idx;
-        if (!isCur) {
-          // 名字没到之前先把 id / 参数攒起来。旧实现直接 `continue` 丢掉这一段,
-          // 结果:名字晚一帧到达时开的是空参数块(工具用错参数执行),名字压根不来
-          // 时整条调用蒸发,只剩一个 stop_reason=tool_use 的空回合 ——
-          // 宿主既没有工具可执行,也看不到正文,于是"任务没结束就停住"。
-          const buf = this.pendingTools.get(idx) ?? { id: '', args: '' };
-          if (tc.id) buf.id = tc.id;
-          if (tc.function?.arguments) buf.args += tc.function.arguments;
-          this.pendingTools.set(idx, buf);
-          if (!tc.function?.name) continue; // 等名字
-          this.closeBlock(res);
-          this.openBlock(res, 'tool', {
-            upIdx: idx,
-            id: buf.id || `call_${idx}_${Date.now().toString(36)}`,
-            name: tc.function.name,
-          });
-          if (buf.args) {
-            this.cur.args += buf.args;
-            sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'input_json_delta', partial_json: buf.args } });
-          }
-          this.pendingTools.delete(idx);
-          continue;
-        }
-        if (tc.id) this.cur.id = tc.id;
-        if (tc.function?.arguments) {
-          this.cur.args += tc.function.arguments;
-          sseWrite(res, 'content_block_delta', { index: this.cur.index, delta: { type: 'input_json_delta', partial_json: tc.function.arguments } });
-        }
+        const buf = this.pendingTools.get(idx) ?? { id: '', name: '', args: '' };
+        if (tc.id) buf.id = tc.id;
+        if (tc.function?.name) buf.name += tc.function.name;
+        if (tc.function?.arguments) buf.args += tc.function.arguments;
+        this.pendingTools.set(idx, buf);
       }
     }
     return null;
   }
 
-  finishAll(res) {
+  finishBlocks(res) {
     this.closeBlock(res);
+    const recovered = recoverDSMLToolCalls(this.dsml.capture, this.declaredTools);
+    noteUnrecoveredDSML(this.dsml.capture, recovered);
+    this.dsml.capture = ''; // 先消费捕获,再输出;不再从 closeBlock 重入恢复。
+    const calls = [...this.pendingTools.entries()].sort((a, b) => a[0] - b[0])
+      .filter(([, call]) => call.name)
+      .map(([idx, call]) => ({ ...call, id: call.id || `call_${idx}_${Date.now().toString(36)}` }));
+    calls.push(...recovered.map(call => ({ ...call, args: call.arguments })));
+    // 所有参数先校验,再发任何可执行块,不把损坏的 JSON 伪装成 {}。
+    for (const call of calls) {
+      try {
+        call.input = JSON.parse(call.args || '{}');
+        if (!call.input || typeof call.input !== 'object' || Array.isArray(call.input)) throw new Error('expected an object');
+      } catch {
+        return { message: `Invalid tool arguments for ${call.name}` };
+      }
+    }
+    this.pendingTools.clear();
+    for (const call of calls) {
+      const index = this.blockIndex++;
+      sseWrite(res, 'content_block_start', { index, content_block: { type: 'tool_use', id: call.id, name: call.name, input: {} } });
+      sseWrite(res, 'content_block_delta', { index, delta: { type: 'input_json_delta', partial_json: call.args || '{}' } });
+      sseWrite(res, 'content_block_stop', { index });
+      this.blocks.push({ type: 'tool_use', id: call.id, name: call.name, input: call.input });
+    }
+    return null;
+  }
+
+  finishAll(res) {
+    const error = this.finishBlocks(res);
+    if (error) return error;
     const stopReason = this.resolveStop();
     sseWrite(res, 'message_delta', {
       delta: { stop_reason: stopReason, stop_sequence: null },
@@ -997,7 +1022,7 @@ function estimateTokens(body) {
   return Math.ceil(chars / 4);
 }
 
-async function handleMessages(req, res, body) {
+async function handleMessages(req, res, body, signal) {
   const wireModel = body.model ?? '';
   const slash = wireModel.indexOf('/');
   if (slash <= 0) {
@@ -1051,18 +1076,18 @@ async function handleMessages(req, res, body) {
   if (maxOut) chatPayload.max_tokens = maxOut;
   const estInput = estimateTokens(body);
 
-  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false, noToolChoice = false) => {
+  const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
+    signal.throwIfAborted();
     const p = { ...chatPayload };
     // 每级都从原始 body 重建:billing 剥除 + 去指纹 + assistant 历史改写按当前档位重算
     p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), mutLevel), body.messages, mutLevel);
     if (noStreamOptions) delete p.stream_options;
     if (noMaxTokens) delete p.max_tokens;
-    // 400 兜底:个别通道不认 tool_choice(required),去掉后重试,别让整轮失败
-    if (noToolChoice) delete p.tool_choice;
     return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
       body: JSON.stringify(p),
+      signal,
     });
   };
 
@@ -1075,50 +1100,64 @@ async function handleMessages(req, res, body) {
   try {
     upstream = await callUpstream(0, false);
   } catch (e) {
+    signal.throwIfAborted();
     json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
     return;
   }
   if (upstream.status === 400) {
-    let errText = await upstream.text().catch(() => '');
+    let errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     if (errText.includes('11128')) {
       // 11128 同义改写梯子:level 1(措辞加强)→ level 2(中性头兜底)
       for (let level = 1; level <= 2; level++) {
         try {
           upstream = await callUpstream(level, false);
         } catch (e) {
+          signal.throwIfAborted();
           json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
           return;
         }
         if (upstream.status !== 400) break;
-        errText = await upstream.text().catch(() => '');
+        errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
         if (!errText.includes('11128')) break;
       }
-    } else {
-      // 非 11128 的 400:个别通道不认 stream_options / max_tokens / tool_choice,
-      // 全去掉后重试一次(宁可少一点约束,也别让整轮直接失败)
+    } else if (!/tool_choice/i.test(errText) && /(?:unsupported|unknown|unrecognized)[^\n]*(?:stream_options|max_tokens)|(?:stream_options|max_tokens)[^\n]*(?:not supported|unsupported|unknown|unrecognized)/i.test(errText)) {
+      // 只对明确不支持的兼容字段重试,绝不删除 tool_choice。
       try {
-        upstream = await callUpstream(0, true, true, true);
+        upstream = await callUpstream(0, true, true);
       } catch (e) {
+        signal.throwIfAborted();
         json(res, 502, { type: 'error', error: { type: 'api_error', message: `${t.tool} 端点连接失败:${e.cause?.code ?? e.message}` } });
         return;
       }
+      if (!upstream.ok) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     }
     if (!upstream.ok) {
-      const text = await upstream.text().catch(() => '');
-      json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: text.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
+      if (!upstream.bodyUsed) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
+      json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
       return;
     }
   }
   if (!upstream.ok) {
-    const text = await upstream.text().catch(() => '');
+    const text = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
     json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: text.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
     return;
   }
 
   const builder = new AnthropicStreamBuilder(wireModel, estInput, new Set((tools ?? []).map(t2 => t2.function.name)));
   if (body.stream !== true) {
-    for await (const d of upstreamSseChunks(upstream)) { builder.handleChunk({ write: () => {} }, d); }
-    builder.closeBlock({ write: () => {} });
+    const sink = { write: () => {} };
+    for await (const d of upstreamSseChunks(upstream, signal)) {
+      const error = builder.handleChunk(sink, d);
+      if (error) {
+        json(res, 502, { type: 'error', error: { type: 'api_error', message: String(error.message ?? JSON.stringify(error)).slice(0, 500) } });
+        return;
+      }
+    }
+    const error = builder.finishBlocks(sink);
+    if (error) {
+      json(res, 502, { type: 'error', error: { type: 'api_error', message: error.message } });
+      return;
+    }
     const stopReason = builder.resolveStop();
     json(res, 200, {
       id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: wireModel,
@@ -1131,14 +1170,13 @@ async function handleMessages(req, res, body) {
   res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
   builder.msgStart(res);
   let streamError = null;
-  for await (const d of upstreamSseChunks(upstream)) {
+  for await (const d of upstreamSseChunks(upstream, signal)) {
     const err = builder.handleChunk(res, d);
     if (err) { streamError = err; break; }
   }
+  if (!streamError) streamError = builder.finishAll(res);
   if (streamError) {
     sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: String(streamError.message ?? JSON.stringify(streamError)).slice(0, 500) } });
-  } else {
-    builder.finishAll(res);
   }
   sseDone(res);
   res.end();
@@ -1175,8 +1213,26 @@ async function readBody(req) {
 }
 
 async function handle(req, res) {
+  if (!hostIsLoopback(req.headers.host)) {
+    json(res, 403, { error: { type: 'host_not_allowed', message: 'Host header must name the loopback interface' } });
+    return;
+  }
+  if (!originIsLoopback(req.headers.origin)) {
+    json(res, 403, { error: { type: 'origin_not_allowed', message: 'Origin must be a loopback origin' } });
+    return;
+  }
+  const contentType = req.headers['content-type'];
+  if (req.method === 'POST' && !(typeof contentType === 'string' && contentType.trim().toLowerCase().startsWith('application/json'))) {
+    json(res, 415, { error: { type: 'unsupported_media_type', message: 'Content-Type must be application/json' } });
+    return;
+  }
   const url = new URL(req.url, 'http://127.0.0.1');
   const p = url.pathname.replace(/\/+$/, '') || '/';
+  const controller = new AbortController();
+  const { signal } = controller;
+  const onClose = () => { if (!res.writableFinished) controller.abort(); };
+  res.on('close', onClose);
+  if (res.destroyed) onClose();
   try {
     if (req.method === 'GET' && (p === '/healthz' || p === '/health')) {
       const tools = {};
@@ -1193,12 +1249,12 @@ async function handle(req, res) {
     }
     if (req.method === 'POST' && (p === '/v1/responses' || p === '/responses')) {
       const body = await readBody(req);
-      await handleResponses(req, res, body.model ?? '', body);
+      await handleResponses(req, res, body.model ?? '', body, signal);
       return;
     }
     if (req.method === 'POST' && (p === '/v1/messages' || p === '/messages')) {
       const body = await readBody(req);
-      await handleMessages(req, res, body);
+      await handleMessages(req, res, body, signal);
       return;
     }
     if (req.method === 'POST' && (p === '/v1/messages/count_tokens' || p === '/messages/count_tokens')) {
@@ -1210,9 +1266,12 @@ async function handle(req, res) {
     }
     json(res, 404, { error: { message: `桥支持:GET /healthz、GET /v1/models、POST /v1/responses(Codex)、POST /v1/messages 与 /v1/messages/count_tokens(Claude Code)(收到 ${req.method} ${p})` } });
   } catch (e) {
+    if (signal.aborted) return;
     await log(`handler error: ${e.stack ?? e.message}`);
     if (!res.headersSent) json(res, 500, { error: { message: e.message } });
     else res.end();
+  } finally {
+    res.removeListener('close', onClose);
   }
 }
 

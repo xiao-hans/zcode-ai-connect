@@ -137,36 +137,39 @@ function hooksBlockYaml() {
 
 // --- collect rosters --------------------------------------------------------
 
-const targets = options.only
-  ? SERVICES.filter((s) => s.id === options.only || s.tool === options.only)
-  : SERVICES;
-if (targets.length === 0) {
-  console.error(`[sync-hermes] unknown --only target: ${options.only}`);
-  console.error(`  known ids: ${SERVICES.map((s) => s.id).join(', ')}`);
-  process.exit(1);
-}
-
 const collected = [];
-for (const service of targets) {
-  if (options.ensure) {
-    const started = await ensureService(service);
-    if (options.verbose) {
-      console.log(`  ${service.id.padEnd(13)} :${started.port}  ${started.up ? 'up  ' : 'DOWN'}  ${started.action}`);
+// Removal depends only on local managed state, even when --ensure is supplied.
+if (!options.remove) {
+  const targets = options.only
+    ? SERVICES.filter((s) => s.id === options.only || s.tool === options.only)
+    : SERVICES;
+  if (targets.length === 0) {
+    console.error(`[sync-hermes] unknown --only target: ${options.only}`);
+    console.error(`  known ids: ${SERVICES.map((s) => s.id).join(', ')}`);
+    process.exit(1);
+  }
+
+  for (const service of targets) {
+    if (options.ensure) {
+      const started = await ensureService(service);
+      if (options.verbose) {
+        console.log(`  ${service.id.padEnd(13)} :${started.port}  ${started.up ? 'up  ' : 'DOWN'}  ${started.action}`);
+      }
+    }
+    try {
+      const roster = await loadRoster(service);
+      const models = roster.rows.map((row) => describe(row, { assumeReasoning: !options.noReasoning }));
+      collected.push({ service, roster, models });
+    } catch (error) {
+      console.log(`  ${service.id.padEnd(13)} skipped — ${String(error.message ?? error).slice(0, 90)}`);
     }
   }
-  try {
-    const roster = await loadRoster(service);
-    const models = roster.rows.map((row) => describe(row, { assumeReasoning: !options.noReasoning }));
-    collected.push({ service, roster, models });
-  } catch (error) {
-    console.log(`  ${service.id.padEnd(13)} skipped — ${String(error.message ?? error).slice(0, 90)}`);
-  }
-}
 
-if (collected.length === 0) {
-  console.error(`[sync-hermes] no endpoint answered; nothing written to ${CONFIG_PATH}`);
-  console.error(`  Start them first, or re-run with --ensure.`);
-  process.exit(1);
+  if (collected.length === 0) {
+    console.error(`[sync-hermes] no endpoint answered; nothing written to ${CONFIG_PATH}`);
+    console.error(`  Start them first, or re-run with --ensure.`);
+    process.exit(1);
+  }
 }
 
 // --- patch ------------------------------------------------------------------
@@ -263,16 +266,18 @@ if (text === original) {
 
 // --- report -----------------------------------------------------------------
 
-console.log('');
-for (const entry of collected) {
-  console.log(`${entry.service.id.padEnd(13)} ${String(entry.models.length).padStart(3)} models @ ${entry.roster.baseUrl}`);
+if (!options.remove) {
+  console.log('');
+  for (const entry of collected) {
+    console.log(`${entry.service.id.padEnd(13)} ${String(entry.models.length).padStart(3)} models @ ${entry.roster.baseUrl}`);
+  }
+  console.log('');
+  console.log('选择模型: hermes 里 `/model`,或直接');
+  console.log(`  ${CONFIG_PATH.replaceAll('\\', '/')}  -> model.provider: ${collected[0].service.id}`);
+  console.log(`  hermes --provider ${collected[0].service.id} --model <id>`);
+  console.log('');
+  console.log('Token 轮换(报 401)或上游名册变化时,重跑本脚本即可。');
 }
-console.log('');
-console.log('选择模型: hermes 里 `/model`,或直接');
-console.log(`  ${CONFIG_PATH.replaceAll('\\', '/')}  -> model.provider: ${collected[0].service.id}`);
-console.log(`  hermes --provider ${collected[0].service.id} --model <id>`);
-console.log('');
-console.log('Token 轮换(报 401)或上游名册变化时,重跑本脚本即可。');
 
 if (options.installHooks && !options.remove) {
   console.log('');
@@ -285,5 +290,5 @@ if (options.remove) {
   console.log('');
   console.log(`已移除 ${CONFIG_PATH} 中的 ${MARKER} 托管块${options.dryRun ? ' (--dry-run: 未写盘)' : ''}`);
   console.log(`  suite root: ${SUITE_ROOT}`);
-  console.log(`  config:     ${dirname(CONFIG_PATH)}`);
+  console.log(`  config:     ${pathDirname(CONFIG_PATH)}`);
 }

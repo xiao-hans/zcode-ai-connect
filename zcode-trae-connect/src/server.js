@@ -114,6 +114,50 @@ function bearerOk(req, expected) {
   return timingSafeEqual(a, b)
 }
 
+/** Own the reader: abort must wake a pending read even if the source ignores the signal. */
+async function* readUpstream(body, signal) {
+  const reader = body.getReader()
+  let done = false
+  let cancellation
+  // Abort and early exit share one cancellation; cleanup must not mask a read failure.
+  const cancel = () => (cancellation ??= reader.cancel(signal.reason).catch(() => {}))
+  signal.addEventListener('abort', cancel, { once: true })
+  try {
+    if (signal.aborted) cancel()
+    while (!signal.aborted) {
+      const next = await reader.read()
+      done = next.done
+      if (done) break
+      yield next.value
+    }
+  } finally {
+    signal.removeEventListener('abort', cancel)
+    try {
+      if (cancellation !== undefined) await cancellation
+      else if (!done) await cancel()
+    } finally {
+      reader.releaseLock()
+    }
+  }
+}
+
+/** Decode incrementally so protocol termination does not have to wait for transport EOF. */
+async function* readUpstreamLines(body, signal) {
+  const decoder = new TextDecoder()
+  let pending = ''
+  for await (const value of readUpstream(body, signal)) {
+    pending += decoder.decode(value, { stream: true })
+    let newline
+    while ((newline = pending.indexOf('\n')) !== -1) {
+      const line = pending.slice(0, newline)
+      pending = pending.slice(newline + 1)
+      yield line
+    }
+  }
+  pending += decoder.decode()
+  if (pending !== '') yield pending
+}
+
 /**
  * Buffer an upstream SSE stream into one non-streaming completion.
  *
@@ -121,26 +165,27 @@ function bearerOk(req, expected) {
  * single JSON answer is served by consuming the stream here and reassembling
  * it. Content and reasoning are merged, matching the OpenAI chunking shape.
  */
-async function collectCompletion(body, model) {
-  const text = await new Response(body).text()
+async function collectCompletion(body, model, signal) {
   let content = ''
   let reasoning = ''
   let finishReason = 'stop'
   let usage
-  const toolCalls = []
+  const toolCalls = new Map()
   let id = `chatcmpl-${Date.now()}`
 
-  for (const line of text.split('\n')) {
+  for await (const line of readUpstreamLines(body, signal)) {
     const trimmed = line.trim()
     if (!trimmed.startsWith('data:')) continue
     const payload = trimmed.slice(5).trim()
-    if (payload === '' || payload === '[DONE]') continue
+    if (payload === '[DONE]') break
+    if (payload === '') continue
     let chunk
     try {
       chunk = JSON.parse(payload)
     } catch {
       continue
     }
+    if (chunk['error'] !== undefined && chunk['error'] !== null) return { error: chunk['error'] }
     if (typeof chunk['id'] === 'string' && chunk['id'] !== '') id = chunk['id']
     if (chunk['usage'] !== undefined && chunk['usage'] !== null) usage = chunk['usage']
     const choice = Array.isArray(chunk['choices']) ? chunk['choices'][0] : undefined
@@ -152,16 +197,30 @@ async function collectCompletion(body, model) {
     if (typeof delta !== 'object' || delta === null) continue
     if (typeof delta['content'] === 'string') content += delta['content']
     if (typeof delta['reasoning_content'] === 'string') reasoning += delta['reasoning_content']
-    if (Array.isArray(delta['tool_calls'])) toolCalls.push(...delta['tool_calls'])
+    if (Array.isArray(delta['tool_calls'])) {
+      for (const call of delta['tool_calls']) {
+        const index = call.index ?? 0
+        const existing = toolCalls.get(index) ?? { id: '', name: '', arguments: '' }
+        if (call.id) existing.id = call.id
+        if (call.function?.name) existing.name = call.function.name
+        if (typeof call.function?.arguments === 'string') existing.arguments += call.function.arguments
+        toolCalls.set(index, existing)
+      }
+    }
   }
 
   const message = { role: 'assistant', content: content === '' ? null : content }
   if (reasoning !== '') message['reasoning_content'] = reasoning
-  if (toolCalls.length > 0) message['tool_calls'] = toolCalls.map((call, index) => ({
-    id: call.id ?? `call_${index}`,
-    type: 'function',
-    function: { name: call.function?.name ?? '', arguments: call.function?.arguments ?? '' },
-  }))
+  if (toolCalls.size > 0) {
+    message['tool_calls'] = [...toolCalls.entries()]
+      .sort((a, b) => a[0] - b[0])
+      .map(([index, call]) => ({
+        id: call.id || `call_${index}`,
+        type: 'function',
+        function: { name: call.name, arguments: call.arguments },
+      }))
+    if (finishReason === 'stop' || finishReason === 'function_call') finishReason = 'tool_calls'
+  }
   const completion = {
     id,
     object: 'chat.completion',
@@ -796,8 +855,8 @@ export function createTraeServer(options) {
       // empty body, because a silent empty completion is indistinguishable from
       // a model that chose to say nothing.
       try {
-        const completion = await collectCompletion(result.response.body, model)
-        writeJson(res, 200, completion)
+        const completion = await collectCompletion(result.response.body, model, controller.signal)
+        writeJson(res, completion.error === undefined ? 200 : 502, completion)
       } catch (error) {
         writeOpenAIError(res, 502, 'upstream_stream_failed', String(error))
       }
@@ -815,11 +874,8 @@ export function createTraeServer(options) {
       onStall: () => controller.abort('upstream stalled'),
     })
     const decoder = new TextDecoder()
-    const reader = result.response.body.getReader()
     try {
-      for (;;) {
-        const { done, value } = await reader.read()
-        if (done) break
+      for await (const value of readUpstream(result.response.body, controller.signal)) {
         if (normalizer.push(decoder.decode(value, { stream: true }))) break
       }
       normalizer.end()
@@ -831,7 +887,6 @@ export function createTraeServer(options) {
       normalizer.end()
     } finally {
       normalizer.dispose()
-      void result.response.body.cancel?.().catch?.(() => {})
     }
   }
 

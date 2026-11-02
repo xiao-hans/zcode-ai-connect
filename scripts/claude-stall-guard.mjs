@@ -120,12 +120,13 @@ function isToolResult(content) {
 }
 
 /**
- * 本轮统计:最后一条 assistant 文本、本轮工具调用数、本轮起点(真人输入)文本。
- * @returns {{toolCalls:number, lastText:string, turnStart:string}}
+ * 本轮统计:最终 assistant 的全部正文、本轮工具调用数、本轮起点(真人输入)文本。
+ * @returns {{toolCalls:number, lastText:string, turnStart:string, turnStartAt:string}}
  */
 function lastTurnStats(entries) {
   let toolCalls = 0;
   let lastText = '';
+  let foundLastAssistant = false;
   let turnStart = '';
   let turnStartAt = '';
   for (let i = entries.length - 1; i >= 0; i--) {
@@ -149,10 +150,15 @@ function lastTurnStats(entries) {
       }
     }
     if (o.type === 'assistant' && Array.isArray(o.message?.content)) {
+      if (!foundLastAssistant) {
+        // 空正文也是最终回复,不能回退到较早消息的正文。
+        lastText = o.message.content
+          .filter(p => p?.type === 'text' && typeof p.text === 'string')
+          .map(p => p.text).join('').trim();
+        foundLastAssistant = true;
+      }
       for (const p of o.message.content) {
         if (p?.type === 'tool_use') toolCalls++;
-        // 逆序回溯:第一条找到的文本就是时间上最末的 assistant 文本,不可被更早的覆盖
-        if (p?.type === 'text' && typeof p.text === 'string' && p.text.trim() && !lastText) lastText = p.text;
       }
     }
   }
@@ -160,7 +166,7 @@ function lastTurnStats(entries) {
 }
 
 /**
- * 数「上一次真正干活之后」出现过几条 Stop hook feedback。
+ * 数「本轮上一次真正干活之后」出现过几条 Stop hook feedback。
  *
  * 「真正干活」= 带 tool_use 的 assistant 消息。这是判断续跑该不该继续的唯一
  * 有意义的口径:救一次之后模型真的动了手,下一次再停就是**新的**一次停住,
@@ -174,6 +180,8 @@ function feedbacksSinceLastWork(entries) {
   let count = 0;
   for (let i = entries.length - 1; i >= 0; i--) {
     const o = entries[i];
+    if (o.type === 'user' && o.message?.content !== undefined
+      && !o.isMeta && !isToolResult(o.message.content)) break;
     if (o.type === 'assistant' && Array.isArray(o.message?.content)
       && o.message.content.some(p => p?.type === 'tool_use')) break;
     if (o.type === 'user' && o.isMeta && typeof o.message?.content === 'string'

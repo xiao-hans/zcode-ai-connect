@@ -27,6 +27,7 @@
  */
 
 import { createServer } from 'node:http'
+import { EventEmitter } from 'node:events'
 import { Readable } from 'node:stream'
 
 import { createChatShimHandler } from '../vendor/lib/chat-shim.js'
@@ -72,17 +73,21 @@ function readBody(req) {
   })
 }
 
-/**
- * Minimal response sink for the non-streaming path. The shim handler only
- * touches `writeHead`, `write`, `end`, `on('close', …)` and `writableEnded`;
- * a client disconnect during a non-streaming call just means nobody reads the
- * capture, so the close listener is recorded and never fired.
- */
-class CaptureResponse {
-  constructor() {
+/** Capture SSE while preserving the real response's client-disconnect lifecycle. */
+class CaptureResponse extends EventEmitter {
+  constructor(response) {
+    super()
     this.status = 0
     this.body = ''
     this.writableEnded = false
+    this.response = response
+    this.clientGone = response.destroyed
+    this.onClose = () => {
+      if (response.writableEnded) return
+      this.clientGone = true
+      this.emit('close')
+    }
+    response.on('close', this.onClose)
   }
 
   writeHead(status) {
@@ -91,16 +96,28 @@ class CaptureResponse {
   }
 
   write(chunk) {
+    if (this.clientGone || this.writableEnded) return false
     this.body += typeof chunk === 'string' ? chunk : String(chunk)
     return true
   }
 
   end(chunk) {
-    if (chunk !== undefined) this.body += typeof chunk === 'string' ? chunk : String(chunk)
+    if (chunk !== undefined) this.write(chunk)
     this.writableEnded = true
+    return this
   }
 
-  on() {}
+  on(event, listener) {
+    super.on(event, listener)
+    // The shim subscribes only after upstream headers; replay an earlier close.
+    if (event === 'close' && this.clientGone) listener.call(this)
+    return this
+  }
+
+  dispose() {
+    this.response.off('close', this.onClose)
+    this.removeAllListeners()
+  }
 }
 
 /**
@@ -275,8 +292,13 @@ export function createQwenworkServer(options) {
         return
       }
 
-      const captured = new CaptureResponse()
-      await chatHandler(replay, captured)
+      const captured = new CaptureResponse(res)
+      try {
+        await chatHandler(replay, captured)
+      } finally {
+        captured.dispose()
+      }
+      if (captured.clientGone || res.destroyed) return
       const result = collectCapturedCompletion(captured, model)
       if (result.ok) writeJson(res, 200, result.completion)
       else writeJson(res, result.status, { error: result.error })

@@ -78,31 +78,25 @@ export function revokeHooks(homeDir, commands, { dryRun = false } = {}) {
  */
 export function ensureNoProxy(homeDir, { dryRun = false } = {}) {
   const path = join(homeDir, '.env');
+  const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
+  const region = managedEnvRegion(text);
+  const unmanaged = region ? text.slice(0, region.start) + text.slice(region.end) : text;
+  // Let python-dotenv resolve effective values (quotes, comments, duplicates and
+  // interpolation). Put this last, and never feed a previous managed value back in.
   const body = [
     ENV_MARKER_START,
-    `NO_PROXY=${LOOPBACK}`,
-    `no_proxy=${LOOPBACK}`,
+    `NO_PROXY="\${NO_PROXY},\${no_proxy},${LOOPBACK}"`,
+    'no_proxy="${NO_PROXY}"',
     ENV_MARKER_END,
+    '',
   ].join('\n');
-
-  const text = existsSync(path) ? readFileSync(path, 'utf8') : '';
-  const start = text.indexOf(ENV_MARKER_START);
-  const end = text.indexOf(ENV_MARKER_END);
-
-  if (start !== -1 && end !== -1 && end > start) {
-    const current = text.slice(start, end + ENV_MARKER_END.length);
-    if (current === body) return 'present';
-    if (dryRun) return 'skipped-dry-run';
-    copyFileSync(path, `${path}.bak`);
-    writeFileSync(path, text.slice(0, start) + body + text.slice(end + ENV_MARKER_END.length), 'utf8');
-    return 'updated';
-  }
-
+  const separator = unmanaged === '' || unmanaged.endsWith('\n') ? '' : '\n';
+  const next = `${unmanaged}${separator}${body}`;
+  if (next === text) return 'present';
   if (dryRun) return 'skipped-dry-run';
   if (existsSync(path)) copyFileSync(path, `${path}.bak`);
-  const prefix = text === '' ? '' : (text.endsWith('\n') ? '\n' : '\n\n');
-  writeFileSync(path, `${text}${prefix}${body}\n`, 'utf8');
-  return 'wrote';
+  writeFileSync(path, next, 'utf8');
+  return region ? 'updated' : 'wrote';
 }
 
 /** Remove the managed NO_PROXY block (used by --remove). */
@@ -110,13 +104,19 @@ export function removeNoProxy(homeDir, { dryRun = false } = {}) {
   const path = join(homeDir, '.env');
   if (!existsSync(path)) return false;
   const text = readFileSync(path, 'utf8');
-  const start = text.indexOf(ENV_MARKER_START);
-  const end = text.indexOf(ENV_MARKER_END);
-  if (start === -1 || end === -1) return false;
+  const region = managedEnvRegion(text);
+  if (!region) return false;
   if (dryRun) return true;
   copyFileSync(path, `${path}.bak`);
-  const before = text.slice(0, start).replace(/\n+$/, '\n');
-  const after = text.slice(end + ENV_MARKER_END.length).replace(/^\n+/, '');
-  writeFileSync(path, `${before}${after}`, 'utf8');
+  writeFileSync(path, text.slice(0, region.start) + text.slice(region.end), 'utf8');
   return true;
+}
+
+function managedEnvRegion(text) {
+  const start = new RegExp(`^${ENV_MARKER_START}\\r?$`, 'm').exec(text);
+  if (!start) return null;
+  const tail = text.slice(start.index + start[0].length);
+  const end = new RegExp(`^${ENV_MARKER_END}(?:\\r?\\n|$)`, 'm').exec(tail);
+  if (!end) return null;
+  return { start: start.index, end: start.index + start[0].length + end.index + end[0].length };
 }

@@ -625,375 +625,376 @@ export function createChatShimHandler(deps) {
     // 首次使用，导致 TDZ 错误 `Cannot access 'upstreamAbort' before initialization`，
     // 使**所有**请求都直接 502。
     const upstreamAbort = new AbortController();
-    let upstream;
-    try {
-      // tools 必须一并透传：否则模型收不到工具 schema，会编造自由文本格式。
-      // 1.2.0 的 model_config 需要 is_vl / is_reasoning（规格 §3.6），取值来自
-      // models.js 的静态目录声明（插件侧不动态拉 catalog）。
-      const capabilities = resolveModelCapabilities(modelKey);
-      const bodyJson = buildInferBody({
-        messages,
-        modelKey,
-        sessionId,
-        tools: body?.tools,
-        isVl: capabilities.isVl,
-        isReasoning: capabilities.isReasoning,
-        // 图片经 chat_context.imageUrls 送上游。
-        // ⚠️ t7 实测：该字段**无实际作用**，真正生效的通道是 messages[].content[]
-        // 里的 {type:"image_url",image_url:{url}}（由 toMultimodalContent 产出）。
-        // 此处保留仅为「只增不减」既有行为，删除它不属本任务范围。
-        imageUrls: collectImageUrls(body),
-      });
-      upstream = await fetchUpstreamWithRetry(session, bodyJson, modelKey, log, {
-        signal: upstreamAbort.signal,
-        ...(headerTimeoutMs === undefined ? {} : { headerTimeoutMs }),
-      });
-      trace('upstream-headers', { ms: Date.now() - reqT0, status: upstream.status, model: modelKey });
-    } catch (error) {
-      trace('upstream-fail', { ms: Date.now() - reqT0, error: safeMessage(error) });
-      log.warn?.('dsh-qwen-connect: upstream request failed', safeMessage(error));
-      jsonError(res, 502, safeMessage(error), 'api_error');
-      return;
-    }
-
-    if (!upstream.ok) {
-      const text = await upstream.text().catch(() => '');
-      trace('upstream-rejected', { ms: Date.now() - reqT0, status: upstream.status });
-      log.warn?.('dsh-qwen-connect: upstream rejected', upstream.status);
-      jsonError(res, upstream.status, safeMessage(text) || 'upstream error', 'api_error');
-      return;
-    }
-
-    // ---- 解析上游 SSE 并转成 OpenAI SSE ------------------------------
-    res.writeHead(200, {
-      'Content-Type': 'text/event-stream; charset=utf-8',
-      'Cache-Control': 'no-store',
-      Connection: 'keep-alive',
-      // 明确禁止缓冲，保证真流式
-      'X-Accel-Buffering': 'no',
-    });
-
-    const chunkId = `chatcmpl-${Date.now().toString(36)}`;
-    const created = Math.floor(Date.now() / 1000);
-    const parser = new SseParser();
-    let finished = false;
     let clientGone = false;
-    /** 上游在流中途报错；置位后不得再补正常收尾帧，否则会掩盖真实错误。 */
-    let errored = false;
-    /** 上游末帧给出的 token 统计（OpenAI 形态）；拿不到保持 null，不编造。 */
-    let usage = null;
-    // ---- 性能采样（供设置卡片展示上游速度）----
-    const startedAt = Date.now();
-    /** 首个**正文**内容到达时刻；null 表示还没有正文。 */
-    let firstContentAt = null;
-    /** 累加的正文长度（不含思考链）——速率只看正文，否则思考会虚高。 */
-    let outputChars = 0;
-    /** 累加的思考链长度：只思考不回答的回合要靠它区分「有产出」与「空回合」。 */
-    let thinkingChars = 0;
-    /** 本回合是否已下发工具调用分片（有它就算有产出）。 */
-    let toolCallsEmitted = false;
-    // ---- 「200 之后的静默」放弃计时器 ----
-    // 上游拿到 200 后若在 FIRST_CONTENT_TIMEOUT_MS 内**任何帧都没发**
-    // （reasoning 或 content 都算帧），就视为排队失败，主动放弃并报错。
-    // 见 FIRST_CONTENT_TIMEOUT_MS 的文档（trace 实测的排队态卡死模式）。
-
-    res.on('close', () => {
+    const onClientClose = () => {
+      if (res.writableEnded) return;
       clientGone = true;
-      // 客户端走了就没有下游了，及时中断上游，避免连接与 token 被白白消耗。
-      try {
-        upstreamAbort.abort('client disconnected');
-      } catch {
-        /* 已中止 */
-      }
-    });
-
-    /** 写一块；客户端断开后不再写。 */
-    const write = (text) => {
-      if (clientGone || res.writableEnded) return false;
-      try {
-        res.write(text);
-        return true;
-      } catch {
-        clientGone = true;
-        return false;
-      }
+      upstreamAbort.abort();
     };
+    // fetch 尚未返回响应头时也必须能取消；正常完成不能被 close 误判。
+    try {
+      res.on('close', onClientClose);
+      let upstream;
+      try {
+        // tools 必须一并透传：否则模型收不到工具 schema，会编造自由文本格式。
+        // 1.2.0 的 model_config 需要 is_vl / is_reasoning（规格 §3.6），取值来自
+        // models.js 的静态目录声明（插件侧不动态拉 catalog）。
+        const capabilities = resolveModelCapabilities(modelKey);
+        const bodyJson = buildInferBody({
+          messages,
+          modelKey,
+          sessionId,
+          tools: body?.tools,
+          isVl: capabilities.isVl,
+          isReasoning: capabilities.isReasoning,
+          // 图片经 chat_context.imageUrls 送上游。
+          // ⚠️ t7 实测：该字段**无实际作用**，真正生效的通道是 messages[].content[]
+          // 里的 {type:"image_url",image_url:{url}}（由 toMultimodalContent 产出）。
+          // 此处保留仅为「只增不减」既有行为，删除它不属本任务范围。
+          imageUrls: collectImageUrls(body),
+        });
+        upstream = await fetchUpstreamWithRetry(session, bodyJson, modelKey, log, {
+          signal: upstreamAbort.signal,
+          ...(headerTimeoutMs === undefined ? {} : { headerTimeoutMs }),
+        });
+        trace('upstream-headers', { ms: Date.now() - reqT0, status: upstream.status, model: modelKey });
+      } catch (error) {
+        trace('upstream-fail', { ms: Date.now() - reqT0, error: safeMessage(error) });
+        log.warn?.('dsh-qwen-connect: upstream request failed', safeMessage(error));
+        jsonError(res, 502, safeMessage(error), 'api_error');
+        return;
+      }
 
-    /** 处理解析出的负载；返回 false 表示应停止读流。 */
-    const handlePayload = (payload) => {
-      const frame = parseQwenWorkFrame(payload);
-      if (frame.kind === 'skip') return true;
-      if (frame.kind === 'error') {
-        // 上游在流中途报告错误：以 OpenAI 的 error 帧表达。
-        //
-        // ⚠️ 置 `errored`，收尾时**不得**再补 `finish_reason: "stop"` + `[DONE]`。
-        // 否则下游会认为「流正常结束但内容为空」，报出 EMPTY_RESPONSE 之类
-        // 的误导性错误，把真实原因（如「该模型对当前账号不可用」）掩盖掉。
-        //
-        // ⚠️ 必须**原样保留上游的 HTTP 状态码**。上游把错误放在 HTTP 200 的
-        // SSE 流内，下游（pi-ai → DSH）从协议层拿不到任何状态码；这里若再丢掉
-        // `frame.error.status`，用户就只看到 "Model catalog unavailable" 这类
-        // 纯文本，无法区分「模型名写错了」与「上游 503，只能等」。
-        // 实测上游会用状态码表达不同语义：
-        //   403 Model is not available for this user  —— 模型不在该账号可用列表
-        //   400 Unsupported FetchKeys value           —— 请求 URL 参数不合法
-        //   503 Model catalog unavailable             —— 上游模型目录服务不可用
-        // 状态码是这三者唯一的判据，因此按 `HTTP <code>: <message>` 透传。
-        const status = frame.error.status;
-        const message =
-          typeof status === 'number' && status > 0
-            ? `HTTP ${status}: ${frame.error.message}`
-            : frame.error.message;
-        write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
-        errored = true;
-        return false;
+      if (!upstream.ok) {
+        const text = await upstream.text().catch(() => '');
+        trace('upstream-rejected', { ms: Date.now() - reqT0, status: upstream.status });
+        log.warn?.('dsh-qwen-connect: upstream rejected', upstream.status);
+        jsonError(res, upstream.status, safeMessage(text) || 'upstream error', 'api_error');
+        return;
       }
-      // 上游把 token 统计放在末帧的 raw_usage 里，且常与 finish_reason 帧分离。
-      // 先记下来，收尾时随最后一个 chunk 下发（OpenAI 的用法）。
-      if (frame.rawUsage !== undefined) {
-        usage = parseRawUsage(frame.rawUsage);
-      }
-      if (frame.delta !== undefined && Object.keys(frame.delta).length > 0) {
-        // 性能采样：只对**正文**计时（思考链长度会让速率虚高；纯思考
-        // 而无正文的请求不应计入——那会得到"首 token 很早但速率极低"的假象）。
-        if (typeof frame.delta.content === 'string' && frame.delta.content !== '') {
-          if (firstContentAt === null) {
-            firstContentAt = Date.now();
-            trace('first-content', { ms: firstContentAt - reqT0 });
+
+      // ---- 解析上游 SSE 并转成 OpenAI SSE ------------------------------
+      res.writeHead(200, {
+        'Content-Type': 'text/event-stream; charset=utf-8',
+        'Cache-Control': 'no-store',
+        Connection: 'keep-alive',
+        // 明确禁止缓冲，保证真流式
+        'X-Accel-Buffering': 'no',
+      });
+
+      const chunkId = `chatcmpl-${Date.now().toString(36)}`;
+      const created = Math.floor(Date.now() / 1000);
+      const parser = new SseParser();
+      let finished = false;
+      /** 上游在流中途报错；置位后不得再补正常收尾帧，否则会掩盖真实错误。 */
+      let errored = false;
+      /** 上游末帧给出的 token 统计（OpenAI 形态）；拿不到保持 null，不编造。 */
+      let usage = null;
+      // ---- 性能采样（供设置卡片展示上游速度）----
+      const startedAt = Date.now();
+      /** 首个**正文**内容到达时刻；null 表示还没有正文。 */
+      let firstContentAt = null;
+      /** 累加的正文长度（不含思考链）——速率只看正文，否则思考会虚高。 */
+      let outputChars = 0;
+      /** 累加的思考链长度：只思考不回答的回合要靠它区分「有产出」与「空回合」。 */
+      let thinkingChars = 0;
+      /** 本回合是否已下发工具调用分片（有它就算有产出）。 */
+      let toolCallsEmitted = false;
+      // ---- 「200 之后的静默」放弃计时器 ----
+      // 上游拿到 200 后若在 FIRST_CONTENT_TIMEOUT_MS 内**任何帧都没发**
+      // （reasoning 或 content 都算帧），就视为排队失败，主动放弃并报错。
+      // 见 FIRST_CONTENT_TIMEOUT_MS 的文档（trace 实测的排队态卡死模式）。
+
+      /** 写一块；客户端断开后不再写。 */
+      const write = (text) => {
+        if (clientGone || res.writableEnded) return false;
+        try {
+          res.write(text);
+          return true;
+        } catch {
+          clientGone = true;
+          return false;
+        }
+      };
+
+      /** 处理解析出的负载；返回 false 表示应停止读流。 */
+      const handlePayload = (payload) => {
+        const frame = parseQwenWorkFrame(payload);
+        if (frame.kind === 'skip') return true;
+        if (frame.kind === 'error') {
+          // 上游在流中途报告错误：以 OpenAI 的 error 帧表达。
+          //
+          // ⚠️ 置 `errored`，收尾时**不得**再补 `finish_reason: "stop"` + `[DONE]`。
+          // 否则下游会认为「流正常结束但内容为空」，报出 EMPTY_RESPONSE 之类
+          // 的误导性错误，把真实原因（如「该模型对当前账号不可用」）掩盖掉。
+          //
+          // ⚠️ 必须**原样保留上游的 HTTP 状态码**。上游把错误放在 HTTP 200 的
+          // SSE 流内，下游（pi-ai → DSH）从协议层拿不到任何状态码；这里若再丢掉
+          // `frame.error.status`，用户就只看到 "Model catalog unavailable" 这类
+          // 纯文本，无法区分「模型名写错了」与「上游 503，只能等」。
+          // 实测上游会用状态码表达不同语义：
+          //   403 Model is not available for this user  —— 模型不在该账号可用列表
+          //   400 Unsupported FetchKeys value           —— 请求 URL 参数不合法
+          //   503 Model catalog unavailable             —— 上游模型目录服务不可用
+          // 状态码是这三者唯一的判据，因此按 `HTTP <code>: <message>` 透传。
+          const status = frame.error.status;
+          const message =
+            typeof status === 'number' && status > 0
+              ? `HTTP ${status}: ${frame.error.message}`
+              : frame.error.message;
+          write(`data: ${JSON.stringify({ error: { message, type: 'api_error' } })}\n\n`);
+          errored = true;
+          return false;
+        }
+        // 上游把 token 统计放在末帧的 raw_usage 里，且常与 finish_reason 帧分离。
+        // 先记下来，收尾时随最后一个 chunk 下发（OpenAI 的用法）。
+        if (frame.rawUsage !== undefined) {
+          usage = parseRawUsage(frame.rawUsage);
+        }
+        if (frame.delta !== undefined && Object.keys(frame.delta).length > 0) {
+          // 性能采样：只对**正文**计时（思考链长度会让速率虚高；纯思考
+          // 而无正文的请求不应计入——那会得到"首 token 很早但速率极低"的假象）。
+          if (typeof frame.delta.content === 'string' && frame.delta.content !== '') {
+            if (firstContentAt === null) {
+              firstContentAt = Date.now();
+              trace('first-content', { ms: firstContentAt - reqT0 });
+            }
+            outputChars += frame.delta.content.length;
           }
-          outputChars += frame.delta.content.length;
+          if (typeof frame.delta.reasoning === 'string' && frame.delta.reasoning !== '') {
+            thinkingChars += frame.delta.reasoning.length;
+          }
+          if (Array.isArray(frame.delta.tool_calls) && frame.delta.tool_calls.length > 0) {
+            toolCallsEmitted = true;
+          }
+          write(encodeOpenAiChunk({ model: modelKey, id: chunkId, created, delta: frame.delta }));
         }
-        if (typeof frame.delta.reasoning === 'string' && frame.delta.reasoning !== '') {
-          thinkingChars += frame.delta.reasoning.length;
-        }
-        if (Array.isArray(frame.delta.tool_calls) && frame.delta.tool_calls.length > 0) {
-          toolCallsEmitted = true;
-        }
-        write(encodeOpenAiChunk({ model: modelKey, id: chunkId, created, delta: frame.delta }));
-      }
-      if (frame.finishReason !== null && frame.finishReason !== undefined) {
-        // 上游常把「带工具调用」的回合标成 stop。下游（pi-ai / DSH）靠
-        // finish_reason 判断要不要继续跑工具，标成 stop 就等于告诉它「本轮结束了」，
-        // agent 循环于是停在工具调用前面——表现为「模型不动了」。
-        let reason = frame.finishReason;
-        if (toolCallsEmitted && (reason === 'stop' || reason === 'end')) reason = 'tool_calls';
-        // 只思考不回答（reasoning 一大堆、正文和工具调用都没有）：这是一次
-        // 空回合。报成 stop 会让下游拿到一条空 assistant 消息就收工；
-        // 报错才能让它重试——实测过 340 秒思考、9.5 万字符思考链、0 正文。
-        if (!toolCallsEmitted && outputChars === 0) {
-          trace('empty-answer', { ms: Date.now() - reqT0, thinkingChars });
-          write(
-            `data: ${JSON.stringify({
-              error: {
-                message: `upstream finished without any answer (thinking ${thinkingChars} chars, no content, no tool calls)`,
-                type: 'empty_answer',
-              },
-            })}\n\n`,
-          );
-          reason = 'network_error';
-        }
-        write(
-          encodeOpenAiChunk({
-            model: modelKey,
-            id: chunkId,
-            created,
-            finishReason: reason,
-            usage,
-          }),
-        );
-        finished = true;
-        // 已带 usage 时无需再补一帧；否则继续读，等可能的 raw_usage 帧。
-        return usage === null;
-      }
-      return true;
-    };
-
-    const idleTimer = { current: null };
-    let idleFired = false;
-    /**
-     * 看门狗。deadlineMs 决定这一轮允许静默多久：
-     *   - 首帧之前用 FIRST_CONTENT_TIMEOUT_MS（90s）：拿到 200 却久久没有任何帧，
-     *     是上游「接了单没排上」的排队态，干等 300 秒只是把失败拉长；
-     *   - 首帧之后用 idleTimeoutMs（300s）：长思考时上游仍在持续推 reasoning 帧。
-     * 这个常量此前只有声明和注释、未被任何代码使用，等于首帧预算形同虚设。
-     */
-    const armIdle = (deadlineMs = idleTimeoutMs) => {
-      clearTimeout(idleTimer.current);
-      idleTimer.current = setTimeout(() => {
-        // ⚠️ 关键：必须**先给客户端一个明确结果**，再收摊。
-        // 只设 clientGone 会让后续所有 write 被跳过，客户端一个字节都收不到
-        // → 界面永久转圈（表现为"卡住"，比报错更难排查）。
-        idleFired = true;
-        trace('idle-watchdog-fired', { ms: Date.now() - reqT0, deadlineMs });
-        if (!res.writableEnded) {
-          try {
-            res.write(
+        if (frame.finishReason !== null && frame.finishReason !== undefined) {
+          // 上游常把「带工具调用」的回合标成 stop。下游（pi-ai / DSH）靠
+          // finish_reason 判断要不要继续跑工具，标成 stop 就等于告诉它「本轮结束了」，
+          // agent 循环于是停在工具调用前面——表现为「模型不动了」。
+          let reason = frame.finishReason;
+          if (toolCallsEmitted && (reason === 'stop' || reason === 'end')) reason = 'tool_calls';
+          // 只思考不回答（reasoning 一大堆、正文和工具调用都没有）：这是一次
+          // 空回合。报成 stop 会让下游拿到一条空 assistant 消息就收工；
+          // 报错才能让它重试——实测过 340 秒思考、9.5 万字符思考链、0 正文。
+          if (!toolCallsEmitted && outputChars === 0) {
+            trace('empty-answer', { ms: Date.now() - reqT0, thinkingChars });
+            write(
               `data: ${JSON.stringify({
                 error: {
-                  message: `upstream produced no data for ${deadlineMs}ms`,
-                  type: 'api_error',
+                  message: `upstream finished without any answer (thinking ${thinkingChars} chars, no content, no tool calls)`,
+                  type: 'empty_answer',
                 },
               })}\n\n`,
             );
-            res.write(SSE_DONE);
-          } catch {
-            /* 客户端已断开 */
+            reason = 'network_error';
           }
+          write(
+            encodeOpenAiChunk({
+              model: modelKey,
+              id: chunkId,
+              created,
+              finishReason: reason,
+              usage,
+            }),
+          );
+          finished = true;
+          // 已带 usage 时无需再补一帧；否则继续读，等可能的 raw_usage 帧。
+          return usage === null;
         }
-        clientGone = true;
-        // ⚠️ 用 AbortController 中断读取，**不要**调 `upstream.body.cancel()`：
-        // 此刻 `for await (const chunk of upstream.body)` 正在读取该流，
-        // ReadableStream 已被锁定，`cancel()` 会抛
-        // `ERR_INVALID_STATE: ReadableStream is locked`。该异常在定时器回调里
-        // 抛出，**不会被外层的 try/catch 捕获**（不在同一调用栈），
-        // 会冒成 uncaughtException。
-        try {
-          upstreamAbort.abort('upstream idle timeout');
-        } catch {
-          /* 已中止 */
-        }
-      }, deadlineMs);
-    };
+        return true;
+      };
 
-    try {
-      // 首帧预算更紧：排队态的 200 会先到、随后长时间零字节。
-      armIdle(FIRST_CONTENT_TIMEOUT_MS);
-      const decoder = new TextDecoder('utf-8');
-      for await (const chunk of upstream.body) {
-        if (clientGone) break;
-        armIdle();
-        const payloads = parser.push(decoder.decode(chunk, { stream: true }));
-        let keepGoing = true;
-        for (const payload of payloads) {
-          if (!handlePayload(payload)) {
-            keepGoing = false;
-            break;
-          }
-        }
-        if (!keepGoing) break;
-      }
-
-      if (!clientGone && !parser.done) {
-        for (const payload of parser.flush()) {
-          if (!handlePayload(payload)) break;
-        }
-      }
-
-      // 收尾：无论上游是否给了 finish_reason，都要给下游一个明确的结束帧，
-      // 否则 pi-ai 会一直等下去（"挂起"）。
-      //
-      // 例外一：上游已在流内报错（errored）——**不得**补正常收尾帧，否则下游
-      //   会把「错误」误读成「正常结束但无内容」，真实原因被 EMPTY_RESPONSE
-      //   之类的通用错误覆盖。只补一个 [DONE] 终止读取。
-      // 例外二：看门狗已触发（idleFired）——它已经写过错误帧 + [DONE]，
-      //   此处 `clientGone` 为 true 因而整体跳过，不会再补正常帧。
-      if (!clientGone) {
-        if (errored) {
-          write(SSE_DONE);
-        } else {
-          if (!finished) {
-            // ⚠️ 上游没给 finish 帧就结束了：这是**被截断**的回合，不是正常收尾。
-            // 补一个 `stop` 会让下游把「被切断的回答」当成「模型自己讲完了」，
-            // agent 循环就此静默终止——用户看到的正是「模型突然不动了」。
-            //   有产出(正文/工具调用) → `length`：客户端知道被截断，可续写/重试
-            //   毫无产出(只有思考)     → 错误帧 + `network_error`：让下游重试整轮
-            // 两种情况都必须给下游一个明确的结束信号，不能挂起。
-            if (outputChars > 0 || toolCallsEmitted) {
-              trace('truncated', { ms: Date.now() - reqT0, outputChars, thinkingChars });
-              write(
-                encodeOpenAiChunk({
-                  model: modelKey,
-                  id: chunkId,
-                  created,
-                  finishReason: 'length',
-                  usage,
-                }),
-              );
-            } else {
-              trace('empty-answer', { ms: Date.now() - reqT0, thinkingChars });
-              write(
+      const idleTimer = { current: null };
+      let idleFired = false;
+      /**
+       * 看门狗。deadlineMs 决定这一轮允许静默多久：
+       *   - 首帧之前用 FIRST_CONTENT_TIMEOUT_MS（90s）：拿到 200 却久久没有任何帧，
+       *     是上游「接了单没排上」的排队态，干等 300 秒只是把失败拉长；
+       *   - 首帧之后用 idleTimeoutMs（300s）：长思考时上游仍在持续推 reasoning 帧。
+       * 这个常量此前只有声明和注释、未被任何代码使用，等于首帧预算形同虚设。
+       */
+      const armIdle = (deadlineMs = idleTimeoutMs) => {
+        clearTimeout(idleTimer.current);
+        idleTimer.current = setTimeout(() => {
+          // ⚠️ 关键：必须**先给客户端一个明确结果**，再收摊。
+          // 只设 clientGone 会让后续所有 write 被跳过，客户端一个字节都收不到
+          // → 界面永久转圈（表现为"卡住"，比报错更难排查）。
+          idleFired = true;
+          trace('idle-watchdog-fired', { ms: Date.now() - reqT0, deadlineMs });
+          if (!res.writableEnded) {
+            try {
+              res.write(
                 `data: ${JSON.stringify({
                   error: {
-                    message: `upstream ended without any answer (thinking ${thinkingChars} chars, no content, no tool calls)`,
-                    type: 'empty_answer',
+                    message: `upstream produced no data for ${deadlineMs}ms`,
+                    type: 'api_error',
                   },
                 })}\n\n`,
               );
+              res.write(SSE_DONE);
+            } catch {
+              /* 客户端已断开 */
+            }
+          }
+          clientGone = true;
+          // ⚠️ 用 AbortController 中断读取，**不要**调 `upstream.body.cancel()`：
+          // 此刻 `for await (const chunk of upstream.body)` 正在读取该流，
+          // ReadableStream 已被锁定，`cancel()` 会抛
+          // `ERR_INVALID_STATE: ReadableStream is locked`。该异常在定时器回调里
+          // 抛出，**不会被外层的 try/catch 捕获**（不在同一调用栈），
+          // 会冒成 uncaughtException。
+          try {
+            upstreamAbort.abort('upstream idle timeout');
+          } catch {
+            /* 已中止 */
+          }
+        }, deadlineMs);
+      };
+
+      try {
+        // 首帧预算更紧：排队态的 200 会先到、随后长时间零字节。
+        armIdle(FIRST_CONTENT_TIMEOUT_MS);
+        const decoder = new TextDecoder('utf-8');
+        for await (const chunk of upstream.body) {
+          if (clientGone) break;
+          armIdle();
+          const payloads = parser.push(decoder.decode(chunk, { stream: true }));
+          let keepGoing = true;
+          for (const payload of payloads) {
+            if (!handlePayload(payload)) {
+              keepGoing = false;
+              break;
+            }
+          }
+          if (!keepGoing) break;
+        }
+
+        if (!clientGone && !parser.done) {
+          for (const payload of parser.flush()) {
+            if (!handlePayload(payload)) break;
+          }
+        }
+
+        // 收尾：无论上游是否给了 finish_reason，都要给下游一个明确的结束帧，
+        // 否则 pi-ai 会一直等下去（"挂起"）。
+        //
+        // 例外一：上游已在流内报错（errored）——**不得**补正常收尾帧，否则下游
+        //   会把「错误」误读成「正常结束但无内容」，真实原因被 EMPTY_RESPONSE
+        //   之类的通用错误覆盖。只补一个 [DONE] 终止读取。
+        // 例外二：看门狗已触发（idleFired）——它已经写过错误帧 + [DONE]，
+        //   此处 `clientGone` 为 true 因而整体跳过，不会再补正常帧。
+        if (!clientGone) {
+          if (errored) {
+            write(SSE_DONE);
+          } else {
+            if (!finished) {
+              // ⚠️ 上游没给 finish 帧就结束了：这是**被截断**的回合，不是正常收尾。
+              // 补一个 `stop` 会让下游把「被切断的回答」当成「模型自己讲完了」，
+              // agent 循环就此静默终止——用户看到的正是「模型突然不动了」。
+              //   有产出(正文/工具调用) → `length`：客户端知道被截断，可续写/重试
+              //   毫无产出(只有思考)     → 错误帧 + `network_error`：让下游重试整轮
+              // 两种情况都必须给下游一个明确的结束信号，不能挂起。
+              if (outputChars > 0 || toolCallsEmitted) {
+                trace('truncated', { ms: Date.now() - reqT0, outputChars, thinkingChars });
+                write(
+                  encodeOpenAiChunk({
+                    model: modelKey,
+                    id: chunkId,
+                    created,
+                    finishReason: 'length',
+                    usage,
+                  }),
+                );
+              } else {
+                trace('empty-answer', { ms: Date.now() - reqT0, thinkingChars });
+                write(
+                  `data: ${JSON.stringify({
+                    error: {
+                      message: `upstream ended without any answer (thinking ${thinkingChars} chars, no content, no tool calls)`,
+                      type: 'empty_answer',
+                    },
+                  })}\n\n`,
+                );
+                write(
+                  encodeOpenAiChunk({
+                    model: modelKey,
+                    id: chunkId,
+                    created,
+                    finishReason: 'network_error',
+                    usage,
+                  }),
+                );
+              }
+            } else if (usage !== null) {
+              // finish 帧已经发过、usage 是随后才到的：补一帧只带 usage 的分块。
+              // OpenAI 的约定是 usage 出现在最后一个 chunk 上（choices 可为空）。
               write(
-                encodeOpenAiChunk({
-                  model: modelKey,
+                `data: ${JSON.stringify({
                   id: chunkId,
+                  object: 'chat.completion.chunk',
                   created,
-                  finishReason: 'network_error',
+                  model: modelKey,
+                  choices: [],
                   usage,
-                }),
+                })}\n\n`,
               );
             }
-          } else if (usage !== null) {
-            // finish 帧已经发过、usage 是随后才到的：补一帧只带 usage 的分块。
-            // OpenAI 的约定是 usage 出现在最后一个 chunk 上（choices 可为空）。
-            write(
-              `data: ${JSON.stringify({
-                id: chunkId,
-                object: 'chat.completion.chunk',
-                created,
-                model: modelKey,
-                choices: [],
-                usage,
-              })}\n\n`,
-            );
+            write(SSE_DONE);
           }
+        }
+      } catch (error) {
+        // 网络中断：不让异常穿透出去炸掉插件，给下游一个错误帧即止
+        log.warn?.('dsh-qwen-connect: upstream stream interrupted', safeMessage(error));
+        if (!clientGone) {
+          write(`data: ${JSON.stringify({ error: { message: safeMessage(error), type: 'api_error' } })}\n\n`);
+          // ⚠️ 断流也要给 finish 帧。只发错误帧 + [DONE] 时，有的下游会把「没有
+          // finish_reason」当成「流异常结束但内容正常」，有的则报 EMPTY_RESPONSE；
+          // 已产出内容就说 length（被截断），一个字节都没出就说 network_error。
+          write(
+            encodeOpenAiChunk({
+              model: modelKey,
+              id: chunkId,
+              created,
+              finishReason: outputChars > 0 || toolCallsEmitted ? 'length' : 'network_error',
+              usage,
+            }),
+          );
           write(SSE_DONE);
         }
-      }
-    } catch (error) {
-      // 网络中断：不让异常穿透出去炸掉插件，给下游一个错误帧即止
-      log.warn?.('dsh-qwen-connect: upstream stream interrupted', safeMessage(error));
-      if (!clientGone) {
-        write(`data: ${JSON.stringify({ error: { message: safeMessage(error), type: 'api_error' } })}\n\n`);
-        // ⚠️ 断流也要给 finish 帧。只发错误帧 + [DONE] 时，有的下游会把「没有
-        // finish_reason」当成「流异常结束但内容正常」，有的则报 EMPTY_RESPONSE；
-        // 已产出内容就说 length（被截断），一个字节都没出就说 network_error。
-        write(
-          encodeOpenAiChunk({
-            model: modelKey,
-            id: chunkId,
-            created,
-            finishReason: outputChars > 0 || toolCallsEmitted ? 'length' : 'network_error',
-            usage,
-          }),
-        );
-        write(SSE_DONE);
-      }
-    } finally {
-      clearTimeout(idleTimer.current);
-      trace('stream-end', {
-        ms: Date.now() - reqT0,
-        clientGone,
-        errored,
-        finished,
-        idleFired,
-        outputChars,
-      });
-      // 性能采样：只在「有正文且未出错」时记录——失败请求与纯思考无正文的
-      // 请求会污染速率统计（分母极小或为 0）。recordSample 内部还会再校验。
-      if (firstContentAt !== null && !errored) {
-        const endedAt = Date.now();
-        const genMs = endedAt - firstContentAt;
-        recordSample({
-          ttftMs: firstContentAt - startedAt,
-          charsPerSec: genMs > 0 ? (outputChars / genMs) * 1000 : 0,
-          totalMs: endedAt - startedAt,
+      } finally {
+        clearTimeout(idleTimer.current);
+        trace('stream-end', {
+          ms: Date.now() - reqT0,
+          clientGone,
+          errored,
+          finished,
+          idleFired,
           outputChars,
         });
-      }
-      if (!res.writableEnded) {
-        try {
-          res.end();
-        } catch {
-          /* 已关闭 */
+        // 性能采样：只在「有正文且未出错」时记录——失败请求与纯思考无正文的
+        // 请求会污染速率统计（分母极小或为 0）。recordSample 内部还会再校验。
+        if (firstContentAt !== null && !errored) {
+          const endedAt = Date.now();
+          const genMs = endedAt - firstContentAt;
+          recordSample({
+            ttftMs: firstContentAt - startedAt,
+            charsPerSec: genMs > 0 ? (outputChars / genMs) * 1000 : 0,
+            totalMs: endedAt - startedAt,
+            outputChars,
+          });
+        }
+        if (!res.writableEnded) {
+          try {
+            res.end();
+          } catch {
+            /* 已关闭 */
+          }
         }
       }
+    } finally {
+      res.off('close', onClientClose);
     }
   };
 }

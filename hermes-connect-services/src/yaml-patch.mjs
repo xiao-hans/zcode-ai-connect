@@ -51,11 +51,15 @@ export function patchManagedBlock(text, topKey, blockBody, options = {}) {
     };
   }
 
-  // An inline empty map (`providers: {}`) is legal YAML but has nowhere to put
-  // children — turn it into a block before patching.
-  if (isInlineEmptyMap(lines[keyIndex])) lines[keyIndex] = `${topKey}:`;
+  // Inline mappings cannot contain a managed block; removal must leave them alone.
+  if (!isBlockMapping(lines[keyIndex]) && blockBody.trim() === '') {
+    return { text, changed: false, action: 'noop' };
+  }
+  if (isInlineEmptyMap(lines[keyIndex])) {
+    lines[keyIndex] = lines[keyIndex].replace(/\{\s*\}/, '');
+  }
 
-  const region = mappingRegion(lines, keyIndex);
+  const region = mappingRegion(lines, keyIndex, topKey);
   const owned = findManagedRegion(lines, region, startToken, endToken);
   const nextBlock = buildManagedBlock(blockBody, { marker, indent });
 
@@ -87,7 +91,7 @@ export function readManagedBlock(text, topKey, options = {}) {
   const lines = text.split(/\r?\n/);
   const keyIndex = findTopLevelKey(lines, topKey);
   if (keyIndex === -1) return '';
-  const region = mappingRegion(lines, keyIndex);
+  const region = mappingRegion(lines, keyIndex, topKey);
   const owned = findManagedRegion(lines, region, START(marker), END(marker));
   if (!owned) return '';
   return lines.slice(owned.start + 1, owned.end).join('\n');
@@ -106,7 +110,7 @@ export function readManagedChildren(text, topKey, options = {}) {
   const lines = text.split(/\r?\n/);
   const keyIndex = findTopLevelKey(lines, topKey);
   if (keyIndex === -1) return [];
-  const region = mappingRegion(lines, keyIndex);
+  const region = mappingRegion(lines, keyIndex, topKey);
   const owned = findManagedRegion(lines, region, START(marker), END(marker));
   if (!owned) return [];
   // Inside `providers:` the region carries the mapping's 2-space indent; strip
@@ -133,8 +137,12 @@ export function hasTopLevelKey(text, topKey) {
 /** Index of a top-level `key:` line, or -1. Inline keys inside blocks never match. */
 function findTopLevelKey(lines, topKey) {
   const escaped = topKey.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
-  const pattern = new RegExp(`^${escaped}\\s*:\\s*(#.*)?$`);
+  const pattern = new RegExp(`^(?:${escaped}|"${escaped}"|'${escaped}')\\s*:(?=\\s|[{}\\[\\]]|$)`);
   return lines.findIndex((line) => pattern.test(line));
+}
+
+function isBlockMapping(line) {
+  return /^[^:]+:\s*(#.*)?$/.test(line);
 }
 
 function isInlineEmptyMap(line) {
@@ -146,7 +154,10 @@ function isInlineEmptyMap(line) {
  * the key line until the next top-level key (or EOF). Trailing blank lines are
  * excluded so inserted blocks land right after the last real child.
  */
-function mappingRegion(lines, keyIndex) {
+function mappingRegion(lines, keyIndex, topKey) {
+  if (!isBlockMapping(lines[keyIndex]) && !isInlineEmptyMap(lines[keyIndex])) {
+    throw new Error(`Cannot patch ${topKey}: nonempty inline/flow value; convert it to a block mapping first.`);
+  }
   let end = lines.length;
   for (let i = keyIndex + 1; i < lines.length; i += 1) {
     if (/^\S/.test(lines[i]) && lines[i].trim() !== '') {

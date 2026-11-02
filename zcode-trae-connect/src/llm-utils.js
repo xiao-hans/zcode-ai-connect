@@ -59,6 +59,8 @@ const VERSION_CODE_FALLBACK = '20260716'
  * 可用 `ZC_UPSTREAM_HEADER_TIMEOUT_MS` 覆盖。
  */
 const UPSTREAM_HEADER_TIMEOUT_MS = Number(process.env['ZC_UPSTREAM_HEADER_TIMEOUT_MS'] ?? 120_000)
+// Only until output handoff; the server owns idle/tail timing after that.
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
 
 const nonEmpty = (value) => (typeof value === 'string' && value.trim() !== '' ? value.trim() : undefined)
 
@@ -283,6 +285,10 @@ export function classifyLlmError(failure) {
  * first output frame. */
 export async function llmChatStream({ credential, identity, baseUrl, openaiBody, ownedFunction, signal }) {
 	const input = typeof openaiBody === 'string' ? JSON.parse(openaiBody) : openaiBody
+	// No non-default tool_choice mapping has been verified for this private wire.
+	if (input.tool_choice !== undefined && input.tool_choice !== 'auto') {
+		return { ok: false, kind: 'client', status: 400, message: 'llm_utils_chat: unsupported tool_choice; only "auto" or an omitted tool_choice is supported' }
+	}
 	const model = typeof input.model === 'string' && input.model.trim() !== '' ? input.model.trim() : 'glm-5.2'
 	const wire = {
 		messages: toLlmMessages(input.messages),
@@ -298,14 +304,20 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 
 	/** Frame reader over the gateway SSE. Resumable: the caller may hand the
 	 * generator to a background pump and keep pulling it later. */
-	async function* gatewayFrames(response) {
+	async function* gatewayFrames(response, requestSignal) {
 		const reader = response.body.getReader()
 		const decoder = new TextDecoder()
 		let buffer = ''
 		let eventName = ''
+		// return() queues behind next(); cancellation must wake reader.read().
+		const cancelReader = () => { reader.cancel(requestSignal.reason).catch(() => {}) }
+		requestSignal.addEventListener('abort', cancelReader, { once: true })
+		if (requestSignal.aborted) cancelReader()
 		try {
 			for (;;) {
+				requestSignal.throwIfAborted()
 				const { done, value } = await reader.read()
+				requestSignal.throwIfAborted()
 				if (done) return
 				buffer += decoder.decode(value, { stream: true })
 				let index
@@ -325,6 +337,7 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 				}
 			}
 		} finally {
+			requestSignal.removeEventListener('abort', cancelReader)
 			// Abandoning the generator (client gone, stall watchdog) must also
 			// release the gateway connection: without this the upstream keeps
 			// generating into a socket nobody reads, burning the account's
@@ -343,7 +356,15 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 		if (Array.isArray(record.tool_calls)) {
 			for (const call of record.tool_calls) {
 				const fn = call.function_call ?? call.function ?? {}
-				chunks.push({ choices: [{ index: 0, delta: { tool_calls: [{ index: call.index ?? 0, ...(call.id ? { id: call.id } : {}), type: 'function', function: { ...(call.id ? { name: fn.name ?? '' } : {}), arguments: fn.arguments ?? '' } }] }, finish_reason: null }] })
+				chunks.push({ choices: [{ index: 0, delta: { tool_calls: [{
+					index: call.index ?? 0,
+					...(call.id ? { id: call.id } : {}),
+					type: 'function',
+					function: {
+						...(fn.name !== undefined ? { name: fn.name } : {}),
+						...(fn.arguments !== undefined ? { arguments: fn.arguments } : {}),
+					},
+				}] }, finish_reason: null }] })
 			}
 		}
 		return chunks
@@ -352,12 +373,9 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 	for (let attempt = 0; attempt < 4; attempt++) {
 		if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
 		let response
-		// ⚠️ 必须用**可清除**的 AbortController，不能用 AbortSignal.timeout：
-		// 后者绑进 fetch 的 signal 后会被 undici 维持到整个响应生命周期（含 body 流），
-		// 长回答会在第 N 秒被掐死。这里只覆盖「拿到响应头之前」——上游接单后迟迟不回
-		// 是最常见的挂起形态，放任它等于让客户端永远等下去。头一到手立刻 clearTimeout，
-		// 之后的 body 流只受调用方 signal（客户端断连 / 流内看门狗）约束。
+		// Clear phase timers on handoff: neither is a total response deadline.
 		const headerAbort = new AbortController()
+		const requestSignal = signal === undefined ? headerAbort.signal : AbortSignal.any([signal, headerAbort.signal])
 		const headerTimer = setTimeout(() => {
 			headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
 		}, UPSTREAM_HEADER_TIMEOUT_MS)
@@ -366,9 +384,7 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 				method: 'POST',
 				headers: llmHeaders(credential, identity),
 				body: JSON.stringify(wire),
-				signal: signal === undefined
-					? headerAbort.signal
-					: AbortSignal.any([signal, headerAbort.signal]),
+				signal: requestSignal,
 			})
 		} catch (error) {
 			return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error)}` }
@@ -382,41 +398,57 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 			return { ok: false, status: response.status, kind, message: text.slice(0, 400) }
 		}
 
-		const frames = gatewayFrames(response)
-		for (;;) {
-			const next = await frames.next()
-			if (next.done) break
-			const { eventName, record } = next.value
+		const frames = gatewayFrames(response, requestSignal)
+		const firstFrameTimer = setTimeout(() => {
+			headerAbort.abort(new DOMException(`upstream produced no usable frame for ${STREAM_IDLE_TIMEOUT_MS}ms`, 'TimeoutError'))
+		}, STREAM_IDLE_TIMEOUT_MS)
+		let firstChunks
+		try {
+			for (;;) {
+				const next = await frames.next()
+				if (next.done) break
+				const { eventName, record } = next.value
 
-			// Refusal envelopes (statusCodeValue !== 200) before the first
-			// output frame are real failures; a 403/10605 here is the queue
-			// answer → retry with a fresh request.
-			if (typeof record.statusCodeValue === 'number' && record.statusCodeValue !== 200) {
-				const bodyText = String(record.body ?? '')
-				if (record.statusCodeValue === 403 && /10605|isQueued/.test(bodyText) && attempt < 3) break
-				frames.return?.()
-				const kind = record.statusCodeValue === 401 || record.statusCodeValue === 403 ? 'authentication' : 'server'
-				return { ok: false, status: 502, kind, message: `upstream ${record.statusCodeValue}: ${bodyText.slice(0, 240)}` }
+				// Queue refusals are retried only after the current reader is closed.
+				if (typeof record.statusCodeValue === 'number' && record.statusCodeValue !== 200) {
+					const bodyText = String(record.body ?? '')
+					if (record.statusCodeValue === 403 && /10605|isQueued/.test(bodyText) && attempt < 3) break
+					await frames.return()
+					const kind = record.statusCodeValue === 401 || record.statusCodeValue === 403 ? 'authentication' : 'server'
+					return { ok: false, status: 502, kind, message: `upstream ${record.statusCodeValue}: ${bodyText.slice(0, 240)}` }
+				}
+				const isError = eventName === 'error' ||
+					(record.code !== undefined && record.message !== undefined && record.response === undefined && !Array.isArray(record.tool_calls))
+				if (isError) {
+					await frames.return()
+					return { ok: false, ...classifyLlmError({ code: record.code, message: record.message ?? '', extra: record.extra }) }
+				}
+				if (eventName === 'done') {
+					await frames.return()
+					return { ok: false, status: 502, kind: 'server', message: 'llm_utils_chat ended before any output' }
+				}
+				if (eventName !== 'output' && record.response === undefined && record.reasoning_content === undefined) continue
+				const chunks = deltaChunks(record)
+				if (chunks.length === 0) continue
+				firstChunks = chunks
+				break
 			}
-			const isError = eventName === 'error' ||
-				(record.code !== undefined && record.message !== undefined && record.response === undefined && !Array.isArray(record.tool_calls))
-			if (isError) {
-				frames.return?.()
-				return { ok: false, ...classifyLlmError({ code: record.code, message: record.message ?? '', extra: record.extra }) }
-			}
-			if (eventName === 'done') {
-				frames.return?.()
-				return { ok: false, status: 502, kind: 'server', message: 'llm_utils_chat ended before any output' }
-			}
-			if (eventName !== 'output' && record.response === undefined && record.reasoning_content === undefined) continue
+		} catch (error) {
+			await frames.return()
+			return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error).slice(0, 300)}` }
+		} finally {
+			clearTimeout(firstFrameTimer)
+		}
+		if (!firstChunks) {
+			await frames.return()
+			continue
+		}
 
-			// First output frame: hand the response back NOW and keep pumping
-			// the remaining gateway frames from inside the stream's start().
-			// Returning only after the upstream finished would deliver reasoning
-			// and content in one burst instead of streaming them.
-			const firstChunks = deltaChunks(record)
-			const stream = new ReadableStream({
-				async start(controller) {
+		// Hand off after usable output, not merely an empty output/control frame.
+		let pump
+		const stream = new ReadableStream({
+			start(controller) {
+				pump = (async () => {
 					/** A terminal frame from the gateway was forwarded. */
 					let sawTerminal = false
 					/** Something a client can actually use reached the wire. */
@@ -494,16 +526,21 @@ export async function llmChatStream({ credential, identity, baseUrl, openaiBody,
 							emit({ error: { message: String(error?.message ?? error).slice(0, 300), type: 'upstream_error' } })
 						} catch {}
 					} finally {
-						controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-						try { controller.close() } catch {}
+						await frames.return()
+						try {
+							controller.enqueue(encoder.encode('data: [DONE]\n\n'))
+							controller.close()
+						} catch {}
 					}
-				},
-				cancel() {
-					try { frames.return() } catch {}
-				},
-			})
-			return { ok: true, response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }) }
-		}
+				})()
+			},
+			async cancel(reason) {
+				headerAbort.abort(reason)
+				await frames.return()
+				await pump
+			},
+		})
+		return { ok: true, response: new Response(stream, { status: 200, headers: { 'Content-Type': 'text/event-stream' } }) }
 	}
 	return { ok: false, status: 429, kind: 'soft_rate', message: 'llm_utils_chat kept queueing (10605) after 4 attempts' }
 }

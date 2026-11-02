@@ -36,9 +36,10 @@ export const FALLBACK_MODELS = []
 export const QODER_IDE_VERSION = '1.1.77'
 /**
  * 上游「响应头」到达的等待上限（毫秒）。只覆盖响应头阶段，拿到即清除；
- * body 流由流内看门狗负责。可用 `ZC_UPSTREAM_HEADER_TIMEOUT_MS` 覆盖。
+ * 首帧前由客户端限时，交付后由服务器流内看门狗负责。
  */
 const UPSTREAM_HEADER_TIMEOUT_MS = Number(process.env['ZC_UPSTREAM_HEADER_TIMEOUT_MS'] ?? 120_000)
+const STREAM_IDLE_TIMEOUT_MS = Number(process.env['ZC_STREAM_IDLE_TIMEOUT_MS'] ?? 180_000)
 const USER_AGENT = `qoder/${QODER_IDE_VERSION}`
 const LOGIN_VERSION = 'v2'
 const MACHINE_OS = `${process.arch === 'arm64' ? 'aarch64' : process.arch === 'x64' ? 'x86_64' : process.arch}_${process.platform}`
@@ -413,7 +414,10 @@ export class QoderUpstreamClient {
             index: call.index ?? i,
             ...(call.id ? { id: call.id } : {}),
             type: 'function',
-            function: { ...(call.id ? { name: call.function?.name ?? '' } : {}), arguments: call.function?.arguments ?? '' },
+            function: {
+              ...(call.function?.name !== undefined ? { name: call.function.name } : {}),
+              ...(call.function?.arguments !== undefined ? { arguments: call.function.arguments } : {}),
+            },
           }))
         }
         const finish = typeof choice.finish_reason === 'string' && choice.finish_reason !== '' ? choice.finish_reason : null
@@ -426,14 +430,13 @@ export class QoderUpstreamClient {
         if (attempt > 0) await new Promise(resolve => setTimeout(resolve, 6000))
         const encoded = buildBody()
         let response
-        // ⚠️ 可清除的 AbortController，而不是 AbortSignal.timeout：后者绑进 fetch 后
-      // 会被 undici 维持到整个响应生命周期（含 body 流），长回答会在第 N 秒被掐死。
-      // 这里只覆盖「响应头到达之前」——上游接单不回是最常见的挂起形态。
-      const headerAbort = new AbortController()
-      const headerTimer = setTimeout(() => {
-        headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
-      }, UPSTREAM_HEADER_TIMEOUT_MS)
-      try {
+        // Clear phase timers on handoff: neither is a total response deadline.
+        const headerAbort = new AbortController()
+        const requestSignal = signal === undefined ? headerAbort.signal : AbortSignal.any([signal, headerAbort.signal])
+        const headerTimer = setTimeout(() => {
+          headerAbort.abort(new DOMException('The operation was aborted due to timeout', 'TimeoutError'))
+        }, UPSTREAM_HEADER_TIMEOUT_MS)
+        try {
           response = await fetch(chatUrl, {
             method: 'POST',
             headers: {
@@ -447,7 +450,7 @@ export class QoderUpstreamClient {
               ...buildCosyHeaders({ body: encoded, url: chatUrl, credential }),
             },
             body: encoded,
-            signal: signal === undefined ? headerAbort.signal : AbortSignal.any([signal, headerAbort.signal]),
+            signal: requestSignal,
           })
         } catch (error) {
           return { ok: false, kind: 'server', status: 0, message: `transport error: ${String(error).slice(0, 160)}` }
@@ -464,9 +467,15 @@ export class QoderUpstreamClient {
           const reader = response.body.getReader()
           const decoder = new TextDecoder()
           let buffer = ''
+          // return() cannot interrupt a pending next()/read(); wake its owner first.
+          const cancelReader = () => { reader.cancel(requestSignal.reason).catch(() => {}) }
+          requestSignal.addEventListener('abort', cancelReader, { once: true })
+          if (requestSignal.aborted) cancelReader()
           try {
             for (;;) {
+              requestSignal.throwIfAborted()
               const { done, value } = await reader.read()
+              requestSignal.throwIfAborted()
               if (done) return
               buffer += decoder.decode(value, { stream: true })
               let index
@@ -494,6 +503,7 @@ export class QoderUpstreamClient {
               }
             }
           } finally {
+            requestSignal.removeEventListener('abort', cancelReader)
             // An abandoned frame generator must also release the socket: the
             // gateway counts the open stream against the account's concurrency.
             try { await reader.cancel() } catch {}
@@ -501,26 +511,39 @@ export class QoderUpstreamClient {
           }
         }
         const frames = iterateFrames()
+        const firstFrameTimer = setTimeout(() => {
+          headerAbort.abort(new DOMException(`upstream produced no usable frame for ${STREAM_IDLE_TIMEOUT_MS}ms`, 'TimeoutError'))
+        }, STREAM_IDLE_TIMEOUT_MS)
         let firstChunk = null
-        for (;;) {
-          const next = await frames.next()
-          if (next.done) break
-          const frame = next.value
-          if (frame.kind === 'status') {
-            if (frame.statusCodeValue !== 200) {
+        try {
+          for (;;) {
+            const next = await frames.next()
+            if (next.done) break
+            const frame = next.value
+            if (frame.kind === 'status') {
               if (isQueueBody(frame.bodyText) && attempt < 3) break
-              frames.return?.()
+              await frames.return()
               return { ok: false, status: 502, kind: 'server', message: `qoder upstream ${frame.statusCodeValue}: ${frame.bodyText.slice(0, 200)}` }
             }
-            continue
+            if (!Array.isArray(frame.chunk.choices) || frame.chunk.choices.length === 0) continue
+            firstChunk = frame.chunk
+            break
           }
-          firstChunk = frame.chunk
-          break
+        } catch (error) {
+          await frames.return()
+          return { ok: false, status: 0, kind: 'server', message: `transport error: ${String(error).slice(0, 300)}` }
+        } finally {
+          clearTimeout(firstFrameTimer)
         }
-        if (!firstChunk) continue
+        if (!firstChunk) {
+          await frames.return()
+          continue
+        }
 
+        let pump
         const stream = new ReadableStream({
-          async start(controller) {
+          start(controller) {
+            pump = (async () => {
             let sawFinishFrame = false
             let sawOutput = false
             const push = (inner) => {
@@ -539,7 +562,9 @@ export class QoderUpstreamClient {
                   const next = await frames.next()
                   if (next.done) break
                   const frame = next.value
-                  if (frame.kind === 'status' && frame.statusCodeValue !== 200) break
+                  if (frame.kind === 'status' && frame.statusCodeValue !== 200) {
+                    throw new Error(`qoder upstream ${frame.statusCodeValue}: ${frame.bodyText.slice(0, 200)}`)
+                  }
                   if (frame.kind !== 'chunk') continue
                   if (push(frame.chunk)) break
                 }
@@ -558,7 +583,6 @@ export class QoderUpstreamClient {
                 }
               }
               controller.enqueue(encoder.encode('data: [DONE]\n\n'))
-              controller.close()
             } catch (error) {
               try {
                 controller.enqueue(encoder.encode('data: ' + JSON.stringify({
@@ -566,11 +590,16 @@ export class QoderUpstreamClient {
                 }) + '\n\n'))
                 controller.enqueue(encoder.encode('data: [DONE]\n\n'))
               } catch {}
+            } finally {
+              await frames.return()
               try { controller.close() } catch {}
             }
+            })()
           },
-          cancel() {
-            try { frames.return() } catch {}
+          async cancel(reason) {
+            headerAbort.abort(reason)
+            await frames.return()
+            await pump
           },
         })
         return { ok: true, response: { body: stream } }
