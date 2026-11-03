@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 
 import fs from 'node:fs';
 
-const bridgeCode = fs.readFileSync('D:/.hermes/workspace/zcode-ai-connect/scripts/codex-responses-bridge.mjs', 'utf8');
+const bridgeCode = fs.readFileSync(new URL('../scripts/codex-responses-bridge.mjs', import.meta.url), 'utf8');
 
 // 提取 recoverTextToolCalls 函数源码并 eval / new Function 运行单测
 const fnMatch = bridgeCode.match(/function recoverTextToolCalls[\s\S]*?\n\}/);
