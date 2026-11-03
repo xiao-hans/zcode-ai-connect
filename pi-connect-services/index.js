@@ -24,6 +24,27 @@ import { detectStall, EMPTY_TURN_PROMPT } from './lib/stall-detector.mjs'
 const HERE = dirname(fileURLToPath(import.meta.url))
 const require_ = createRequire(import.meta.url)
 
+/**
+ * 是否跳过「打开 pi 就顺手拉起端点」。
+ *
+ * 有人希望端点由自己控制(手动 `start-all.mjs` 或随 ZCode 起),
+ * 那么自动 spawn 就是噪音。两种关闭方式,都不影响下面的 stall 守卫:
+ *   - 环境变量 PI_CONNECT_NO_AUTOSTART=1 / true / yes / on;
+ *   - 运行根放一个标记文件 `~/.zcode-ai-connect/no-autostart`(删掉即恢复)。
+ * 路径在调用时算,方便测试与 USERPROFILE 改写。
+ */
+function autostartMarkerPath() {
+  const home = process.env.USERPROFILE ?? process.env.HOME ?? ''
+  return home ? join(home, '.zcode-ai-connect', 'no-autostart') : ''
+}
+
+export function autostartDisabled() {
+  const flag = process.env.PI_CONNECT_NO_AUTOSTART
+  if (typeof flag === 'string' && /^(1|true|yes|on)$/i.test(flag.trim())) return true
+  const marker = autostartMarkerPath()
+  return marker !== '' && existsSync(marker)
+}
+
 const SERVICES = [
   { name: 'qoder', tool: 'zcode-qoder-connect', port: 39270, state: '.zcode-qoder-connect' },
   { name: 'workbuddy', tool: 'zcode-workbuddy-connect', port: 39271, state: '.zcode-workbuddy-connect' },
@@ -233,11 +254,16 @@ export function installTurnGuard(pi) {
 }
 
 export default function connectServicesExtension(pi) {
-  // Fire and forget: startup must not wait on network probes or spawns.
-  void Promise.all(SERVICES.map(ensure)).then(results => {
-    const failed = results.some(r => r.includes('FAILED'))
-    emit(pi, failed ? 'warn' : 'info', `[pi-connect-services] ${results.join(' | ')}`)
-  })
+  if (autostartDisabled()) {
+    // 显式选择手动控制:不探测、不 spawn,只留一条可解释的提示。
+    emit(pi, 'info', '[pi-connect-services] autostart 已关闭,不拉起端点(删掉 no-autostart 标记或去掉 PI_CONNECT_NO_AUTOSTART 即恢复)')
+  } else {
+    // Fire and forget: startup must not wait on network probes or spawns.
+    void Promise.all(SERVICES.map(ensure)).then(results => {
+      const failed = results.some(r => r.includes('FAILED'))
+      emit(pi, failed ? 'warn' : 'info', `[pi-connect-services] ${results.join(' | ')}`)
+    })
+  }
 
   // 守卫放在这里而不是 pi-provider-qwenwork：后者在 startChatShim() 失败时
   // 直接 return，没装/没登录 qwenwork 时守卫会整体消失。

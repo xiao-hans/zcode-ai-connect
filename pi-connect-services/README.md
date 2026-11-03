@@ -10,6 +10,20 @@ ZCode 侧由各插件的 SessionStart hook 负责同样的事;装上这个扩展
 - 已在跑 → 跳过;不在 → detached 静默拉起(`node <工具>/bin/cli.mjs serve --port N`);
 - 全程 best-effort:拉起失败不影响 pi 会话,失败会体现在对应 provider 的连接错误里。
 
+### 关掉自动拉起
+
+想手动管端点(`start-all.mjs`、或只让 ZCode 的 hook 拉起)时,二选一:
+
+```sh
+# 环境变量
+set PI_CONNECT_NO_AUTOSTART=1
+
+# 或运行根放标记文件(删掉即恢复)
+type nul > %USERPROFILE%\.zcode-ai-connect\no-autostart
+```
+
+关闭后扩展**不探测、不 spawn**,只留一条提示;下面的收尾守卫照旧工作。
+
 ## 收尾守卫
 
 同一个扩展还挂在 `agent_before_settle` 上，模型**什么都没给就收工**时补一轮：
