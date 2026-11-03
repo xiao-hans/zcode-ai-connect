@@ -30,6 +30,19 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 写完**重启 hermes**:hook 只在网关启动时注册。
 
+### 不想要自动拉起
+
+`--install-hooks` 是可选的:不跑它,provider 照样写进 config.yaml,只是打开 hermes
+不会顺手启动端点(适合自己用 `start-all.mjs` 或只让 ZCode 钩子拉起的情况)。
+
+已经装过要撤掉,删这两处即可,然后重启 hermes:
+
+1. `config.yaml` 的 `hooks.on_session_start` / `hooks.pre_gateway_dispatch` 里指向
+   `ensure-services.mjs` 的条目(整段 `hooks:` 可以一起删,没有其它用途);
+2. `shell-hooks-allowlist.json` 里对应的 `approvals` 条目(留着也无害,只是残留审批)。
+
+provider 与模型目录不受影响,只是端点需要你自己保证在跑。
+
 也可以走 npm(四个端点包已是本包的 `dependencies`,一个命令就会一起装上):
 
 ```sh
