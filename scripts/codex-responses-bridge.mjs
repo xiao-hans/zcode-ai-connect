@@ -739,11 +739,164 @@ function recoverDSMLToolCalls(captured, declaredTools) {
 }
 
 /**
- * 恢复失败的可诊断性:抓到了 tool_calls 块却一个 invoke 都没还原,说明模型这次
- * 把标记写坏到了无法安全解析的程度(实测形态 `<name>Grep</｜｜DSML｜｜ parameter>`)。
- * 这类本轮会退化成「文本戛然而止、没有工具调用」,由 Stop 守卫的自动续跑兜住;
- * 这里只留一份可排查的记录,不合成任何调用 —— 猜错的工具调用比漏一次贵得多。
+ * 通用文本工具调用提取器 (Multi-Supplier Text Tool Call Recovery)
+ *
+ * 覆盖场景:
+ * 1. Qwen / 通义千问:
+ *    - JSON 格式: <tool_call>{"name": "...", "arguments": {...}}</tool_call>
+ *    - XML 格式: <function=tool_name><parameter=key string="true">val</parameter></function>
+ *    - 残缺闭合标签: </parameter>\n</function>\n、</tool_call>
+ * 2. GLM / 智谱 (GLM-4 / GLM-5):
+ *    - <tool_call>tool_name\n<arg1>val1</arg1>...</tool_call>
+ *    - <tool_call>tool_name\n{"key": "val"}</tool_call>
+ * 3. 通用格式 (MiniMax, Kimi, 豆包, Qoder 等模型在未启用原生 fc 或降级时泄漏的正文):
+ *    - <function_call>{"name": "...", "arguments": {...}}</function_call>
+ *    - <tool_calls>[{"name": "...", "arguments": {...}}]</tool_calls>
+ *
+ * @param {string} text 待清洗解析的正文
+ * @param {Set<string>} [declaredTools] 当前请求声明的合法工具集合
+ * @returns {{ cleanText: string, toolCalls: { id: string, name: string, arguments: string }[] }}
  */
+function recoverTextToolCalls(text, declaredTools) {
+  if (typeof text !== 'string' || !text) return { cleanText: text || '', toolCalls: [] };
+  const toolCalls = [];
+  let cleanText = text;
+
+  // 1. Qwen / 通用 JSON 格式: <tool_call> ... </tool_call> 或 <function_call> ... </function_call>
+  const jsonToolCallRegex = /<(?:tool_call|function_call)>([\s\S]*?)<\/(?:tool_call|function_call)>/gi;
+  cleanText = cleanText.replace(jsonToolCallRegex, (match, body) => {
+    const trimmed = body.trim();
+    // 尝试直接 JSON 解析: {"name": "...", "arguments": {...}}
+    try {
+      const parsed = JSON.parse(trimmed);
+      const rawName = parsed.name || parsed.function?.name;
+      const name = declaredTools ? canonicalToolName(rawName, declaredTools) : rawName;
+      if (name) {
+        let args = parsed.arguments || parsed.parameters || parsed.function?.arguments || {};
+        if (typeof args === 'object' && args !== null) args = JSON.stringify(args);
+        toolCalls.push({
+          id: `txt_tc_${toolCalls.length}_${Date.now().toString(36)}`,
+          name,
+          arguments: typeof args === 'string' ? args : JSON.stringify(args),
+        });
+        return '';
+      }
+    } catch {
+      // 非纯 JSON, 尝试 GLM 格式: 第一行为工具名, 后续为参数
+    }
+
+    // 1b. GLM 格式: <tool_call>tool_name\n<arg1>val1</arg1>...</tool_call> 或 <tool_call>tool_name\n{...}</tool_call>
+    const firstNewline = trimmed.indexOf('\n');
+    if (firstNewline > 0) {
+      const potentialName = trimmed.slice(0, firstNewline).trim();
+      const name = declaredTools ? canonicalToolName(potentialName, declaredTools) : potentialName;
+      if (name) {
+        const rest = trimmed.slice(firstNewline + 1).trim();
+        // 如果后面是 JSON 字符串
+        if (rest.startsWith('{') && rest.endsWith('}')) {
+          try {
+            const parsed = JSON.parse(rest);
+            toolCalls.push({
+              id: `glm_tc_${toolCalls.length}_${Date.now().toString(36)}`,
+              name,
+              arguments: JSON.stringify(parsed),
+            });
+            return '';
+          } catch {}
+        }
+        // 如果后面是 <arg>val</arg> 格式
+        const xmlParamRegex = /<([a-zA-Z0-9_\-.:]+)>([\s\S]*?)<\/\1>/g;
+        const matches = [...rest.matchAll(xmlParamRegex)];
+        if (matches.length > 0) {
+          const args = Object.create(null);
+          for (const m of matches) {
+            try { args[m[1]] = JSON.parse(m[2]); } catch { args[m[1]] = m[2]; }
+          }
+          toolCalls.push({
+            id: `glm_xml_${toolCalls.length}_${Date.now().toString(36)}`,
+            name,
+            arguments: JSON.stringify(args),
+          });
+          return '';
+        }
+      }
+    }
+
+    return match;
+  });
+
+  // 2. 多工具数组格式: <tool_calls>[ ... ]</tool_calls>
+  const toolCallsArrayRegex = /<tool_calls>([\s\S]*?)<\/tool_calls>/gi;
+  cleanText = cleanText.replace(toolCallsArrayRegex, (match, body) => {
+    try {
+      const parsed = JSON.parse(body.trim());
+      if (Array.isArray(parsed)) {
+        let allValid = true;
+        const recovered = [];
+        for (const item of parsed) {
+          const rawName = item.name || item.function?.name;
+          const name = declaredTools ? canonicalToolName(rawName, declaredTools) : rawName;
+          if (!name) { allValid = false; break; }
+          let args = item.arguments || item.parameters || item.function?.arguments || {};
+          if (typeof args === 'object' && args !== null) args = JSON.stringify(args);
+          recovered.push({
+            id: `arr_tc_${toolCalls.length + recovered.length}_${Date.now().toString(36)}`,
+            name,
+            arguments: typeof args === 'string' ? args : JSON.stringify(args),
+          });
+        }
+        if (allValid && recovered.length > 0) {
+          toolCalls.push(...recovered);
+          return '';
+        }
+      }
+    } catch {}
+    return match;
+  });
+
+  // 3. Qwen XML 格式: <function=name> ... </function>
+  const xmlFunctionRegex = /<function=([a-zA-Z0-9_\-.:]+)>([\s\S]*?)<\/function>/gi;
+  cleanText = cleanText.replace(xmlFunctionRegex, (match, rawName, innerParams) => {
+    const name = declaredTools ? canonicalToolName(rawName, declaredTools) : rawName;
+    if (!name) return match;
+    const args = Object.create(null);
+    let valid = true;
+    const paramRegex = /<parameter=([a-zA-Z0-9_\-.:]+)(?:\s+string="([^"]*)")?>([\s\S]*?)<\/parameter>/gi;
+    const remainder = innerParams.replace(paramRegex, '').trim();
+    if (remainder) return match;
+
+    for (const pMatch of innerParams.matchAll(paramRegex)) {
+      const pName = pMatch[1];
+      const isString = pMatch[2] === 'true';
+      const pVal = pMatch[3];
+      if (isString) {
+        args[pName] = pVal;
+      } else {
+        try {
+          args[pName] = JSON.parse(pVal);
+        } catch {
+          args[pName] = pVal;
+        }
+      }
+    }
+    if (valid) {
+      toolCalls.push({
+        id: `fn_xml_${toolCalls.length}_${Date.now().toString(36)}`,
+        name,
+        arguments: JSON.stringify(args),
+      });
+      return '';
+    }
+    return match;
+  });
+
+  // 4. 清理残存闭合标签，防止客户端看见语法残渣或触发意外断点
+  cleanText = cleanText.replace(/(?:<\/parameter>\s*)*<\/function>/gi, '');
+  cleanText = cleanText.replace(/<\/(?:tool_call|function_call|tool_calls)>/gi, '');
+
+  return { cleanText, toolCalls };
+}
+
 function noteUnrecoveredDSML(captured, recovered) {
   if (recovered.length > 0) return;
   if (!/tool[\s_-]*calls/i.test(captured) && !/invoke/i.test(captured)) return;
