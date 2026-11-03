@@ -1,10 +1,11 @@
 #!/usr/bin/env node
 /**
- * codex-responses-bridge.mjs — 本地协议桥(127.0.0.1:39268),把两类宿主的请求翻译成
+ * codex-responses-bridge.mjs — 本地协议桥(127.0.0.1:39268),把三类宿主的请求翻译成
  * zcode-*-connect 四个 chat/completions 端点:
  *   · Codex(0.142+,仅 Responses API):POST /v1/responses
  *   · Claude Code:POST /v1/messages + /v1/messages/count_tokens(Anthropic Messages)
- * 文件名沿用 codex 起名,现同时服务两类宿主。
+ *   · Hermes 等原生 OpenAI 客户端:POST /v1/chat/completions(透传,桥只做前缀路由)
+ * 文件名沿用 codex 起名,现同时服务三类宿主。
  *
  * 背景:Codex 自 2026-02 起硬移除 wire_api="chat"(见 openai/codex discussion 7782),
  * 只讲 /v1/responses;而本套件四个端点只讲 /v1/chat/completions。本桥在 127.0.0.1:39268
@@ -26,6 +27,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { Readable } from 'node:stream';
 import { hostIsLoopback, originIsLoopback } from '../zcode-trae-connect/src/loopback.js';
 
 const DEFAULT_PORT = 39268;
@@ -1224,6 +1226,50 @@ async function readBody(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
 }
 
+// ---- OpenAI chat/completions 透传(Hermes 等原生 OpenAI 客户端)----
+// 上游四个端点本身就讲 chat/completions:桥只做前缀路由 + 透传,不做协议翻译。
+async function handleChatCompletions(req, res, body, signal) {
+  const wireModel = body.model ?? '';
+  const slash = wireModel.indexOf('/');
+  if (slash <= 0) {
+    json(res, 400, { error: { message: `模型 id 需带提供方前缀(wb/trae/qoder/qw),收到:${wireModel}` } });
+    return;
+  }
+  const t = TOOLS.find((x) => x.key === wireModel.slice(0, slash));
+  const chatModel = wireModel.slice(slash + 1);
+  const ep = t && endpointFor(t.tool);
+  if (!ep || !ep.port || !ep.token) {
+    json(res, 502, { error: { message: `${t?.tool ?? wireModel} 端点未就绪(缺 endpoint.json),先拉起端点` } });
+    return;
+  }
+  const upstream = { ...body, model: chatModel };
+  let r;
+  try {
+    r = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
+      body: JSON.stringify(upstream),
+      signal,
+    });
+  } catch (e) {
+    json(res, 502, { error: { message: `上游 ${t.tool} 连接失败: ${e.message}` } });
+    return;
+  }
+  res.statusCode = r.status;
+  for (const [k, v] of r.headers) {
+    if (/^content-length$/i.test(k)) continue; // 流式长度会变,交给 Node 重写
+    res.setHeader(k, v);
+  }
+  if (!r.body) {
+    res.end(await r.text());
+    return;
+  }
+  const nodeStream = Readable.fromWeb(r.body);
+  nodeStream.on('error', () => { try { res.destroy(); } catch { /* gone */ } });
+  res.on('close', () => nodeStream.destroy());
+  nodeStream.pipe(res);
+}
+
 async function handle(req, res) {
   if (!hostIsLoopback(req.headers.host)) {
     json(res, 403, { error: { type: 'host_not_allowed', message: 'Host header must name the loopback interface' } });
@@ -1276,7 +1322,12 @@ async function handle(req, res) {
       json(res, 200, { input_tokens: n });
       return;
     }
-    json(res, 404, { error: { message: `桥支持:GET /healthz、GET /v1/models、POST /v1/responses(Codex)、POST /v1/messages 与 /v1/messages/count_tokens(Claude Code)(收到 ${req.method} ${p})` } });
+    if (req.method === 'POST' && (p === '/v1/chat/completions' || p === '/chat/completions')) {
+      const body = await readBody(req);
+      await handleChatCompletions(req, res, body, signal);
+      return;
+    }
+    json(res, 404, { error: { message: `桥支持:GET /healthz、GET /v1/models、POST /v1/responses(Codex)、POST /v1/messages、POST /v1/chat/completions(Hermes) 与 /v1/messages/count_tokens(Claude Code)(收到 ${req.method} ${p})` } });
   } catch (e) {
     if (signal.aborted) return;
     await log(`handler error: ${e.stack ?? e.message}`);
