@@ -29,6 +29,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { Readable } from 'node:stream';
 import { hostIsLoopback, originIsLoopback } from '../zcode-trae-connect/src/loopback.js';
+import { detectStall, CONTINUE_PROMPT } from '../shared/stall-detector.mjs';
 
 const DEFAULT_PORT = 39268;
 const EP_CACHE_TTL_MS = 30_000;
@@ -239,6 +240,11 @@ class ResponseBuilder {
       this.msg.text += tail;
       sseWrite(res, 'content_block_delta', { index: this.msg.outputIndex, delta: { type: 'text_delta', text: tail } });
     }
+    const { cleanText, toolCalls } = recoverTextToolCalls(this.msg.text, this.declaredTools);
+    this.msg.text = cleanText;
+    if (toolCalls.length > 0) {
+      this.recoveredTextTools = (this.recoveredTextTools || []).concat(toolCalls);
+    }
     sseWrite(res, 'response.output_text.done', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, text: this.msg.text });
     sseWrite(res, 'response.content_part.done', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, part: { type: 'output_text', text: this.msg.text, annotations: [] } });
     const item = { id: this.msg.id, type: 'message', status: 'completed', role: 'assistant', content: [{ type: 'output_text', text: this.msg.text, annotations: [] }] };
@@ -333,8 +339,10 @@ class ResponseBuilder {
       sseWrite(res, 'response.output_item.done', { output_index: call.outputIndex, item });
       this.items.push(item);
     }
-    // DSML 四道门恢复:剔除内容里结构完好的 tool_calls 块 → function_call 条目
+    // DSML 四道门恢复 + 多供应商正文工具调用恢复 → function_call 条目
     const recovered = recoverDSMLToolCalls(this.dsml.capture, this.declaredTools);
+    if (this.recoveredTextTools?.length) recovered.push(...this.recoveredTextTools);
+    this.recoveredTextTools = null;
     this.dsml.capture = '';
     for (const call of recovered) {
       const idx = this.outputIndex++;
@@ -1055,6 +1063,14 @@ class AnthropicStreamBuilder {
         this.cur.text += tail;
         sseWrite(res, 'content_block_delta', { index: i, delta: { type: 'text_delta', text: tail } });
       }
+      const { cleanText, toolCalls } = recoverTextToolCalls(this.cur.text, this.declaredTools);
+      this.cur.text = cleanText;
+      if (toolCalls.length > 0) {
+        for (const tc of toolCalls) {
+          const idx = this.pendingTools.size;
+          this.pendingTools.set(idx, { id: tc.id, name: tc.name, args: tc.arguments });
+        }
+      }
       sseWrite(res, 'content_block_stop', { index: i });
       this.blocks.push({ type: 'text', text: this.cur.text });
     } else if (this.cur.kind === 'thinking') {
@@ -1162,8 +1178,9 @@ class AnthropicStreamBuilder {
    * 宿主(以及 Stop 守卫)据此还能再要一次。
    */
   resolveStop() {
-    const mapped = ANTHROPIC_STOP[this.finish] ?? 'end_turn';
-    if (mapped === 'tool_use' && !this.blocks.some(b => b.type === 'tool_use')) return 'end_turn';
+    let mapped = ANTHROPIC_STOP[this.finish] ?? 'end_turn';
+    if (this.blocks.some(b => b.type === 'tool_use')) mapped = 'tool_use';
+    else if (mapped === 'tool_use') mapped = 'end_turn';
     return mapped;
   }
 }
@@ -1325,7 +1342,33 @@ async function handleMessages(req, res, body, signal) {
       json(res, 502, { type: 'error', error: { type: 'api_error', message: error.message } });
       return;
     }
-    const stopReason = builder.resolveStop();
+    let stopReason = builder.resolveStop();
+    const hasTools = builder.blocks.some(b => b.type === 'tool_use');
+    const textBlocks = builder.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+    if (tools && !hasTools && textBlocks && detectStall(textBlocks).stall) {
+      try {
+        const continuationMessages = [
+          ...chatPayload.messages,
+          { role: 'assistant', content: textBlocks },
+          { role: 'user', content: CONTINUE_PROMPT },
+        ];
+        const contUpstream = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
+          body: JSON.stringify({ ...chatPayload, messages: continuationMessages, tool_choice: 'required' }),
+          signal,
+        });
+        if (contUpstream.ok) {
+          for await (const d of upstreamSseChunks(contUpstream, signal)) {
+            builder.handleChunk(sink, d);
+          }
+          builder.finishBlocks(sink);
+          stopReason = builder.resolveStop();
+        }
+      } catch {
+        /* 追加推进异常时保持原回复退出 */
+      }
+    }
     json(res, 200, {
       id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: wireModel,
       content: builder.blocks, stop_reason: stopReason, stop_sequence: null,
@@ -1341,7 +1384,43 @@ async function handleMessages(req, res, body, signal) {
     const err = builder.handleChunk(res, d);
     if (err) { streamError = err; break; }
   }
-  if (!streamError) streamError = builder.finishAll(res);
+  if (!streamError) {
+    const error = builder.finishBlocks(res);
+    if (error) streamError = error;
+    else {
+      const hasTools = builder.blocks.some(b => b.type === 'tool_use');
+      const textBlocks = builder.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
+      if (tools && !hasTools && textBlocks && detectStall(textBlocks).stall) {
+        try {
+          const continuationMessages = [
+            ...chatPayload.messages,
+            { role: 'assistant', content: textBlocks },
+            { role: 'user', content: CONTINUE_PROMPT },
+          ];
+          const contUpstream = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
+            body: JSON.stringify({ ...chatPayload, messages: continuationMessages, tool_choice: 'required' }),
+            signal,
+          });
+          if (contUpstream.ok) {
+            for await (const d of upstreamSseChunks(contUpstream, signal)) {
+              builder.handleChunk(res, d);
+            }
+            builder.finishBlocks(res);
+          }
+        } catch {
+          /* 追加推进异常时保持原回复退出 */
+        }
+      }
+      const stopReason = builder.resolveStop();
+      sseWrite(res, 'message_delta', {
+        delta: { stop_reason: stopReason, stop_sequence: null },
+        usage: { output_tokens: builder.usage?.output_tokens ?? 0 },
+      });
+      sseWrite(res, 'message_stop', {});
+    }
+  }
   if (streamError) {
     sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: String(streamError.message ?? JSON.stringify(streamError)).slice(0, 500) } });
   }
