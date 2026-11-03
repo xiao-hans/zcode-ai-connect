@@ -4,11 +4,12 @@
 //
 // usage: node probe-upstream-wire.mjs <maxTokens|none> [prompt]
 import fs from 'node:fs'
+import os from 'node:os'
 import { llmHeaders, resolveLlmIdentity, toLlmMessages } from '../zcode-trae-connect/src/llm-utils.js'
 
 const mtArg = process.argv[2] ?? 'none'
 const prompt = process.argv[3] ?? '写一篇关于缓存的文章，至少 800 字。'
-const auth = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/.trae-credentials.json', 'utf8')).auth
+const auth = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/.trae-credentials.json`, 'utf8')).auth
 const identity = await resolveLlmIdentity()
 
 const wire = {

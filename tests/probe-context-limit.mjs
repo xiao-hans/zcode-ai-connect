@@ -4,10 +4,11 @@
 //
 // usage: node probe-context-limit.mjs <chars>
 import fs from 'node:fs'
+import os from 'node:os'
 import { llmHeaders, resolveLlmIdentity, toLlmMessages } from '../zcode-trae-connect/src/llm-utils.js'
 
 const chars = Number(process.argv[2] ?? 700000)
-const auth = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/.trae-credentials.json', 'utf8')).auth
+const auth = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/.trae-credentials.json`, 'utf8')).auth
 const identity = await resolveLlmIdentity()
 
 // Distinct filler so no compression/dedup trick can shrink it.

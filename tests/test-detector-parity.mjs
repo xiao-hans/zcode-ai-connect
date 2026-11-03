@@ -12,6 +12,7 @@
  * Run: node zcode-ai-connect/tests/test-detector-parity.mjs
  */
 import assert from 'node:assert/strict';
+import os from 'node:os'
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
@@ -75,7 +76,7 @@ function findPython() {
     process.env.STALL_PYTHON,
     'python',
     'python3',
-    'C:/Users/HANXIAO/AppData/Local/hermes/tools/python-3.14.9+20261021-win32-x64/python.exe',
+    `${os.homedir()}/AppData/Local/hermes/tools/python-3.14.9+20261021-win32-x64/python.exe`,
   ].filter(Boolean);
   for (const exe of candidates) {
     const probe = spawnSync(exe, ['-c', 'print(1)'], { encoding: 'utf8', timeout: 15000 });

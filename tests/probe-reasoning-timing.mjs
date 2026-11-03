@@ -1,6 +1,7 @@
 // probe-reasoning-timing.mjs — delta arrival timing through the trae /v1 path.
 import fs from 'node:fs'
-const ep = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/endpoint.json', 'utf8'))
+import os from 'node:os'
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/endpoint.json`, 'utf8'))
 const t0 = Date.now()
 const r = await fetch('http://127.0.0.1:' + ep.port + '/v1/chat/completions', {
   method: 'POST',

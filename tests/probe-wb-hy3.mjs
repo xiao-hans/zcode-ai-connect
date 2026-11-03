@@ -1,6 +1,7 @@
 // probe-wb-hy3.mjs — free-model live test on the new account.
 import fs from 'node:fs'
-const ep = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-workbuddy-connect/endpoint.json', 'utf8'))
+import os from 'node:os'
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-workbuddy-connect/endpoint.json`, 'utf8'))
 const r = await fetch('http://127.0.0.1:39271/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + ep.token },

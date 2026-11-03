@@ -1,6 +1,6 @@
 // fix-corrupted-literals.mjs — repair bash-mangled string literals in upstream.js
 import fs from 'node:fs'
-const p = 'D:/HANXIAO/tools/zcode-ai-connect/zcode-qoder-connect/src/upstream.js'
+const p = new URL('../zcode-qoder-connect/src/upstream.js', import.meta.url)
 let s = fs.readFileSync(p, 'utf8')
 let fixes = 0
 // indexOf('<LF>') → indexOf('\n')

@@ -1,8 +1,9 @@
 // probe-direct-dmodel.mjs — raw SSE dump for dmodel via the gateway.
 import crypto from 'node:crypto'
+import os from 'node:os'
 const mod = await import('../zcode-qoder-connect/src/credentials.js')
 const up = await import('../zcode-qoder-connect/src/upstream.js')
-const store = new mod.QoderCredentialStore({ stateDir: 'C:/Users/HANXIAO/.zcode-qoder-connect' })
+const store = new mod.QoderCredentialStore({ stateDir: `${os.homedir()}/.zcode-qoder-connect` })
 const cred = await store.resolve()
 const requestId = crypto.randomUUID()
 const req = {

@@ -3,7 +3,7 @@
 // loop; the first output chunk hands the resumable iterator to the stream,
 // whose start() keeps pumping in the background — live deltas).
 import fs from 'node:fs'
-const p = 'D:/HANXIAO/tools/zcode-ai-connect/zcode-qoder-connect/src/upstream.js'
+const p = new URL('../zcode-qoder-connect/src/upstream.js', import.meta.url)
 let s = fs.readFileSync(p, 'utf8')
 const marker = "    const isQueueBody = (text) => /10605|isQueued|queueCount/.test(String(text))"
 const idx = s.indexOf(marker)

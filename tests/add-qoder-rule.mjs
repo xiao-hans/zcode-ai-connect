@@ -2,9 +2,19 @@
 // (dataBaseDir-resolved provider_config.json) — this is the file the model
 // dropdown actually reads. Shape mirrors the workbuddy/trae rules exactly.
 import fs from 'node:fs'
+import os from 'node:os'
 
-const p = 'D:/HANXIAO/Documents/.zcode/v2/provider_config.json'
-const ep = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-qoder-connect/endpoint.json', 'utf8'))
+// 按 register-qwenwork.mjs 的 dataBaseDir 惯例解析真实 v2 目录
+import path from 'node:path'
+const v2plain = path.join(os.homedir(), '.zcode', 'v2')
+let v2dir = v2plain
+try {
+  const setting = JSON.parse(fs.readFileSync(path.join(v2plain, 'setting.json'), 'utf8'))
+  if (typeof setting?.dataBaseDir === 'string' && setting.dataBaseDir !== '')
+    v2dir = path.join(setting.dataBaseDir, '.zcode', 'v2')
+} catch {}
+const p = path.join(v2dir, 'provider_config.json')
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-qoder-connect/endpoint.json`, 'utf8'))
 const baseUrl = `http://127.0.0.1:${ep.port || 39270}/v1`
 const MODEL_IDS = [
   'deepseek-v4-pro', 'deepseek-flash', 'qwen3.8-max', 'qwen3.8-flash',

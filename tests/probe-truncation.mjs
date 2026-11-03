@@ -6,6 +6,7 @@
 //
 // usage: node probe-truncation.mjs <port> <model> <tag> [runs]
 import fs from 'node:fs'
+import os from 'node:os'
 
 const port = Number(process.argv[2])
 const model = process.argv[3]
@@ -14,7 +15,7 @@ const runs = Number(process.argv[5] ?? 2)
 const epFile = port === 39271 ? 'zcode-workbuddy-connect'
   : port === 39270 ? 'zcode-qoder-connect'
     : 'zcode-trae-connect'
-const ep = JSON.parse(fs.readFileSync(`C:/Users/HANXIAO/.${epFile}/endpoint.json`, 'utf8'))
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.${epFile}/endpoint.json`, 'utf8'))
 
 const prompt = '逐条列出 Linux 内核 6.x 中从进程创建到调度落地的完整代码路径，每条给出文件路径与函数名，并附一句话说明。要求至少 400 条，不要省略、不要写“以下省略”。'
 
@@ -52,7 +53,7 @@ for (let run = 1; run <= runs; run++) {
       if (c?.finish_reason) finish = c.finish_reason
     }
   }
-  fs.writeFileSync(`D:/HANXIAO/tools/zcode-ai-connect/tests/out-${tag}-${run}.txt`, content)
+  fs.writeFileSync(new URL(`./out-${tag}-${run}.txt`, import.meta.url), content)
   console.log(`run${run} elapsed=${((Date.now() - t0) / 1000).toFixed(1)}s chars=${content.length} reasoning=${reasoning.length} finish=${finish} done=${done}`)
   console.log(`  tail: ...${JSON.stringify(content.slice(-90))}`)
 }

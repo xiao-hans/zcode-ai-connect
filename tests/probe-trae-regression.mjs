@@ -1,6 +1,7 @@
 // probe-trae-regression.mjs — CANARY + tool_calls regression through /v1.
 import fs from 'node:fs'
-const ep = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/endpoint.json', 'utf8'))
+import os from 'node:os'
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/endpoint.json`, 'utf8'))
 const H = { 'content-type': 'application/json', Authorization: 'Bearer ' + ep.token }
 async function canary() {
   const r = await fetch('http://127.0.0.1:39272/v1/chat/completions', { method: 'POST', headers: H, body: JSON.stringify({
@@ -18,7 +19,7 @@ async function tools() {
     model: 'deepseek-v4.1-flash',
     messages: [
       { role: 'system', content: '你是编码代理。读取文件必须调用 read_file 工具。' },
-      { role: 'user', content: '读取 C:/Users/HANXIAO/Documents/notes.txt。' },
+      { role: 'user', content: '读取 ${os.homedir()}/Documents/notes.txt。' },
     ],
     tools: [{ type: 'function', function: { name: 'read_file', description: '读取用户机器上的文件', parameters: { type: 'object', properties: { file_path: { type: 'string' } }, required: ['file_path'] } } }],
     tool_choice: 'auto', max_tokens: 400, stream: false }) })

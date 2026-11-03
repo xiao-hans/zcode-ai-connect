@@ -6,12 +6,13 @@
 //
 // usage: node probe-context-canary.mjs <chars> [model]
 import fs from 'node:fs'
+import os from 'node:os'
 import { llmHeaders, resolveLlmIdentity, toLlmMessages } from '../zcode-trae-connect/src/llm-utils.js'
 
 const chars = Number(process.argv[2] ?? 700000)
 const model = process.argv[3] ?? 'glm-5.3-flash'
 const canary = '紫色犀牛7734'
-const auth = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/.trae-credentials.json', 'utf8')).auth
+const auth = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/.trae-credentials.json`, 'utf8')).auth
 const identity = await resolveLlmIdentity()
 
 let filler = `最重要前提：暗号是「${canary}」。稍后会要求你复述。\n`

@@ -3,11 +3,12 @@
 //
 // usage: node replay-session.mjs <session.jsonl> <port> <model> [takeLast] [--drop-empty]
 import fs from 'node:fs'
+import os from 'node:os'
 
 const [file, port, model, takeArg, ...flags] = process.argv.slice(2)
 const take = Number(takeArg ?? 30)
 const dropEmpty = flags.includes('--drop-empty')
-const ep = JSON.parse(fs.readFileSync(`C:/Users/HANXIAO/.zcode-${port === '39271' ? 'workbuddy' : port === '39270' ? 'qoder' : 'trae'}-connect/endpoint.json`, 'utf8'))
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-${port === '39271' ? 'workbuddy' : port === '39270' ? 'qoder' : 'trae'}-connect/endpoint.json`, 'utf8'))
 
 const recs = fs.readFileSync(file, 'utf8').split('\n').filter(Boolean)
   .map((l, i) => { try { return { i, ...JSON.parse(l) } } catch { return null } })

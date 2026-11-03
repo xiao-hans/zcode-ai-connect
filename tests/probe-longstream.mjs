@@ -4,11 +4,12 @@
 //
 // usage: node probe-longstream.mjs <port> <model> [promptWords]
 import fs from 'node:fs'
+import os from 'node:os'
 
 const port = Number(process.argv[2] ?? 39272)
 const model = process.argv[3] ?? 'deepseek-v4.1-flash'
 const words = Number(process.argv[4] ?? 6000)
-const ep = JSON.parse(fs.readFileSync(`C:/Users/HANXIAO/.zcode-trae-connect/endpoint.json`, 'utf8'))
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/endpoint.json`, 'utf8'))
 const t0 = Date.now()
 const stamp = () => `${((Date.now() - t0) / 1000).toFixed(2)}s`
 

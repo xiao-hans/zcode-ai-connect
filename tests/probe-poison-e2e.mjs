@@ -1,6 +1,7 @@
 // probe-poison-e2e.mjs — poisoned-history end-to-end verification (one tiny request).
 import fs from 'node:fs'
-const ep = JSON.parse(fs.readFileSync('C:/Users/HANXIAO/.zcode-trae-connect/endpoint.json', 'utf8'))
+import os from 'node:os'
+const ep = JSON.parse(fs.readFileSync(`${os.homedir()}/.zcode-trae-connect/endpoint.json`, 'utf8'))
 const r = await fetch('http://127.0.0.1:39272/v1/chat/completions', {
   method: 'POST',
   headers: { 'content-type': 'application/json', Authorization: 'Bearer ' + ep.token },
