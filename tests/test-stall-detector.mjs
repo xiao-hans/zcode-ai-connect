@@ -39,6 +39,16 @@ const quiet = (text, why) => {
 
 console.log('test-stall-detector');
 
+check('鸿蒙 target 待办与安装测试待办（真实停顿）', () => {
+  stalls('build-profile 只注册了 `entry` 模块；测试走它的 `ohosTest` target（之前的 `entry_test` 参数名不对，这就是 Script Error 的原因）：');
+  stalls('测试 HAP 构建成功。安装测试 HAP 并跑全量套件');
+});
+check('鸿蒙测试说明、已完成与用户操作不误续', () => {
+  quiet('测试走 ohosTest target 已通过。', '已完成');
+  quiet('请你安装测试 HAP 并跑全量套件。', '用户操作');
+  quiet('安装测试 HAP 并跑全量套件已完成。', '已完成');
+});
+
 // ── 该续跑的 ────────────────────────────────────────────────────────────────
 check('宣布动作 + 冒号收尾（Cursor 方案里的原例）', () => {
   stalls('我先检查配置，再修改这里：');

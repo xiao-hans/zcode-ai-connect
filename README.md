@@ -243,7 +243,7 @@ call C:\Users\HANXIAO\bin\claude.cmd %*
 | 宿主 | 挂载点 | 续跑方式 |
 |---|---|---|
 | ZCode(四个插件) | `Stop` hook | 输出 `{"decision":"block","reason":"…"}`,提示回灌上下文再请求一次 |
-| Claude Code | `Stop` hook | [claude-stall-guard.mjs](scripts/claude-stall-guard.mjs) 读 `transcript_path` 取本轮末条文本判定;同一段文本只续跑一次 + 每回合预算 3 次(原子指纹锁在 `~/.claude-stall-guard/`);**要挂进 `~/.claude/settings.json` 的 `hooks.Stop`,不能只挂在 `--settings` 层**——否则用 `claude` 直接启动(含经 bili 转发)时守卫根本不执行 |
+| Claude Code | 聚合桥接续；可选 `Stop` hook | 聚合桥的 Messages/Responses 路由默认有界接续（见下）；未经过该桥时，可用 [claude-stall-guard.mjs](scripts/claude-stall-guard.mjs) 读取 `transcript_path`，按文本指纹与回合预算防止重复续跑 |
 | pi | `turn_end` | 返回 `{continue:true, entries:[custom_message]}` |
 | dsh | `agent/turn-stopping` | `agent.steer(user 消息)` 塞进 `inbox.nextStep` |
 | hermes | **没有** —— 见下 | 补第 5 道收尾闸(`turn_stop_gates.py`) |
@@ -267,9 +267,19 @@ ZCode 侧的执行流程:
 
 **限制:Stop 载荷里没有 provider 信息**,所以这份 hook 影响 ZCode 里的所有模型,不只千问办公那一个。判定逻辑与 pi / dsh / hermes 侧共用同一套规则(`shared/stall-detector.mjs` 与 `shared/stall_detector.py`,由 `scripts/sync-stall-guard.mjs` 分发),四端阈值一致，`tests/test-detector-parity.mjs` 会逐字段比对两份实现。
 
-### Claude Code 侧必须挂进全局 settings
+### 网关接续（Messages 与 Responses）
 
-`claude-connect.cmd` 只在自己的 `--settings` 层挂守卫。**用 `claude` 直接启动(或经 bili / billion-context 转发)时那一层根本不会被读**,守卫一次都不跑——实测会话里 24 次「宣布下一步就停」没有一条 Stop hook 反馈。所以同时把守卫写进 `~/.claude/settings.json`:
+经过聚合桥的 `/v1/messages` 和 `/v1/responses` 默认启用有界接续，覆盖 `wb/trae/qoder/qw`。Claude Code 经 CC Switch 转为 Responses 请求时也会走此机制，**不需要全局 Stop Hook**；`/v1/chat/completions` 保持透传，不在此接续范围。
+
+- 上游完整正常结束、当前生成无工具、收尾包含明确未执行动作时，再向**原供应商、原模型**追加请求；保留成功请求的历史前缀、工具声明和 `tool_choice`，不强制 `required`。
+- 确认/问句/完成态不接续；`none`、无工具、输出截断与错误不接续。最多追加两次，相同正文再次停顿提前终止。恢复失败明确报错，不伪报完成。
+- SSE 保持单一消息/响应生命周期，最终终止事件仅一次，usage 累计；JSON 使用同一调度。用户取消会终止后续请求。
+- 正常请求没有额外模型调用；每次恢复会再发送上下文并增加 token 消耗。启动桥前设置 `ZC_GATEWAY_CONTINUE=0` 可关闭并回退；`service.log` 的 `continuation` 记录只包含路由/模型/判定信号/尝试与结果，不含正文和密钥。
+- 回归：`node tests/test-bridge-tools.mjs` 覆盖真实停顿正文与两次上游交互，`node tests/test-bridge-cancellation.mjs` 覆盖取消。
+
+### Claude Code 侧可选 Stop Hook
+
+直接连接其他端点、没有经过上述桥路由时，可选用客户端 Stop Hook：
 
 ```jsonc
 {

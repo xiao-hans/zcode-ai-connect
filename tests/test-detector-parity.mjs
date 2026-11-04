@@ -25,6 +25,11 @@ const PY_DETECTOR = join(HERE, '..', 'shared', 'stall_detector.py');
 /** 用例集合：与 test-stall-detector.mjs 同源，另加几条特意为难实现差异的输入。 */
 const CASES = [
   // 该续跑
+  { text: 'build-profile 只注册了 `entry` 模块；测试走它的 `ohosTest` target（之前的 `entry_test` 参数名不对，这就是 Script Error 的原因）：' },
+  { text: '测试 HAP 构建成功。安装测试 HAP 并跑全量套件' },
+  { text: '测试走 ohosTest target 已通过。' },
+  { text: '请你安装测试 HAP 并跑全量套件。' },
+  { text: '安装测试 HAP 并跑全量套件已完成。' },
   { text: '我先检查配置，再修改这里：' },
   { text: '接下来我来实现这个 hook，然后跑一遍测试：' },
   { text: '我先把四个包的 plugin.json 都加上 Stop 注册，再统一验证。' },

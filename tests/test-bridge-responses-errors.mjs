@@ -8,6 +8,7 @@ import { createContext, Script } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { hostIsLoopback, originIsLoopback } from '../zcode-trae-connect/src/loopback.js';
+import { detectStall, CONTINUE_PROMPT } from '../shared/stall-detector.mjs';
 
 const bridgeUrl = new URL('../scripts/codex-responses-bridge.mjs', import.meta.url);
 const source = readFileSync(bridgeUrl, 'utf8');
@@ -17,7 +18,7 @@ const runnable = source.slice(0, source.indexOf('const argv = process.argv.slice
   .replaceAll('import.meta.url', JSON.stringify(bridgeUrl.href));
 let upstream;
 const context = createContext({
-  hostIsLoopback, originIsLoopback, path, fileURLToPath, Buffer, TextDecoder, Date, Set, Map, URL, AbortController, console,
+  hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT, path, fileURLToPath, Buffer, TextDecoder, Date, Set, Map, URL, AbortController, console,
   process: { env: {} },
   os: { homedir: () => '/synthetic-home' },
   fs: { readFileSync: () => JSON.stringify({ port: 1, token: 'synthetic-token' }) },

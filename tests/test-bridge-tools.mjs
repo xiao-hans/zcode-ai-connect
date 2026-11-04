@@ -189,7 +189,7 @@ for (const [label, text] of [
 ]) {
   for (const route of ['messages', 'responses']) {
     await test(`R08 ${route} does not execute ${label}`, async () => {
-      const result = await request(route, false, [...text].map(content => chunk({ content })));
+      const result = await request(route, false, [...[...text].map(content => chunk({ content })), chunk({}, 'stop')]);
       assert.equal(result.status, 200, result.text);
       const body = JSON.parse(result.text);
       const blocks = route === 'messages' ? body.content : body.output;
@@ -257,5 +257,166 @@ await test('R09 forced R10 continuation cannot downgrade on 400', async () => {
   assert.equal(calls.length, 1);
   assert.equal(result.status, 400);
 });
-console.log(`bridge R05/R08/R09: ${passed} passed, ${failed} failed`);
+const stalledReplies = [
+  'build-profile 只注册了 `entry` 模块；测试走它的 `ohosTest` target（之前的 `entry_test` 参数名不对，这就是 Script Error 的原因）：',
+  '测试 HAP 构建成功（`entry@ohosTest` target 才是正确参数，此前的 `entry_test@default` Script Error 就此根因解决）。安装测试 HAP 并跑全量套件',
+];
+for (const provider of ['wb', 'trae', 'qoder', 'qw']) {
+  for (const route of ['messages', 'responses']) {
+    for (const stream of [false, true]) {
+      for (const text of stalledReplies) {
+        await test(`continuation ${provider} ${route} ${stream ? 'SSE' : 'JSON'} real stalled reply`, async () => {
+          const result = await request(route, stream, [], { model: `${provider}/test` }, n => n === 1
+            ? sse([chunk({ content: text }, 'stop'), { usage: { prompt_tokens: 10, completion_tokens: 3 } }])
+            : sse([chunk({ tool_calls: [tool(0, '{"path":"a"}', 'read', 'continued')] }, 'tool_calls'), { usage: { prompt_tokens: 20, completion_tokens: 4 } }]));
+          assert.equal(calls.length, 2, 'must issue a second upstream request');
+          assert.equal(calls[1].model, calls[0].model);
+          assert.deepEqual(calls[1].tools, calls[0].tools);
+          assert.deepEqual(calls[1].tool_choice, calls[0].tool_choice);
+          assert.deepEqual(calls[1].messages.slice(0, -2), calls[0].messages, 'history is append-only');
+          assert.equal(calls[1].messages.at(-2).content, text);
+          assert.equal(result.status, 200, result.text);
+          const es = stream ? events(result.text) : [];
+          const body = route === 'messages' ? message(result, stream)
+            : stream ? es.find(e => e.type === 'response.completed')?.response : JSON.parse(result.text);
+          const blocks = route === 'messages' ? body.content : body.output;
+          assert.equal(blocks.filter(b => b.type === 'tool_use' || b.type === 'function_call').length, 1, result.text);
+          if (route === 'messages') assert.equal(body.stop_reason, 'tool_use');
+          if (stream) {
+            const terminal = route === 'messages' ? 'message_stop' : 'response.completed';
+            assert.equal(es.filter(e => e.type === terminal).length, 1);
+            const usage = route === 'messages' ? es.find(e => e.type === 'message_delta').usage : body.usage;
+            assert.equal(usage.output_tokens, 7, 'sum both upstream output usages');
+            if (route === 'responses') {
+              assert.equal(body.usage.input_tokens, 30);
+              const ids = es.filter(e => e.response).map(e => e.response.id);
+              assert.equal(new Set(ids).size, 1, 'one response ID throughout continuation');
+              assert.equal(es.some(e => e.type === 'content_block_delta'), false, 'Responses must not emit Messages events');
+            }
+          } else {
+            assert.equal(body.usage.output_tokens, 7);
+            assert.equal(body.usage.input_tokens, 30);
+          }
+        });
+      }
+    }
+  }
+}
+for (const route of ['messages', 'responses']) {
+  for (const stream of [false, true]) {
+    const stalled = '我先读取配置并验证编译结果。';
+    const failing = (result) => {
+      if (!stream) {
+        assert.equal(result.status, 502, result.text);
+        assert.ok(JSON.parse(result.text).error, result.text);
+      } else {
+        const es = events(result.text);
+        assert.ok(es.some(e => e.type === (route === 'messages' ? 'error' : 'response.failed')), result.text);
+        assert.equal(es.some(e => e.type === 'message_stop' || e.type === 'response.completed'), false);
+      }
+    };
+    for (const text of ['已完成全部验证。', '请你确认后我再执行。', '根因有三层：', '以后遇到问题，我会先检查配置。']) {
+      await test(`continuation ${route} ${stream} does not interrupt ${text}`, async () => {
+        const result = await request(route, stream, [chunk({ content: text }, 'stop')]);
+        assert.equal(result.status, 200, result.text);
+        assert.equal(calls.length, 1);
+      });
+    }
+    for (const finish of ['length', 'content_filter']) {
+      await test(`continuation ${route} ${stream} never retries ${finish}`, async () => {
+        const result = await request(route, stream, [chunk({ content: stalled }, finish)]);
+        assert.equal(result.status, 200);
+        assert.equal(calls.length, 1);
+      });
+    }
+    for (const extra of [{ tools: [] }, { tool_choice: route === 'messages' ? { type: 'none' } : 'none' }]) {
+      await test(`continuation ${route} ${stream} honors disabled tools`, async () => {
+        const result = await request(route, stream, [chunk({ content: stalled }, 'stop')], extra);
+        assert.equal(result.status, 200, result.text);
+        assert.equal(calls.length, 1);
+      });
+    }
+    await test(`continuation ${route} ${stream} existing tool is not repeated`, async () => {
+      await request(route, stream, [chunk({ content: stalled }), chunk({ tool_calls: [tool(0, '{}', 'read', 'r')] }, 'tool_calls')]);
+      assert.equal(calls.length, 1);
+    });
+    await test(`continuation ${route} ${stream} preserves named tool`, async () => {
+      const choice = route === 'messages' ? { type: 'tool', name: 'read' } : { type: 'function', name: 'read' };
+      await request(route, stream, [], { tool_choice: choice }, n => n === 1
+        ? sse([chunk({ content: stalled }, 'stop')]) : sse([chunk({ tool_calls: [tool(0, '{}', 'read', 'r')] }, 'tool_calls')]));
+      assert.equal(calls.length, 2);
+      assert.deepEqual(calls[1].tool_choice, { type: 'function', function: { name: 'read' } });
+    });
+    await test(`continuation ${route} ${stream} retains known usage when final segment omits it`, async () => {
+      const result = await request(route, stream, [], {}, n => n === 1
+        ? sse([chunk({ content: stalled }, 'stop'), { usage: { prompt_tokens: 10, completion_tokens: 3 } }])
+        : sse([chunk({ tool_calls: [tool(0, '{}', 'read', 'r')] }, 'tool_calls')]));
+      assert.equal(calls.length, 2);
+      assert.equal(result.status, 200, result.text);
+      const es = stream ? events(result.text) : [];
+      const body = route === 'messages' ? message(result, stream)
+        : stream ? es.find(e => e.type === 'response.completed').response : JSON.parse(result.text);
+      const usage = route === 'messages' && stream ? es.find(e => e.type === 'message_delta').usage : body.usage;
+      assert.equal(usage.input_tokens, 10);
+      assert.equal(usage.output_tokens, 3);
+    });
+    if (route === 'responses') {
+      await test(`continuation responses ${stream} preserves length-truncated tool as incomplete`, async () => {
+        const result = await request(route, stream, [chunk({ tool_calls: [tool(0, '{"path":"abc', 'read', 'r')] }, 'length')]);
+        assert.equal(calls.length, 1);
+        assert.equal(result.status, 200, result.text);
+        const es = stream ? events(result.text) : [];
+        const body = stream ? es.find(e => e.type === 'response.incomplete')?.response : JSON.parse(result.text);
+        assert.equal(body?.status, 'incomplete', result.text);
+        assert.equal(body.incomplete_details.reason, 'max_output_tokens');
+        assert.equal(body.error, null);
+        assert.equal(body.output.some(b => b.type === 'function_call' && b.status === 'completed'), false);
+        assert.equal(es.some(e => e.type === 'response.completed' || e.type === 'response.failed'), false);
+      });
+    }
+    for (const failure of ['HTTP', 'connection', 'stream', 'missing-finish', 'invalid-tool']) {
+      await test(`continuation ${route} ${stream} ${failure} reports failure`, async () => {
+        const result = await request(route, stream, [], {}, n => {
+          if (n === 1) return sse([chunk({ content: stalled }, 'stop')]);
+          if (failure === 'HTTP') return new Response('unavailable', { status: 503 });
+          if (failure === 'connection') throw new Error('connection failed');
+          if (failure === 'stream') return sse([{ error: { message: 'stream failed' } }]);
+          if (failure === 'invalid-tool') return sse([chunk({ tool_calls: [tool(0, '{broken', 'read', 'r')] }, 'tool_calls')]);
+          return sse([chunk({ content: 'partial' })]);
+        });
+        failing(result);
+        assert.equal(calls.length, 2);
+      });
+    }
+    await test(`continuation ${route} ${stream} unfinished repeated reply is bounded`, async () => {
+      const result = await request(route, stream, [], {}, () => sse([chunk({ content: stalled }, 'stop')]));
+      failing(result);
+      assert.equal(calls.length, 2);
+      assert.match(result.text, /unfinished/);
+    });
+    await test(`continuation ${route} ${stream} max two extra requests`, async () => {
+      const result = await request(route, stream, [], {}, n => sse([chunk({ content: `我先检查第 ${n} 个配置文件。` }, 'stop')]));
+      failing(result);
+      assert.equal(calls.length, 3);
+    });
+    await test(`continuation ${route} ${stream} feature switch off`, async () => {
+      context.process.env.ZC_GATEWAY_CONTINUE = '0';
+      try {
+        await request(route, stream, [chunk({ content: stalled }, 'stop')]);
+        assert.equal(calls.length, 1);
+      } finally { delete context.process.env.ZC_GATEWAY_CONTINUE; }
+    });
+    await test(`continuation ${route} ${stream} successful compatibility retry payload is preserved`, async () => {
+      const result = await request(route, stream, [], { max_output_tokens: 40, max_tokens: 40 }, n => {
+        if (n === 1) return new Response('unsupported stream_options', { status: 400 });
+        if (n === 2) return sse([chunk({ content: stalled }, 'stop')]);
+        return sse([chunk({ tool_calls: [tool(0, '{}', 'read', 'r')] }, 'tool_calls')]);
+      });
+      assert.equal(result.status, 200, result.text);
+      assert.equal(calls.length, 3);
+      assert.deepEqual({ ...calls[2], messages: calls[1].messages }, calls[1], 'only append messages to the successful payload');
+    });
+  }
+}
+console.log(`bridge R05/R08/R09 + continuation: ${passed} passed, ${failed} failed`);
 if (failed) process.exitCode = 1;

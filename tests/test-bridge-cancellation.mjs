@@ -9,6 +9,7 @@ import { createContext, Script } from 'node:vm';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { hostIsLoopback, originIsLoopback } from '../zcode-trae-connect/src/loopback.js';
+import { detectStall, CONTINUE_PROMPT } from '../shared/stall-detector.mjs';
 
 const bridgeUrl = new URL('../scripts/codex-responses-bridge.mjs', import.meta.url);
 const source = readFileSync(bridgeUrl, 'utf8');
@@ -19,7 +20,7 @@ let respond;
 const calls = [];
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, AbortSignal, console,
-  hostIsLoopback, originIsLoopback,
+  hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT,
   process: { env: {} },
   os: { homedir: () => '/synthetic-home' },
   fs: { readFileSync: () => JSON.stringify({ port: 1, token: 'synthetic-token' }) },
@@ -89,7 +90,7 @@ function streamResponse() {
   };
 }
 
-function request(route, stream) {
+function request(route, stream, extra = {}) {
   calls.length = 0;
   const output = [];
   const socket = new Duplex({ read() {}, write(_data, _encoding, done) { done(); } });
@@ -99,7 +100,7 @@ function request(route, stream) {
     complete: true, url: `/v1/${route}`,
     headers: { host: '127.0.0.1:39268', 'content-type': 'application/json' },
   });
-  req.push(JSON.stringify({ model: 'trae/test', stream, input: 'hi', messages: [{ role: 'user', content: 'hi' }] }));
+  req.push(JSON.stringify({ model: 'trae/test', stream, input: 'hi', messages: [{ role: 'user', content: 'hi' }], ...extra }));
   req.push(null);
   const res = new ServerResponse(req);
   res.assignSocket(socket);
@@ -264,5 +265,42 @@ for (const route of ['responses', 'messages']) {
     }
   }
 }
-console.log(`bridge R13 cancellation: ${passed} passed, ${failed} failed`);
+for (const route of ['responses', 'messages']) {
+  for (const stream of [false, true]) {
+    await test(`${route} ${stream ? 'SSE' : 'JSON'} cancel during gateway continuation`, async () => {
+      const entered = deferred();
+      const pending = deferred();
+      let signal;
+      const tool = { name: 'read', input_schema: { type: 'object', properties: { path: { type: 'string' } } } };
+      respond = (options, count) => {
+        signal = options.signal;
+        if (count === 1) {
+          return new Response(`data: ${JSON.stringify({ choices: [{ delta: { content: '我先读取配置并跑一次验证。' }, finish_reason: 'stop' }] })}\n\ndata: [DONE]\n\n`);
+        }
+        const abort = () => pending.reject(signal.reason);
+        signal.addEventListener('abort', abort, { once: true });
+        entered.resolve();
+        return pending.promise.finally(() => signal.removeEventListener('abort', abort));
+      };
+      const client = request(route, stream, {
+        tools: route === 'messages' ? [tool] : [{ type: 'function', name: 'read', parameters: tool.input_schema }],
+      });
+      try {
+        await bounded(entered.promise, 'continuation fetch');
+        assert.equal(calls.length, 2);
+        await client.cancel();
+        await client.settled();
+        assert.ok(signal.aborted);
+        assert.ok(calls.every(call => call.signal === signal));
+        assert.equal(getEventListeners(signal, 'abort').length, 0);
+        assert.doesNotMatch(client.output, /response\.completed|message_stop/);
+      } finally {
+        pending.reject(new Error('fixture cleanup'));
+        await client.settled();
+        client.cleanup();
+      }
+    });
+  }
+}
+console.log(`bridge R13 cancellation + continuation: ${passed} passed, ${failed} failed`);
 if (failed) process.exitCode = 1;

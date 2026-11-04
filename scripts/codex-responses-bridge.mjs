@@ -196,6 +196,7 @@ class ResponseBuilder {
     this.declaredTools = declaredTools;
     this.dsml = new DSMLTextFilter();
     this.items = [];
+    this.responseId = `resp_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
     this.outputIndex = 0;
     this.msg = null;   // 进行中的 assistant message
     this.reasoning = null;
@@ -206,7 +207,7 @@ class ResponseBuilder {
 
   responsePayload(status, extra = {}) {
     return {
-      id: `resp_${Date.now().toString(36)}`,
+      id: this.responseId,
       object: 'response',
       created_at: Math.floor(Date.now() / 1000),
       status,
@@ -238,7 +239,7 @@ class ResponseBuilder {
     const tail = this.dsml.flush();
     if (tail) {
       this.msg.text += tail;
-      sseWrite(res, 'content_block_delta', { index: this.msg.outputIndex, delta: { type: 'text_delta', text: tail } });
+      sseWrite(res, 'response.output_text.delta', { item_id: this.msg.id, output_index: this.msg.outputIndex, content_index: 0, delta: tail });
     }
     const { cleanText, toolCalls } = recoverTextToolCalls(this.msg.text, this.declaredTools);
     this.msg.text = cleanText;
@@ -332,10 +333,22 @@ class ResponseBuilder {
   finishAll(res, status) {
     this.finishReasoning(res);
     this.finishMsg(res);
+    if (this.finish !== 'length') {
+      for (const call of this.calls.values()) {
+        if (!call.announced) continue;
+        try {
+          const input = JSON.parse(call.args || '{}');
+          if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('expected an object');
+        } catch {
+          return { message: `Invalid tool arguments for ${call.name}` };
+        }
+      }
+    }
     for (const [, call] of [...this.calls.entries()].sort((a, b) => a[0] - b[0])) {
       if (!call.announced) continue; // 没拿到名字的残缺调用,丢弃
-      sseWrite(res, 'response.function_call_arguments.done', { item_id: `fc_${call.outputIndex}`, output_index: call.outputIndex, arguments: call.args });
-      const item = { id: `fc_${call.outputIndex}`, type: 'function_call', status: 'completed', call_id: call.id, name: call.name, arguments: call.args };
+      const callStatus = this.finish === 'length' ? 'incomplete' : 'completed';
+      if (callStatus === 'completed') sseWrite(res, 'response.function_call_arguments.done', { item_id: `fc_${call.outputIndex}`, output_index: call.outputIndex, arguments: call.args });
+      const item = { id: `fc_${call.outputIndex}`, type: 'function_call', status: callStatus, call_id: call.id, name: call.name, arguments: call.args };
       sseWrite(res, 'response.output_item.done', { output_index: call.outputIndex, item });
       this.items.push(item);
     }
@@ -353,6 +366,8 @@ class ResponseBuilder {
       sseWrite(res, 'response.output_item.done', { output_index: idx, item });
       this.items.push(item);
     }
+    this.calls.clear();
+    return null;
   }
 }
 
@@ -418,7 +433,7 @@ function clampEffort(tool, level) {
   return ranked.find(eff => EFFORT_RANK.indexOf(eff) >= target) ?? ranked[ranked.length - 1];
 }
 
-async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false, signal } = {}) {
+async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false, signal, onPayload } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
   const payload = {
@@ -435,6 +450,7 @@ async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, n
   const tc = toChatToolChoice(body.tool_choice);
   if (tc) payload.tool_choice = tc;
   // parallel_tool_calls 不转发:workbuddy 上游通道校验会拦非官方字段
+  onPayload?.(payload);
 
   return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
     method: 'POST',
@@ -477,9 +493,13 @@ async function handleResponses(req, res, wireModel, body, signal) {
     await appendFile(path.join(stateDir, 'debug-trace.log'), `${new Date().toISOString()} ${JSON.stringify(body)}\n`).catch(() => {});
   }
 
+  let successfulPayload;
   const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
     signal.throwIfAborted();
-    return upstreamChat(ep, { ...body, model: chatModel }, { mutLevel, noStreamOptions, noMaxTokens, signal });
+    return upstreamChat(ep, { ...body, model: chatModel }, {
+      mutLevel, noStreamOptions, noMaxTokens, signal,
+      onPayload: payload => { successfulPayload = payload; },
+    });
   };
 
   // 入口校验:翻译后一条消息都没有就别打上游了。上游只会回一句笼统的
@@ -542,49 +562,118 @@ async function handleResponses(req, res, wireModel, body, signal) {
   }
 
   const clientWantsStream = body.stream !== false;
+  const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
+  const sink = clientWantsStream ? res : { write: () => {} };
+  if (clientWantsStream) {
+    res.writeHead(200, {
+      'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive',
+    });
+    sseWrite(res, 'response.created', { response: builder.responsePayload('in_progress') });
+    sseWrite(res, 'response.in_progress', { response: builder.responsePayload('in_progress') });
+  }
+  const streamError = await consumeWithContinuation(upstream, builder, sink, {
+    ep, payload: successfulPayload, signal, route: 'responses',
+  });
+  const status = streamError ? 'failed' : builder.finish === 'length' ? 'incomplete' : 'completed';
+  const response = builder.responsePayload(status, {
+    error: streamError,
+    incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
+  });
   if (!clientWantsStream) {
-    // 聚合成单个 JSON response(codex 恒为流式;此路径便于 curl 调试)
-    const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
-    const sink = { write: () => {} };
-    let streamError = null;
-    for await (const d of upstreamSseChunks(upstream, signal)) {
-      const err = builder.handleChunk(sink, d);
-      if (err?.error) { streamError = err.error; break; }
-    }
-    builder.finishAll(sink);
-    const status = streamError ? 'failed' : builder.finish === 'length' ? 'incomplete' : 'completed';
-    json(res, streamError ? 502 : 200, builder.responsePayload(status, {
-      error: streamError,
-      incomplete_details: status === 'incomplete' ? { reason: 'max_output_tokens' } : null,
-    }));
+    json(res, streamError ? 502 : 200, response);
     return;
   }
-
-  res.writeHead(200, {
-    'content-type': 'text/event-stream',
-    'cache-control': 'no-cache',
-    connection: 'keep-alive',
-  });
-  const builder = new ResponseBuilder(wireModel, new Set((body.tools ?? []).filter(t2 => t2?.type === 'function' && t2.name).map(t2 => t2.name)));
-  sseWrite(res, 'response.created', { response: builder.responsePayload('in_progress') });
-  sseWrite(res, 'response.in_progress', { response: builder.responsePayload('in_progress') });
-
-  let streamError = null;
-  for await (const d of upstreamSseChunks(upstream, signal)) {
-    const err = builder.handleChunk(res, d);
-    if (err?.error) { streamError = err.error; break; }
-  }
-  builder.finishAll(res);
-
-  if (streamError) {
-    sseWrite(res, 'response.failed', { response: builder.responsePayload('failed', { error: streamError }) });
-  } else if (builder.finish === 'length') {
-    sseWrite(res, 'response.incomplete', { response: builder.responsePayload('incomplete', { incomplete_details: { reason: 'max_output_tokens' } }) });
-  } else {
-    sseWrite(res, 'response.completed', { response: builder.responsePayload('completed') });
-  }
+  sseWrite(res, `response.${status}`, { response });
   sseDone(res);
   res.end();
+}
+
+// 只接续完整的正常结束；客户端执行工具，网关只追加模型生成，不代执行。
+async function consumeWithContinuation(upstream, builder, sink, { ep, payload, signal, route }) {
+  let messages = payload.messages;
+  const seen = new Set();
+  const totals = { input_tokens: 0, output_tokens: 0, total_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens_details: { reasoning_tokens: 0 } };
+  const traceId = `${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+  const trace = (attempt, outcome, signals = []) => log(`continuation ${JSON.stringify({ traceId, route, model: builder.model, attempt, outcome, signals })}`);
+  const enabled = process.env.ZC_GATEWAY_CONTINUE !== '0';
+
+  for (let attempt = 0; ; attempt++) {
+    signal.throwIfAborted();
+    builder.finish = null;
+    const previousUsage = builder.usage;
+    builder.usage = null;
+    const output = builder.blocks ?? builder.items;
+    const start = output.length;
+    let text = '';
+    for await (const d of upstreamSseChunks(upstream, signal)) {
+      const content = d.choices?.[0]?.delta?.content;
+      if (typeof content === 'string') text += content;
+      const result = builder.handleChunk(sink, d);
+      const error = result?.error ?? result;
+      if (error) {
+        // Responses 错误载荷保留此前已收到的正文，但不完成任何工具条目。
+        if (builder.items) {
+          builder.finishReasoning(sink);
+          builder.finishMsg(sink);
+        }
+        await trace(attempt, 'stream-error');
+        return error;
+      }
+    }
+    signal.throwIfAborted();
+    const segmentUsage = builder.usage;
+    const error = builder.blocks ? builder.finishBlocks(sink) : builder.finishAll(sink);
+    if (error) {
+      await trace(attempt, 'invalid-tool');
+      return error;
+    }
+    if (segmentUsage) {
+      for (const key of ['input_tokens', 'output_tokens', 'total_tokens']) totals[key] += segmentUsage[key] ?? 0;
+      totals.input_tokens_details.cached_tokens += segmentUsage.input_tokens_details?.cached_tokens ?? 0;
+      totals.output_tokens_details.reasoning_tokens += segmentUsage.output_tokens_details?.reasoning_tokens ?? 0;
+      builder.usage = { ...totals, input_tokens_details: { ...totals.input_tokens_details }, output_tokens_details: { ...totals.output_tokens_details } };
+    } else {
+      builder.usage = previousUsage;
+    }
+    if (!builder.finish) {
+      await trace(attempt, 'missing-finish');
+      return { type: 'upstream_incomplete', message: 'Upstream stream ended without a finish_reason' };
+    }
+    const segment = output.slice(start);
+    const toolCount = segment.filter(b => b.type === 'tool_use' || b.type === 'function_call').length;
+    const verdict = detectStall(text, { toolCallCount: toolCount });
+    if (!enabled || builder.finish !== 'stop' || !payload.tools?.length || payload.tool_choice === 'none' || !verdict.stall) {
+      if (attempt > 0) await trace(attempt, toolCount ? 'tool-produced' : 'ended', verdict.signals);
+      return null;
+    }
+    if (attempt >= 2 || seen.has(text.trim())) {
+      await trace(attempt, 'exhausted', verdict.signals);
+      return { type: 'continuation_exhausted', message: 'Gateway continuation did not make progress; task remains unfinished' };
+    }
+    seen.add(text.trim());
+    // 保留成功请求的前缀和 tool_choice，不把确认/完成回答强制改成工具动作。
+    messages = [...messages, { role: 'assistant', content: text }, { role: 'user', content: verdict.prompt ?? CONTINUE_PROMPT }];
+    await trace(attempt + 1, 'retry', verdict.signals);
+    signal.throwIfAborted();
+    try {
+      upstream = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
+        body: JSON.stringify({ ...payload, messages }),
+        signal,
+      });
+    } catch (error) {
+      signal.throwIfAborted();
+      await trace(attempt + 1, 'connection-error');
+      return { type: 'continuation_failed', message: `Gateway continuation connection failed: ${error.cause?.code ?? error.message}` };
+    }
+    signal.throwIfAborted();
+    if (!upstream.ok) {
+      await upstream.body?.cancel();
+      await trace(attempt + 1, `http-${upstream.status}`);
+      return { type: 'continuation_failed', message: `Gateway continuation upstream HTTP ${upstream.status}` };
+    }
+  }
 }
 
 async function* upstreamSseChunks(upstream, signal) {
@@ -1260,6 +1349,7 @@ async function handleMessages(req, res, body, signal) {
   if (maxOut) chatPayload.max_tokens = maxOut;
   const estInput = estimateTokens(body);
 
+  let successfulPayload;
   const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
     signal.throwIfAborted();
     const p = { ...chatPayload };
@@ -1267,6 +1357,7 @@ async function handleMessages(req, res, body, signal) {
     p.messages = toChatMessagesAnthropic(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), mutLevel), body.messages, mutLevel);
     if (noStreamOptions) delete p.stream_options;
     if (noMaxTokens) delete p.max_tokens;
+    successfulPayload = p;
     return fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
       method: 'POST',
       headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
@@ -1328,101 +1419,35 @@ async function handleMessages(req, res, body, signal) {
   }
 
   const builder = new AnthropicStreamBuilder(wireModel, estInput, new Set((tools ?? []).map(t2 => t2.function.name)));
-  if (body.stream !== true) {
-    const sink = { write: () => {} };
-    for await (const d of upstreamSseChunks(upstream, signal)) {
-      const error = builder.handleChunk(sink, d);
-      if (error) {
-        json(res, 502, { type: 'error', error: { type: 'api_error', message: String(error.message ?? JSON.stringify(error)).slice(0, 500) } });
-        return;
-      }
-    }
-    const error = builder.finishBlocks(sink);
-    if (error) {
-      json(res, 502, { type: 'error', error: { type: 'api_error', message: error.message } });
+  const streaming = body.stream === true;
+  const sink = streaming ? res : { write: () => {} };
+  if (streaming) {
+    res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
+    builder.msgStart(res);
+  }
+  const streamError = await consumeWithContinuation(upstream, builder, sink, {
+    ep, payload: successfulPayload, signal, route: 'messages',
+  });
+  if (!streaming) {
+    if (streamError) {
+      json(res, 502, { type: 'error', error: { type: 'api_error', message: streamError.message } });
       return;
-    }
-    let stopReason = builder.resolveStop();
-    const hasTools = builder.blocks.some(b => b.type === 'tool_use');
-    const textBlocks = builder.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-    if (tools && !hasTools && textBlocks && detectStall(textBlocks).stall) {
-      try {
-        const continuationMessages = [
-          ...chatPayload.messages,
-          { role: 'assistant', content: textBlocks },
-          { role: 'user', content: CONTINUE_PROMPT },
-        ];
-        const contUpstream = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
-          body: JSON.stringify({ ...chatPayload, messages: continuationMessages, tool_choice: 'required' }),
-          signal,
-        });
-        if (contUpstream.ok) {
-          for await (const d of upstreamSseChunks(contUpstream, signal)) {
-            builder.handleChunk(sink, d);
-          }
-          builder.finishBlocks(sink);
-          stopReason = builder.resolveStop();
-        }
-      } catch {
-        /* 追加推进异常时保持原回复退出 */
-      }
     }
     json(res, 200, {
       id: `msg_${Date.now().toString(36)}`, type: 'message', role: 'assistant', model: wireModel,
-      content: builder.blocks, stop_reason: stopReason, stop_sequence: null,
+      content: builder.blocks, stop_reason: builder.resolveStop(), stop_sequence: null,
       usage: { input_tokens: builder.usage?.input_tokens ?? estInput, output_tokens: builder.usage?.output_tokens ?? 0 },
     });
     return;
   }
-
-  res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
-  builder.msgStart(res);
-  let streamError = null;
-  for await (const d of upstreamSseChunks(upstream, signal)) {
-    const err = builder.handleChunk(res, d);
-    if (err) { streamError = err; break; }
-  }
-  if (!streamError) {
-    const error = builder.finishBlocks(res);
-    if (error) streamError = error;
-    else {
-      const hasTools = builder.blocks.some(b => b.type === 'tool_use');
-      const textBlocks = builder.blocks.filter(b => b.type === 'text').map(b => b.text).join('\n').trim();
-      if (tools && !hasTools && textBlocks && detectStall(textBlocks).stall) {
-        try {
-          const continuationMessages = [
-            ...chatPayload.messages,
-            { role: 'assistant', content: textBlocks },
-            { role: 'user', content: CONTINUE_PROMPT },
-          ];
-          const contUpstream = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
-            method: 'POST',
-            headers: { 'content-type': 'application/json', authorization: `Bearer ${ep.token}` },
-            body: JSON.stringify({ ...chatPayload, messages: continuationMessages, tool_choice: 'required' }),
-            signal,
-          });
-          if (contUpstream.ok) {
-            for await (const d of upstreamSseChunks(contUpstream, signal)) {
-              builder.handleChunk(res, d);
-            }
-            builder.finishBlocks(res);
-          }
-        } catch {
-          /* 追加推进异常时保持原回复退出 */
-        }
-      }
-      const stopReason = builder.resolveStop();
-      sseWrite(res, 'message_delta', {
-        delta: { stop_reason: stopReason, stop_sequence: null },
-        usage: { output_tokens: builder.usage?.output_tokens ?? 0 },
-      });
-      sseWrite(res, 'message_stop', {});
-    }
-  }
   if (streamError) {
     sseWrite(res, 'error', { type: 'error', error: { type: 'api_error', message: String(streamError.message ?? JSON.stringify(streamError)).slice(0, 500) } });
+  } else {
+    sseWrite(res, 'message_delta', {
+      delta: { stop_reason: builder.resolveStop(), stop_sequence: null },
+      usage: { input_tokens: builder.usage?.input_tokens ?? estInput, output_tokens: builder.usage?.output_tokens ?? 0 },
+    });
+    sseWrite(res, 'message_stop', {});
   }
   sseDone(res);
   res.end();
