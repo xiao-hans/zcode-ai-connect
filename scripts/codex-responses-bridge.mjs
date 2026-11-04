@@ -52,6 +52,27 @@ async function log(line) {
   } catch { /* 诊断尽力而为 */ }
 }
 
+/** 截断到 n 字符,超出加标记:把失败报文落盘时不至于无限膨胀。 */
+function trunc(v, n) {
+  if (v === undefined || v === null) return v;
+  const s = typeof v === 'string' ? v : JSON.stringify(v);
+  if (s === undefined) return undefined;
+  return s.length > n ? `${s.slice(0, n)}…[截断 ${s.length - n} 字符]` : s;
+}
+
+/**
+ * 11128(未授权渠道)在「改写梯子」全部耗尽后仍命中时,把真正发出去的报文形态落盘,
+ * 供后续定位是哪段文本(system / 工具定义 / 历史 / 用户输入)触发上游指纹。
+ * 只在失败时写,正常请求零开销;任何异常都不外抛,绝不影响请求本身。
+ */
+function captureFingerprint(kind, info) {
+  try {
+    fs.mkdirSync(stateDir, { recursive: true });
+    const record = { at: new Date().toISOString(), kind, ...info };
+    fs.appendFileSync(path.join(stateDir, 'fingerprint-capture.log'), `${JSON.stringify(record)}\n`);
+  } catch { /* 捕获是诊断,绝不能影响请求 */ }
+}
+
 /**
  * 进程级兜底:桥是所有会话共用的单点,任何一次请求里的漏网异常都不该让它退出。
  *
@@ -551,6 +572,18 @@ async function handleResponses(req, res, wireModel, body, signal) {
     }
     if (!upstream.ok) {
       if (!upstream.bodyUsed) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
+      if (errText.includes('11128')) {
+        captureFingerprint('responses', {
+          tool: t.tool,
+          model: chatModel,
+          status: upstream.status,
+          err: trunc(errText, 600),
+          instructionsRaw: trunc(body.instructions, 40000),
+          instructionsLevel2: trunc(deFingerprint(body.instructions, 2), 40000),
+          input: trunc(body.input, 200000),
+          tools: trunc(body.tools, 120000),
+        });
+      }
       json(res, upstream.status, { error: { message: errText.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
       return;
     }
@@ -1409,6 +1442,18 @@ async function handleMessages(req, res, body, signal) {
     }
     if (!upstream.ok) {
       if (!upstream.bodyUsed) errText = await upstream.text().catch(() => { signal.throwIfAborted(); return ''; });
+      if (errText.includes('11128')) {
+        captureFingerprint('messages', {
+          tool: t.tool,
+          model: body.model,
+          status: upstream.status,
+          err: trunc(errText, 600),
+          systemRaw: trunc(body.system, 40000),
+          systemLevel2: trunc(deFingerprint(anthropicTextOf(stripBillingBlocks(body.system)), 2), 40000),
+          messages: trunc(body.messages, 200000),
+          tools: trunc(body.tools, 120000),
+        });
+      }
       json(res, upstream.status, { type: 'error', error: { type: 'api_error', message: errText.slice(0, 500) || `upstream HTTP ${upstream.status}` } });
       return;
     }
