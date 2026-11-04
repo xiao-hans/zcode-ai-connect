@@ -120,6 +120,23 @@ check('交回选择权', () => {
   quiet('接下来需要你决定用哪个方案，我再动手。', 'asked-user');
 });
 
+check('条件授权与等待放行（2026-11-04 真实事故回放）', () => {
+  // 原事故长句：包含「推荐先跑」「改」「实测」及「等你一句话我来改」
+  quiet(
+    '**等拍板的两件事**（不影响今晚 17:45 五步轮，链路正常待命）：\\n' +
+    '1. **Hermes cron 5 个任务全挂 400**：上游把 gpt-6-luna 从 chat completions 通道下了。修法二选一：改 cron 模型或切 responses 通道 provider。**推荐先跑 `hermes chat -q PONG` 实测哪个模型可用再改**，等你一句话我来改。\\n' +
+    '2. 4 个未推送提交 + MR !6 评审、APK 重建——你自己的节奏，我不催。',
+    'asked-user',
+  );
+  // 短句变体
+  quiet('推荐先跑 hermes chat -q PONG 实测哪个模型可用再改，等你一句话我来改。', 'asked-user');
+  quiet('推荐先跑实测，等你一句话我来改。', 'asked-user');
+  quiet('方案 A 还是 B 由你决定，等你发话我就动手。', 'asked-user');
+  quiet('只要你一句话我就改。', 'asked-user');
+  quiet('先备份当前的配置文件，等你拍板我再改。', 'asked-user');
+  quiet('先备份当前的配置文件，等你点头我再改。', 'asked-user');
+});
+
 check('已完成宣告', () => {
   quiet('已完成全部修改，测试通过。', 'already-done');
 });
