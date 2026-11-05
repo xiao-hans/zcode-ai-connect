@@ -1,7 +1,6 @@
 // R05/R08/R09: real bridge source and HTTP objects, synthetic IO only.
 // Boundary-test injection pattern: no listening socket or real credentials.
 import assert from 'node:assert/strict';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Duplex } from 'node:stream';
@@ -21,7 +20,6 @@ let upstream;
 let calls = [];
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, console,
-  createHash, timingSafeEqual,
   hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT,
   process: { env: {}, on() {} },
   os: { homedir: () => '/synthetic-home' },
@@ -59,7 +57,7 @@ async function request(route, stream, chunks = [], extra = {}, respond = () => s
   req.httpVersionMinor = 1;
   req.complete = true;
   req.url = `/v1/${route}`;
-  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token' };
+  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json' };
   req.push(JSON.stringify({
     model: 'trae/test', stream, input: 'hi', messages: [{ role: 'user', content: 'hi' }],
     tools: route === 'messages' ? tools : tools.map(t => ({ type: 'function', name: t.name, parameters: schema })),

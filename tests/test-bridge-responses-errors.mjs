@@ -1,7 +1,6 @@
 // R02/R03: run the real bridge handlers with synthetic endpoint/network IO only.
 // No bridge CLI, credential files, service process or listening socket is used.
 import assert from 'node:assert/strict';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Duplex } from 'node:stream';
@@ -20,7 +19,6 @@ const runnable = source.slice(0, source.indexOf('const argv = process.argv.slice
 let upstream;
 const context = createContext({
   hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT, path, fileURLToPath, Buffer, TextDecoder, Date, Set, Map, URL, AbortController, console,
-  createHash, timingSafeEqual,
   process: { env: {} },
   os: { homedir: () => '/synthetic-home' },
   fs: { readFileSync: () => JSON.stringify({ port: 1, token: 'synthetic-token' }) },
@@ -68,7 +66,7 @@ async function request(route, stream, chunks, broken = false) {
   });
   const req = new IncomingMessage(socket);
   req.method = 'POST';
-  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token' };
+  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json' };
   req.httpVersion = '1.1';
   req.httpVersionMajor = 1;
   req.httpVersionMinor = 1;

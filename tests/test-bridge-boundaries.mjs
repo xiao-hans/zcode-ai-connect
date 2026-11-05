@@ -1,7 +1,6 @@
 // R04/R10: exercise the captured createServer entry with real HTTP objects.
 // Only credentials, fetch, logs and server startup are replaced; no socket listens.
 import assert from 'node:assert/strict';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Duplex } from 'node:stream';
@@ -23,7 +22,6 @@ let bodyReads = 0;
 let calls = [];
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, AbortSignal, console,
-  createHash, timingSafeEqual,
   hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT,
   process: { env, on() {} },
   os: { homedir: () => '/synthetic-home' },
@@ -65,7 +63,7 @@ async function request(route, { headers = {}, body = {}, method = 'POST', rawBod
   req.httpVersionMinor = 1;
   req.complete = true;
   req.url = route;
-  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token', ...headers };
+  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', ...headers };
   const iterate = req[Symbol.asyncIterator].bind(req);
   req[Symbol.asyncIterator] = function () { bodyReads++; return iterate(); };
   req.push(rawBody ?? JSON.stringify({ model: 'trae/test', stream: false, input: 'hi', messages: [prompt], tools: [tool], ...body }));
@@ -143,27 +141,6 @@ await test('R04 count_tokens also requires JSON', async () => {
   assert.equal((await request('/v1/messages/count_tokens', { headers: { 'content-type': 'text/plain' } })).status, 415);
   assert.equal(bodyReads, 0);
   assert.equal(credentialReads, 0);
-});
-await test('bridge auth rejects a missing bearer before endpoint credentials', async () => {
-  const result = await request('/v1/messages', { headers: { authorization: undefined } });
-  assert.equal(result.status, 401);
-  assert.equal(credentialReads, 0);
-  assert.equal(calls.length, 0);
-  assert.equal(bodyReads, 0);
-  assert.equal(JSON.stringify(result.body).includes('synthetic-token'), false);
-});
-await test('bridge auth rejects a wrong bearer before endpoint credentials', async () => {
-  const result = await request('/v1/responses', { headers: { authorization: 'Bearer not-the-bridge-token' } });
-  assert.equal(result.status, 401);
-  assert.equal(credentialReads, 0);
-  assert.equal(calls.length, 0);
-  assert.equal(bodyReads, 0);
-});
-await test('bridge auth accepts x-api-key', async () => {
-  const result = await request('/v1/messages', { headers: { authorization: undefined, 'x-api-key': 'synthetic-token' } });
-  assert.equal(result.status, 200);
-  assert.equal(calls.length, 1);
-  assert.equal(calls[0].options.headers.authorization, 'Bearer synthetic-token');
 });
 await test('R04 rejected source precedes malformed JSON parsing', async () => {
   assert.equal((await request('/v1/messages', { headers: { origin: 'https://evil.example' }, rawBody: '{' })).status, 403);

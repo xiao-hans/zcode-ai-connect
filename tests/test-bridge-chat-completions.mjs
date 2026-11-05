@@ -1,7 +1,6 @@
 // R-new: chat/completions 透传路由(聚合模式下 Hermes 走桥的 OpenAI chat 协议)。
 // 复用桥的边界注入模式:真实桥源码 + 合成 IO(合成 fetch/createServer/fs)。
 import assert from 'node:assert/strict';
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Duplex } from 'node:stream';
@@ -23,7 +22,6 @@ let lastUrl = null;
 let lastAuth = null;
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, console, Readable,
-  createHash, timingSafeEqual,
   hostIsLoopback, originIsLoopback,
   process: { env: {}, on() {} },
   os: { homedir: () => '/synthetic-home' },
@@ -57,7 +55,7 @@ async function request(body, respond) {
   req.method = 'POST';
   req.httpVersion = '1.1'; req.httpVersionMajor = 1; req.httpVersionMinor = 1; req.complete = true;
   req.url = '/v1/chat/completions';
-  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token' };
+  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json' };
   req.push(JSON.stringify(body));
   req.push(null);
   const res = new ServerResponse(req);

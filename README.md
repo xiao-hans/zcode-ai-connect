@@ -104,7 +104,7 @@ node hermes-connect-services/bin/sync-hermes-config.mjs --install-hooks
 
 ## 五、接入 Codex
 
-Codex 0.142+ 只讲 Responses API(官方已硬移除 `wire_api = "chat"`),四个端点只讲 chat completions,中间由 [codex-responses-bridge](scripts/codex-responses-bridge.mjs)(127.0.0.1:39268,零依赖单文件)双向翻译。桥直读各端点 `endpoint.json` 的 port+token(30 秒缓存),token 轮换自愈。调用方须带桥自己的本机 bearer(`~/.zcode-codex-bridge/auth.json`,模式 0600);`setup-codex.mjs` 写入 Codex 的 `experimental_bearer_token`,Claude 包装器在启动时注入。
+Codex 0.142+ 只讲 Responses API(官方已硬移除 `wire_api = "chat"`),四个端点只讲 chat completions,中间由 [codex-responses-bridge](scripts/codex-responses-bridge.mjs)(127.0.0.1:39268,零依赖单文件)双向翻译。桥直读各端点 `endpoint.json` 的 port+token(30 秒缓存),token 轮换自愈,无需配置密钥。
 
 ```sh
 node scripts/setup-codex.mjs            # 写入 provider + 四个 profile + 自启 hook(幂等,写前自动备份)
@@ -138,8 +138,6 @@ Claude Code 讲 Anthropic Messages 协议,同一个桥同样翻译:`POST /v1/mes
 ```sh
 scripts/claude-connect.cmd -p "…"   # 参数与 claude 完全一致(-p / 交互 / MCP 均可)
 ```
-
-包装器启动时把桥的本机 bearer 写进一份临时 settings 的 `ANTHROPIC_AUTH_TOKEN`(仓库里的 `zc-connect-local` 只是占位,不是密钥),不改 `~/.claude`。
 
 模型映射与选择器都在 [claude-connect-settings.json](scripts/claude-connect-settings.json):主模型 `wb/deepseek-v4.1-flash`,后台快速档(haiku 位)`qw/qwen3.8-flash`。上下文不设人为窗口——`CLAUDE_CODE_DISABLE_UNKNOWN_MODEL_WINDOW_ENFORCEMENT=1` 让 Claude 以上游裁决为准:上游拒 "Prompt is too long"(Claude 认得该错误格式)时自动压缩恢复。注意 roster 声称的 1M 是目录宣传值,网关实际执行的限制更低且按它自家分词器计数(中文内容计数显著高于 chars/4 估算),故配套 20KB 工具输出截断防单轮爆仓。免审批由包装器的 `--dangerously-skip-permissions` 与 settings 的 `permissions.defaultMode=bypassPermissions` 双重保证。自动压缩另有一个全局开关坑:若 `~/.claude/settings.json` env 里设了 `DISABLE_AUTO_COMPACT=1`,Claude 的自动压缩会被关掉,上游拒满后只能手动 /compact——包装器在 `--settings` 层覆盖为 0 并置 `autoCompactEnabled=true`;若你的环境仍不生效,删掉全局那行。`modelPicker` 由 [sync-claude-models.mjs](scripts/sync-claude-models.mjs) 生成——四家**全量**模型(61+)进入 `/model` 阵容,默认模型带 ★;上游名册变化后重跑 `node scripts/sync-claude-models.mjs` 刷新(需端点在跑,已开会话要重开)。
 
