@@ -44,6 +44,10 @@ const TOOLS = [
 
 const stateDir = path.join(os.homedir(), '.zcode-codex-bridge');
 const logPath = path.join(stateDir, 'service.log');
+// 进程身份:供 /healthz 报告,restart 用它确认「旧进程真的被换掉了」。
+const startedAt = new Date().toISOString();
+let codeMtime = '';
+try { codeMtime = fs.statSync(fileURLToPath(import.meta.url)).mtime.toISOString(); } catch { /* 诊断字段,读不到不影响 */ }
 
 async function log(line) {
   try {
@@ -514,7 +518,7 @@ function clampEffort(tool, level) {
   return ranked.find(eff => EFFORT_RANK.indexOf(eff) >= target) ?? ranked[ranked.length - 1];
 }
 
-async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false, signal, onPayload } = {}) {
+async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, noMaxTokens = false, wireModel = '', signal, onPayload } = {}) {
   // 只发送 ZCode/pi 同款的最小字段集:workbuddy 上游做通道校验(11128),
   // codex 特有的 parallel_tool_calls / stream_options 等额外字段会触发拦截。
   const payload = {
@@ -523,8 +527,8 @@ async function upstreamChat(ep, body, { mutLevel = 0, noStreamOptions = false, n
     stream: true,
   };
   if (!noStreamOptions) payload.stream_options = { include_usage: true };
-  // 输出预算(见 clampMaxOutput):Codex 的 max_output_tokens 夹到上游天花板
-  const maxOut = clampMaxOutput(body.max_output_tokens ?? body.max_tokens);
+  // 输出预算:Codex 的 max_output_tokens 夹到「该模型真实上限」(见 outputCapFor)
+  const maxOut = clampMaxOutput(body.max_output_tokens ?? body.max_tokens, wireModel);
   if (maxOut && !noMaxTokens) payload.max_tokens = maxOut;
   const tools = toChatTools(body.tools);
   if (tools) payload.tools = tools;
@@ -578,7 +582,7 @@ async function handleResponses(req, res, wireModel, body, signal) {
   const callUpstream = (mutLevel, noStreamOptions, noMaxTokens = false) => {
     signal.throwIfAborted();
     return upstreamChat(ep, { ...body, model: chatModel }, {
-      mutLevel, noStreamOptions, noMaxTokens, signal,
+      mutLevel, noStreamOptions, noMaxTokens, wireModel, signal,
       onPayload: payload => { successfulPayload = payload; },
     });
   };
@@ -1202,15 +1206,30 @@ function recentlyStalled(messages) {
 // 以前桥完全不转发客户端的 max_tokens:上游按自己的默认值生成,客户端却按自己的
 // 预算记账(Claude Code 的 CLAUDE_CODE_MAX_OUTPUT_TOKENS 常见 6000/128000 两档),
 // 于是「客户端以为早该截断的地方上游还在写」——上下文计量与实际输出脱节。
-// 现在转发,但夹在上游能接受的天花板内:各通道对超限 max_tokens 的处置不一致
-// (有的 400、有的静默按上限截),统一压到 ZC_MAX_OUTPUT_TOKENS(默认 32000)。
-const MAX_OUTPUT_CEILING = Number(process.env['ZC_MAX_OUTPUT_TOKENS'] ?? 32000);
+// 现在转发并夹到「该模型的真实输出上限」:以前一律压到 32000,导致
+// wb/hy4free(64000)、wb/deepseek-v4.1-flash(128000) 这类模型被无谓砍半,
+// 单轮稍长就 finish_reason:"length" → Codex 报
+// "Incomplete response returned, reason: max_output_tokens"。
+// 表由 scripts/sync-model-output-limits.mjs 从各端点 GET /v1/models 生成。
+const MODEL_OUTPUT_LIMITS = (() => {
+  try {
+    const parsed = JSON.parse(fs.readFileSync(new URL('./model-output-limits.json', import.meta.url), 'utf8'));
+    return parsed && typeof parsed.limits === 'object' && parsed.limits !== null ? parsed.limits : {};
+  } catch { return {}; /* 表缺失:回退到兜底上限 */ }
+})();
 
-function clampMaxOutput(value) {
+function outputCapFor(wireModel) {
+  const env = Number(process.env['ZC_MAX_OUTPUT_TOKENS']);
+  if (Number.isFinite(env) && env > 0) return Math.floor(env); // 显式 env 覆盖一切
+  const cap = Number(MODEL_OUTPUT_LIMITS[wireModel]);            // 否则用模型真实上限
+  if (Number.isInteger(cap) && cap > 0) return cap;
+  return 32000;                                                 // 未收录模型的保守兜底
+}
+
+function clampMaxOutput(value, wireModel) {
   const n = Number(value);
   if (!Number.isFinite(n) || n <= 0) return 0;
-  const ceiling = Number.isFinite(MAX_OUTPUT_CEILING) && MAX_OUTPUT_CEILING > 0 ? MAX_OUTPUT_CEILING : 32000;
-  return Math.min(Math.floor(n), ceiling);
+  return Math.min(Math.floor(n), outputCapFor(wireModel));
 }
 
 class AnthropicStreamBuilder {
@@ -1439,8 +1458,8 @@ async function handleMessages(req, res, body, signal) {
     && recentlyStalled(body.messages);
   if (forceContinue) chatPayload.tool_choice = 'required';
   else if (tc) chatPayload.tool_choice = tc;
-  // 输出预算:Claude 的 max_tokens 夹到上游天花板(见 clampMaxOutput)
-  const maxOut = clampMaxOutput(body.max_tokens);
+  // 输出预算:Claude 的 max_tokens 夹到「该模型真实上限」(见 outputCapFor)
+  const maxOut = clampMaxOutput(body.max_tokens, wireModel);
   if (maxOut) chatPayload.max_tokens = maxOut;
   const estInput = estimateTokens(body);
 
@@ -1612,6 +1631,8 @@ async function handleChatCompletions(req, res, body, signal) {
     // Hermes 直发 chat 协议:同样要修 tool_calls/tool 结果配对,否则上游 11148
     ...(Array.isArray(body.messages) ? { messages: repairToolPairing(body.messages) } : {}),
   };
+  const hermesMaxOut = clampMaxOutput(body.max_tokens, wireModel);
+  if (hermesMaxOut) upstream.max_tokens = hermesMaxOut;
   let r;
   try {
     r = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
@@ -1667,7 +1688,7 @@ async function handle(req, res) {
         const ep = endpointFor(t.tool);
         tools[t.key] = ep ? `:${ep.port}` : 'missing';
       }
-      json(res, 200, { ok: true, bridge: true, tools });
+      json(res, 200, { ok: true, bridge: true, tools, pid: process.pid, startedAt: startedAt, codeMtime: codeMtime });
       return;
     }
     if (req.method === 'GET' && p === '/v1/models') {
@@ -1739,6 +1760,53 @@ async function ensure(port) {
   return 0; // 与套件 hook 同一契约:never fails the session
 }
 
+/**
+ * 强制重启:ensure 只保证「有个健康的桥」,不替换已存在的进程,所以桥代码更新后
+ * 双击重启脚本仍是旧代码在跑(11148 修复迟迟不生效的根因)。restart 会先按
+ * /healthz 报告的 pid 终止旧进程,确认端口释放,再拉起新进程并核对身份。
+ */
+async function restart(port) {
+  const health = async () => {
+    try {
+      const r = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: AbortSignal.timeout(700) });
+      return r.ok ? await r.json() : null;
+    } catch { return null; }
+  };
+  const old = await health();
+  const oldPid = old?.bridge === true && Number.isInteger(old.pid) ? old.pid : null;
+  if (oldPid && oldPid !== process.pid) {
+    try { process.kill(oldPid, 'SIGTERM'); } catch { /* 已退出 */ }
+    let released = false;
+    for (let i = 0; i < 30 && !released; i++) {
+      await new Promise(ok => setTimeout(ok, 150));
+      released = (await health()) === null;
+    }
+    if (!released) {
+      try { process.kill(oldPid, 'SIGKILL'); } catch { /* 已退出 */ }
+      for (let i = 0; i < 20 && !released; i++) {
+        await new Promise(ok => setTimeout(ok, 150));
+        released = (await health()) === null;
+      }
+    }
+    if (!released) { console.error(`bridge :${port} pid ${oldPid} 未能终止,请先手动结束该进程`); return 1; }
+    console.log(`bridge :${port} stopped old pid ${oldPid} (was ${old.startedAt ?? 'unknown'})`);
+  }
+  const child = spawn(process.execPath, [fileURLToPath(import.meta.url), 'serve', '--port', String(port)], {
+    detached: true, stdio: 'ignore', windowsHide: true,
+  });
+  child.unref();
+  for (let i = 0; i < 30; i++) {
+    await new Promise(ok => setTimeout(ok, 200));
+    const now = await health();
+    if (now && now.bridge === true && (!oldPid || now.pid !== oldPid)) {
+      console.log(`bridge :${port} started pid ${now.pid} codeMtime=${now.codeMtime ?? 'unknown'}`);
+      return 0;
+    }
+  }
+  console.error(`bridge :${port} restart 后仍未就绪(详见 ${logPath})`);
+  return 1;
+}
+
 async function status() {
   try {
     const r = await fetch(`http://127.0.0.1:${DEFAULT_PORT}/healthz`, { signal: AbortSignal.timeout(800) });
@@ -1761,5 +1829,6 @@ const port = portIdx >= 0 ? Number(argv[portIdx + 1]) : DEFAULT_PORT;
 
 if (cmd === 'serve') await serve(port);
 else if (cmd === 'ensure') process.exit(await ensure(port));
+else if (cmd === 'restart') process.exit(await restart(port));
 else if (cmd === 'status') await status();
-else { console.error('用法: serve [--port N] | ensure | status'); process.exit(2); }
+else { console.error('用法: serve [--port N] | ensure | restart | status'); process.exit(2); }
