@@ -964,7 +964,7 @@ async function commandServe(args) {
   for (const { id, path: mount, appName } of stores) {
     console.log(`[zcode-trae-connect]   ${appName} (${id}) mount: ${url}${mount}/v1`)
   }
-  console.log(`[zcode-trae-connect] bearer: ${token}`)
+  console.log(`[zcode-trae-connect] bearer: ${mask(token)}`)
   console.log(`[zcode-trae-connect] state dir: ${stateDir()}`)
 
   // Follow the desktop app: a re-login or token rotation in Trae must be

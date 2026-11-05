@@ -11,11 +11,11 @@
 //   doctor           credential + upstream diagnostics
 
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 
 const { defaultStateDir, configureStateDir, configureEndpoint, stateDir, endpointPath } = await import(new URL('../src/config.js', import.meta.url).href)
-const { QoderCredentialStore, patPath, SIGN_IN_HINT } = await import(new URL('../src/credentials.js', import.meta.url).href)
+const { QoderCredentialStore, patPath, savePat, writePrivateFile, SIGN_IN_HINT } = await import(new URL('../src/credentials.js', import.meta.url).href)
 const { QoderUpstreamClient } = await import(new URL('../src/upstream.js', import.meta.url).href)
 const { QoderCatalog } = await import(new URL('../src/catalog.js', import.meta.url).href)
 const { createQoderServer } = await import(new URL('../src/server.js', import.meta.url).href)
@@ -45,6 +45,11 @@ const portArg = args.includes('--port') ? Number(args[args.indexOf('--port') + 1
 configureStateDir(defaultStateDir())
 mkdirSync(stateDir(), { recursive: true })
 
+function mask(value) {
+  if (typeof value !== 'string' || value === '') return '(none)'
+  return value.length <= 10 ? '***' : `${value.slice(0, 6)}…${value.slice(-4)} (${value.length} chars)`
+}
+
 // --- endpoint token (stable across restarts) --------------------------------
 function ensureToken() {
   const p = endpointPath()
@@ -52,13 +57,14 @@ function ensureToken() {
     try {
       const j = JSON.parse(readFileSync(p, 'utf8'))
       if (j.token && j.port) {
+        try { chmodSync(p, 0o600) } catch { /* 已有文件也收紧到仅当前用户可读 */ }
         configureEndpoint({ port: j.port, token: j.token })
         return j.token
       }
     } catch {}
   }
   const token = randomBytes(24).toString('base64url')
-  writeFileSync(p, JSON.stringify({ token, port: portArg, createdAt: new Date().toISOString() }, null, 2), 'utf8')
+  writePrivateFile(p, JSON.stringify({ token, port: portArg, createdAt: new Date().toISOString() }, null, 2))
   configureEndpoint({ port: portArg, token })
   return token
 }
@@ -81,7 +87,7 @@ async function main() {
     try {
       const data = await exchangePat(pat)
       if (!data?.token) throw new Error('兑换未返回 job token')
-      writeFileSync(patPath(stateDir()), pat, 'utf8')
+      savePat(stateDir(), pat)
       console.log('PAT 有效并已保存(有效期至 ' + (data.expires_at ?? data.expires_in + 's') + ')')
     } catch (e) {
       console.error('PAT 校验失败,未保存:', String(e.message ?? e).slice(0, 200)); process.exitCode = 2
@@ -173,7 +179,7 @@ async function main() {
     await server.start()
     console.log(`[zcode-qoder-connect] listening on http://127.0.0.1:${server.port()}`)
     console.log(`[zcode-qoder-connect] OpenAI base: http://127.0.0.1:${server.port()}/v1`)
-    console.log(`[zcode-qoder-connect] bearer: ${token}`)
+    console.log(`[zcode-qoder-connect] bearer: ${mask(token)}`)
     // initial catalog load (best-effort)
     try {
       const credential = await store.resolve()

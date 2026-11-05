@@ -4,6 +4,7 @@
 // 这种条目被静默丢掉,messages 变空后才由上游回一句 "messages is required"。
 // 这里直接观察桥发给端点的 payload,并确认空 input 在本地就被拦下。
 import assert from 'node:assert/strict';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { IncomingMessage, ServerResponse } from 'node:http';
 import { Duplex } from 'node:stream';
@@ -23,6 +24,7 @@ let handler;
 let calls = [];
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, AbortSignal, console,
+  createHash, timingSafeEqual,
   hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT,
   process: { env: {}, on() {} },
   os: { homedir: () => '/synthetic-home' },
@@ -53,7 +55,7 @@ async function post(body) {
   req.httpVersionMinor = 1;
   req.complete = true;
   req.url = '/v1/responses';
-  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json' };
+  req.headers = { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token' };
   req.push(JSON.stringify({ model: 'wb/test', stream: false, ...body }));
   req.push(null);
   const res = new ServerResponse(req);

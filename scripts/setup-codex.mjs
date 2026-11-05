@@ -17,8 +17,9 @@
  * 注意:新加的 SessionStart hook 首次在 codex TUI 里会请求一次信任确认,
  * codex exec(非交互)会静默跳过未信任 hook。
  */
-import { copyFile, readFile, rm, writeFile } from 'node:fs/promises';
-import { existsSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { copyFile, mkdir, readFile, rm, writeFile } from 'node:fs/promises';
+import { chmodSync, existsSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -33,15 +34,33 @@ const MARK_OPEN = '# >>> zcode-ai-connect >>>';
 const MARK_CLOSE = '# <<< zcode-ai-connect <<<';
 const ensureCmd = `node ${bridgeAbs.split(path.sep).join('/')} ensure`;
 
-const PROVIDER_BLOCK = `${MARK_OPEN}
+function tomlBasic(value) {
+  return `"${String(value).replaceAll('\\', '\\\\').replaceAll('"', '\\"')}"`;
+}
+
+/** 桥的本机 bearer。Codex 把它放进 experimental_bearer_token,请求才会带上 Authorization。 */
+function bridgeToken() {
+  const result = spawnSync(process.execPath, [bridgeAbs, 'token'], { encoding: 'utf8' });
+  const token = (result.stdout ?? '').trim();
+  if (result.status !== 0 || token === '') {
+    throw new Error((result.stderr || '无法读取桥的本机 bearer').trim());
+  }
+  return token;
+}
+
+function providerBlock(token) {
+  return `${MARK_OPEN}
 # 本地端点经 Responses→Chat 桥接入 Codex(Codex 0.142+ 已移除 wire_api="chat")。
 # 桥:scripts/codex-responses-bridge.mjs(127.0.0.1:39268),ensure 子命令自动拉起。
 # 模型 id 带提供方前缀:wb/* trae/* qoder/* qw/*;profile 见 connect-*.config.toml。
+# experimental_bearer_token 只授权本机桥,不是上游密钥。重跑本脚本会刷新它。
 [model_providers.zc-connect]
 name = "zcode-ai-connect (本地桥)"
 base_url = "http://127.0.0.1:39268/v1"
 wire_api = "responses"
+experimental_bearer_token = ${tomlBasic(token)}
 ${MARK_CLOSE}`;
+}
 
 // ctx/out:roster 声称的 1M 是目录默认值不可信——实测 wb 上游在 input≈187k 时拒绝
 // "Prompt is too long"(真实上限 ~190-200k 档),统一取安全值 180k 让 codex 及时压缩
@@ -58,21 +77,24 @@ async function backup(file) {
   }
 }
 
-async function syncConfigToml() {
+async function syncConfigToml(token) {
+  const block = providerBlock(token);
   const current = existsSync(configToml) ? await readFile(configToml, 'utf8') : '';
   const open = current.indexOf(MARK_OPEN);
   const close = current.indexOf(MARK_CLOSE);
   if (open >= 0 && close > open) {
     // 已有块:原位替换(marker 之外不动)
-    const next = current.slice(0, open) + PROVIDER_BLOCK + current.slice(close + MARK_CLOSE.length);
+    const next = current.slice(0, open) + block + current.slice(close + MARK_CLOSE.length);
     await writeFile(configToml, next);
+    try { chmodSync(configToml, 0o600); } catch { /* 含本机 bearer,收紧权限尽力而为 */ }
     console.log('config.toml: provider 块已刷新(marker 内)');
     return;
   }
   await backup(configToml);
   // 本块全是 [table],追加到文件尾始终是合法 TOML,且不影响既有顶层键
   const next = current.endsWith('\n') || current === '' ? current : current + '\n';
-  await writeFile(configToml, `${next}\n${PROVIDER_BLOCK}\n`);
+  await writeFile(configToml, `${next}\n${block}\n`);
+  try { chmodSync(configToml, 0o600); } catch { /* 含本机 bearer,收紧权限尽力而为 */ }
   console.log(`config.toml: provider 块已追加(备份 ${path.basename(configToml)}.bak-zc-connect)`);
 }
 
@@ -129,6 +151,8 @@ async function syncHooks() {
   console.log(`hooks.json: SessionStart 已追加桥 ensure(备份 hooks.json.bak-zc-connect)`);
 }
 
+await mkdir(codexHome, { recursive: true });
+
 if (REMOVE) {
   const current = existsSync(configToml) ? await readFile(configToml, 'utf8') : '';
   const open = current.indexOf(MARK_OPEN);
@@ -143,7 +167,7 @@ if (REMOVE) {
   await syncHooks();
   console.log('卸载完成。桥进程如还在跑:node scripts/codex-responses-bridge.mjs status 查看。');
 } else {
-  await syncConfigToml();
+  await syncConfigToml(bridgeToken());
   await syncProfiles();
   await syncHooks();
   console.log('\n完成。用法:codex --profile connect-wb(或 -trae / -qoder / -qw)。');

@@ -1,11 +1,16 @@
 #!/usr/bin/env node
 // 桥协议验证:1) 纯文本流式回合 2) 强制工具调用回合。只打印事件摘要。
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
+
 const BASE = 'http://127.0.0.1:39268';
+const bridgeToken = JSON.parse(readFileSync(path.join(homedir(), '.zcode-codex-bridge', 'auth.json'), 'utf8')).token;
 
 async function run(label, body) {
   const r = await fetch(`${BASE}/v1/responses`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: { 'content-type': 'application/json', authorization: `Bearer ${bridgeToken}` },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(120000),
   });

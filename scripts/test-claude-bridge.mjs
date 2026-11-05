@@ -1,11 +1,17 @@
 #!/usr/bin/env node
 // Claude Code(Anthropic Messages)协议冒烟:纯文本、工具调用、多轮 tool_result、count_tokens。
+import { readFileSync } from 'node:fs';
+import { homedir } from 'node:os';
+import path from 'node:path';
+
 const BASE = 'http://127.0.0.1:39268';
+const bridgeToken = JSON.parse(readFileSync(path.join(homedir(), '.zcode-codex-bridge', 'auth.json'), 'utf8')).token;
+const authHeaders = { 'content-type': 'application/json', authorization: `Bearer ${bridgeToken}` };
 
 async function run(label, body, expectStop) {
   const r = await fetch(`${BASE}/v1/messages`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json', 'anthropic-version': '2023-06-01' },
+    headers: { ...authHeaders, 'anthropic-version': '2023-06-01' },
     body: JSON.stringify(body),
     signal: AbortSignal.timeout(120000),
   });
@@ -86,11 +92,11 @@ if (t1) {
 
 // 4. 非流式 + count_tokens
 const r2 = await fetch(`${BASE}/v1/messages`, {
-  method: 'POST', headers: { 'content-type': 'application/json' },
+  method: 'POST', headers: authHeaders,
   body: JSON.stringify({ model: 'qw/qwen3.8-flash', max_tokens: 50, messages: [{ role: 'user', content: 'Reply with exactly: nostream-ok' }], stream: false }),
   signal: AbortSignal.timeout(120000),
 });
 if (r2.ok) { const j = await r2.json(); console.log(`qw 非流式: type=${j.type} stop=${j.stop_reason} text="${(j.content ?? []).map(c => c.text ?? '').join('').slice(0, 40)}"`); }
 else console.log(`qw 非流式: HTTP ${r2.status}`);
-const ct = await fetch(`${BASE}/v1/messages/count_tokens`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ model: 'wb/glm-5.3', messages: [{ role: 'user', content: 'x'.repeat(400) }] }) });
+const ct = await fetch(`${BASE}/v1/messages/count_tokens`, { method: 'POST', headers: authHeaders, body: JSON.stringify({ model: 'wb/glm-5.3', messages: [{ role: 'user', content: 'x'.repeat(400) }] }) });
 console.log(`count_tokens: ${JSON.stringify(await ct.json())}`);

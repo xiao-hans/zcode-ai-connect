@@ -5,4 +5,8 @@ rem (settings.json 里的 ANTHROPIC_BASE_URL 优先级高于 shell 环境变量,
 rem  所以必须走 --settings 这一层)。用法与 claude 完全一致:
 rem   claude-connect [-p "…"] [--dangerously-skip-permissions] ...
 node "%~dp0codex-responses-bridge.mjs" ensure >nul 2>&1
-claude --settings "%~dp0claude-connect-settings.json" %*
+for /f "delims=" %%S in ('node "%~dp0claude-connect-launch.mjs" --emit-settings') do set "ZC_CLAUDE_SETTINGS=%%S"
+claude --settings "%ZC_CLAUDE_SETTINGS%" %*
+set "ZC_ERR=%ERRORLEVEL%"
+if exist "%ZC_CLAUDE_SETTINGS%" del /q "%ZC_CLAUDE_SETTINGS%" >nul 2>&1
+exit /b %ZC_ERR%

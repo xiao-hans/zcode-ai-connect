@@ -1,6 +1,7 @@
 // R13: load real handlers; replace only endpoint, fetch, logs and socket IO.
 // No listening port, bridge CLI or real account/credential access.
 import assert from 'node:assert/strict';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFileSync } from 'node:fs';
 import { getEventListeners } from 'node:events';
 import { IncomingMessage, ServerResponse } from 'node:http';
@@ -20,6 +21,7 @@ let respond;
 const calls = [];
 const context = createContext({
   path, fileURLToPath, Buffer, TextDecoder, URL, AbortController, AbortSignal, console,
+  createHash, timingSafeEqual,
   hostIsLoopback, originIsLoopback, detectStall, CONTINUE_PROMPT,
   process: { env: {} },
   os: { homedir: () => '/synthetic-home' },
@@ -98,7 +100,7 @@ function request(route, stream, extra = {}) {
   Object.assign(req, {
     method: 'POST', httpVersion: '1.1', httpVersionMajor: 1, httpVersionMinor: 1,
     complete: true, url: `/v1/${route}`,
-    headers: { host: '127.0.0.1:39268', 'content-type': 'application/json' },
+    headers: { host: '127.0.0.1:39268', 'content-type': 'application/json', authorization: 'Bearer synthetic-token' },
   });
   req.push(JSON.stringify({ model: 'trae/test', stream, input: 'hi', messages: [{ role: 'user', content: 'hi' }], ...extra }));
   req.push(null);

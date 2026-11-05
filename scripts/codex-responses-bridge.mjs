@@ -16,11 +16,16 @@
  *   node scripts/codex-responses-bridge.mjs serve [--port 39268]   # 前台运行
  *   node scripts/codex-responses-bridge.mjs ensure                 # 探测,不在则后台拉起(自验证)
  *   node scripts/codex-responses-bridge.mjs status                 # 报告桥与四个端点状态
+ *   node scripts/codex-responses-bridge.mjs token                  # 打印桥的本机 bearer(给配置脚本)
  *
  * 模型 id 带提供方前缀:wb/* trae/* qoder/* qw/*(四家存在同名模型,前缀消歧)。
- * 纯 Node 零依赖;只绑定 127.0.0.1;桥本身不鉴权(鉴权由各端点的 bearer 完成)。
+ * 纯 Node 零依赖;只绑定 127.0.0.1。桥会替调用方带上各端点的 bearer,因此桥自身也要鉴权:
+ * 本机 bearer 在 ~/.zcode-codex-bridge/auth.json(模式 0600)。Codex 由 setup-codex.mjs
+ * 写入 experimental_bearer_token;Claude Code 由 claude-connect.cmd 在启动时注入。
+ * /healthz 与 /health 保持免鉴权,供 ensure/status 探测。
  */
 import { spawn } from 'node:child_process';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { createServer } from 'node:http';
 import { appendFile, mkdir } from 'node:fs/promises';
 import fs from 'node:fs';
@@ -43,6 +48,71 @@ const TOOLS = [
 
 const stateDir = path.join(os.homedir(), '.zcode-codex-bridge');
 const logPath = path.join(stateDir, 'service.log');
+const bridgeAuthPath = path.join(stateDir, 'auth.json');
+
+function readExistingBridgeToken(file) {
+  try {
+    const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+    if (typeof doc?.token === 'string' && doc.token !== '') {
+      try { fs.chmodSync(file, 0o600); } catch { /* 已有文件也收紧到仅当前用户可读 */ }
+      return doc.token;
+    }
+  } catch { /* 还没有,或文件损坏后下面会重写 */ }
+  return '';
+}
+
+/** 桥的本机 bearer。生成一次并持久化,模式 0600;并发首启时后写者改读已有文件。 */
+function loadBridgeToken() {
+  const existing = readExistingBridgeToken(bridgeAuthPath);
+  if (existing) return existing;
+  const token = randomBytes(32).toString('base64url');
+  const body = `${JSON.stringify({ token, createdAt: new Date().toISOString() }, null, 2)}\n`;
+  fs.mkdirSync(stateDir, { recursive: true });
+  try {
+    fs.writeFileSync(bridgeAuthPath, body, { encoding: 'utf8', mode: 0o600, flag: 'wx' });
+  } catch (error) {
+    if (error?.code !== 'EEXIST') throw error;
+    const raced = readExistingBridgeToken(bridgeAuthPath);
+    if (raced) return raced;
+    throw error;
+  }
+  try { fs.chmodSync(bridgeAuthPath, 0o600); } catch { /* 模式在不支持的平台上尽力而为 */ }
+  return token;
+}
+
+const bridgeToken = loadBridgeToken();
+
+/**
+ * 常量时间比较。先哈希到固定长度,避免 timingSafeEqual 因长度不同抛错,
+ * 也避免用长度差提前返回。与 QwenWork shim 的 secretMatches 同一做法。
+ */
+function secretsEqual(left, right) {
+  const a = createHash('sha256').update(String(left), 'utf8').digest();
+  const b = createHash('sha256').update(String(right), 'utf8').digest();
+  return timingSafeEqual(a, b);
+}
+
+function presentedSecrets(req) {
+  const found = [];
+  const authorization = req.headers.authorization;
+  if (typeof authorization === 'string') {
+    const match = /^Bearer\s+(\S+)\s*$/i.exec(authorization.trim());
+    if (match) found.push(match[1]);
+  }
+  const apiKey = req.headers['x-api-key'];
+  if (typeof apiKey === 'string' && apiKey.trim() !== '') found.push(apiKey.trim());
+  return found;
+}
+
+/** Codex 用 Authorization;Claude 的 ANTHROPIC_AUTH_TOKEN 同样是 Bearer,部分客户端用 x-api-key。 */
+function bearerOk(req, expected) {
+  if (typeof expected !== 'string' || expected === '') return false;
+  const candidates = presentedSecrets(req);
+  if (candidates.length === 0) return false;
+  let ok = false;
+  for (const candidate of candidates) ok = secretsEqual(candidate, expected) || ok;
+  return ok;
+}
 
 async function log(line) {
   try {
@@ -1004,8 +1074,8 @@ function noteUnrecoveredDSML(captured, recovered) {
 
 // ---- Anthropic Messages(/v1/messages,Claude Code)→ Chat ----
 // 与 Codex 共用同一批上游路由/去指纹/SSE 读取;此处只做协议形状转换。
-// Claude Code 经环境变量接入:ANTHROPIC_BASE_URL=http://127.0.0.1:39268
-// + ANTHROPIC_AUTH_TOKEN=<任意非空> + ANTHROPIC_MODEL=<前缀>/<模型>。桥不校验鉴权。
+// Claude Code 经 claude-connect.cmd 接入:包装器把 auth.json 的 bearer 注入
+// ANTHROPIC_AUTH_TOKEN(Authorization: Bearer)。占位符 zc-connect-local 不是密钥。
 
 function anthropicTextOf(content) {
   if (typeof content === 'string') return content;
@@ -1543,6 +1613,13 @@ async function handle(req, res) {
   }
   const url = new URL(req.url, 'http://127.0.0.1');
   const p = url.pathname.replace(/\/+$/, '') || '/';
+  // 健康探测免鉴权(ensure/status)。其余路由都会替调用方附上端点 bearer 或暴露名册,
+  // 必须先核对桥自己的 bearer,且不得在拒绝前读取端点凭据或请求体。
+  const publicProbe = req.method === 'GET' && (p === '/healthz' || p === '/health');
+  if (!publicProbe && !bearerOk(req, bridgeToken)) {
+    json(res, 401, { error: { type: 'authentication_error', message: 'missing or invalid Authorization bearer' } });
+    return;
+  }
   const controller = new AbortController();
   const { signal } = controller;
   const onClose = () => { if (!res.writableFinished) controller.abort(); };
@@ -1650,4 +1727,5 @@ const port = portIdx >= 0 ? Number(argv[portIdx + 1]) : DEFAULT_PORT;
 if (cmd === 'serve') await serve(port);
 else if (cmd === 'ensure') process.exit(await ensure(port));
 else if (cmd === 'status') await status();
-else { console.error('用法: serve [--port N] | ensure | status'); process.exit(2); }
+else if (cmd === 'token') process.stdout.write(`${bridgeToken}\n`);
+else { console.error('用法: serve [--port N] | ensure | status | token'); process.exit(2); }
