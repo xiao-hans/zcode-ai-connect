@@ -686,6 +686,21 @@ async function handleResponses(req, res, wireModel, body, signal) {
 }
 
 // 只接续完整的正常结束；客户端执行工具，网关只追加模型生成，不代执行。
+// 端点在「上游流没发 finish frame 就断开」时会伪造 finish_reason:"length"
+// (见 zcode-*-connect/src/server.js 的 end())。那不是输出预算耗尽:实测 Codex
+// 报 "Incomplete response returned, reason: max_output_tokens" 时单轮只输出
+// 61 / 68 / 3958 token,而请求上限是 128000。桥不能把流故障翻译成预算问题:
+// incomplete 是终态,Codex 直接结束任务且不重试;应改报可重试的流错误。
+// 真·输出超限会带上贴近上限的 usage,用它把两者区分开。
+function isSpuriousLength(builder, payload) {
+  if (builder?.finish !== 'length') return false;
+  const requested = Number(payload?.max_tokens);
+  if (!Number.isFinite(requested) || requested <= 0) return false; // 没转发预算:不敢断言
+  const used = Number(builder?.usage?.output_tokens);
+  if (!Number.isFinite(used) || used <= 0) return true;  // 断流通常连 usage 都没有
+  return used < requested * 0.5;                         // 真截断会贴近上限
+}
+
 async function consumeWithContinuation(upstream, builder, sink, { ep, payload, signal, route }) {
   let messages = payload.messages;
   const seen = new Set();
@@ -731,6 +746,11 @@ async function consumeWithContinuation(upstream, builder, sink, { ep, payload, s
       builder.usage = { ...totals, input_tokens_details: { ...totals.input_tokens_details }, output_tokens_details: { ...totals.output_tokens_details } };
     } else {
       builder.usage = previousUsage;
+    }
+    if (isSpuriousLength(builder, payload)) {
+      await trace(attempt, 'spurious-length');
+      builder.finish = null;
+      return { type: 'upstream_incomplete', message: 'Upstream stream ended without a finish frame (endpoint reported length, not an output cap)' };
     }
     if (!builder.finish) {
       await trace(attempt, 'missing-finish');
