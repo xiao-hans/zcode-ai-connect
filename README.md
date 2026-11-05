@@ -126,6 +126,7 @@ profile 是独立文件 `~/.codex/connect-*.config.toml`(0.142+ 起从 config.to
 
 - Responses SSE 的 `data:` JSON 必须自带 `"type"` 字段,codex 按 `data.type` 分发事件;缺了它表现为「stream disconnected before completion」重试 5 次全败,与桥端是否发出 `response.completed` 无关。
 - WorkBuddy 上游 WAF(11128 "unapproved channel")对 Codex 官方身份声明(开头三句,空白归一化)做指纹匹配;桥对 instructions 做语义无损改写(去牛津逗号,命中 11128 再换一处措辞重试)绕过。
+- WorkBuddy 上游严格校验工具历史(11148 "tool calls and tool results do not match", `retry:false`, 明确要求开新会话):每条 `assistant.tool_calls` 后必须紧跟等量、ID 一一对应的 `role:tool` 消息。并行调用被拆成多条 assistant、或工具轮被中断/Esc/桥 `invalid-tool` 拦下留下孤立 `tool_call`,都会毒化后续每一轮(Codex 每轮重发完整 input)。桥在出站前用 `repairToolPairing` 统一修复:合并连续调用、补齐缺失结果、丢弃孤儿结果、ID 唯一化;Responses / Messages / chat 透传三条路径均已接入。回归:`node tests/test-bridge-tool-pairing.mjs`。
 - roster/目录声称的 `contextWindow: 1_000_000` 是宣传值,实测上游在更小体量即拒 `prompt is too long`(11115,与 11128 是两个不同错误);故 profile 显式声明 `model_context_window=180000` 标定自动压缩时机,`model_max_output_tokens` 按各端点实测值。
 - codex 在非信任目录用 read-only 沙箱跑 shell 会报 `CreateProcessWithLogonW: 267`,属 codex 自身 Windows 沙箱限制,与桥无关。
 

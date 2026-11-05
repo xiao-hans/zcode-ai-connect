@@ -130,6 +130,63 @@ function capToolOutput(s) {
   return s.slice(0, head) + `\n…[桥截断:单条工具输出 ${s.length} 字符超上限,中段省略 ${s.length - TOOL_OUTPUT_CAP} 字符]…\n` + s.slice(-tail);
 }
 
+// ---- 工具调用 / 工具结果配对修复 ----
+// WorkBuddy 上游对 chat 历史做严格校验(400/11148 "tool calls and tool results
+// do not match", retry_policy.retry:false):每条 assistant.tool_calls 之后必须
+// 紧跟等量、ID 一一对应的 role:tool 消息。实测两种形态必被拒:
+//   ① 并行工具调用被拆成多条 assistant(各带 1 个 call)——桥原先逐条转换;
+//   ② 工具轮被中断 / 用户 Esc / 桥 invalid-tool 拦下后,历史里留下孤立 tool_call
+//      或缺 tool result。Codex 每轮重发完整 input,残缺会毒化到会话结束,上游
+//      明确要求「start a new conversation」。
+// 出站前把结构修成合法形态:合并连续调用、补齐缺失结果、丢弃孤儿结果、ID 唯一化。
+// 正文与消息顺序不变,正常多轮原样通过。
+function repairToolPairing(messages) {
+  const out = [];
+  let seq = 0;
+  const newId = () => `zc_gc_${++seq}`;
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i];
+    if (!m || typeof m !== 'object') continue;
+    if (m.role !== 'assistant' || !Array.isArray(m.tool_calls) || !m.tool_calls.length) {
+      // 孤儿 tool 结果:前面没有紧邻的调用块,上游必拒,直接丢弃
+      if (m.role === 'tool') continue;
+      out.push(m);
+      continue;
+    }
+    // 合并连续的 assistant.tool_calls(并行调用)成一条
+    const calls = [];
+    let j = i;
+    while (j < messages.length && messages[j]?.role === 'assistant'
+      && Array.isArray(messages[j].tool_calls) && messages[j].tool_calls.length) {
+      for (const c of messages[j].tool_calls) {
+        calls.push(c && typeof c === 'object'
+          ? { ...c, function: c.function && typeof c.function === 'object' ? { ...c.function } : c.function }
+          : c);
+      }
+      j++;
+    }
+    const ids = new Set();
+    for (const c of calls) {
+      if (!c || typeof c !== 'object') continue;
+      if (typeof c.id !== 'string' || c.id === '' || ids.has(c.id)) c.id = newId();
+      ids.add(c.id);
+    }
+    out.push(j - i === 1 ? { ...m, tool_calls: calls } : { role: 'assistant', content: null, tool_calls: calls });
+    // 只认紧邻的 tool 消息;被 user/system 隔开的按孤儿处理(后续循环会丢弃)
+    const results = new Map();
+    while (j < messages.length && messages[j]?.role === 'tool') {
+      const t = messages[j];
+      if (ids.has(t.tool_call_id) && !results.has(t.tool_call_id)) results.set(t.tool_call_id, t);
+      j++;
+    }
+    for (const c of calls) {
+      out.push(results.get(c.id) ?? { role: 'tool', tool_call_id: c.id, content: '(tool execution was interrupted)' });
+    }
+    i = j - 1;
+  }
+  return out;
+}
+
 // ---- 历史净化 ----
 // 长会话实测(dengying 45cdd3d3):模型退化后会把**整个会话历史**当正文复述
 // (82KB 文本、316 个 <result> 块),这些毒进入历史后每轮回喂,模型越学越偏,
@@ -151,6 +208,8 @@ function toChatMessages(instructions, input, mutLevel = 0) {
   const items = typeof input === 'string'
     ? [{ type: 'message', role: 'user', content: input }]
     : Array.isArray(input) ? input : [];
+  let synthId = 0;
+  const callId = (v) => (typeof v === 'string' && v ? v : `zc_missing_${++synthId}`);
   for (const item of items) {
     if (!item || typeof item !== 'object') continue;
     // Responses 的 EasyInputMessage 允许省略 type:只带 role/content 也是一条消息。
@@ -171,14 +230,14 @@ function toChatMessages(instructions, input, mutLevel = 0) {
         role: 'assistant',
         content: null,
         // 工具参数也是被扫描的 assistant 内容;只做词级改写,不能加中性头(会破坏 JSON)
-        tool_calls: [{ id: item.call_id ?? 'call_0', type: 'function', function: { name: item.name ?? '', arguments: deFingerprintLexical(item.arguments ?? '', mutLevel) } }],
+        tool_calls: [{ id: callId(item.call_id), type: 'function', function: { name: item.name ?? '', arguments: deFingerprintLexical(item.arguments ?? '', mutLevel) } }],
       });
     } else if (item.type === 'function_call_output') {
-      messages.push({ role: 'tool', tool_call_id: item.call_id ?? 'call_0', content: capToolOutput(typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '')) });
+      messages.push({ role: 'tool', tool_call_id: callId(item.call_id), content: capToolOutput(typeof item.output === 'string' ? item.output : JSON.stringify(item.output ?? '')) });
     }
     // reasoning 等其他 item 无 chat 等价物,丢弃
   }
-  return messages;
+  return repairToolPairing(messages);
 }
 
 function toChatTools(tools) {
@@ -1062,14 +1121,16 @@ function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
     const parts = Array.isArray(m.content) ? m.content : [{ type: 'text', text: String(m.content ?? '') }];
     if (m.role === 'user') {
       const texts = [];
+      const toolResults = [];
       for (const p of parts) {
         if (p?.type === 'text') texts.push(p.text ?? '');
         else if (p?.type === 'tool_result') {
-          if (texts.length) { out.push({ role: 'user', content: texts.join('') }); texts.length = 0; }
-          out.push({ role: 'tool', tool_call_id: p.tool_use_id ?? '', content: capToolOutput(anthropicTextOf(p.content)) || (p.is_error ? '(tool error)' : '') });
+          toolResults.push({ role: 'tool', tool_call_id: p.tool_use_id ?? '', content: capToolOutput(anthropicTextOf(p.content)) || (p.is_error ? '(tool error)' : '') });
         }
         // image 等无 chat 等价物,丢弃
       }
+      // tool 结果必须紧邻上一条 assistant.tool_calls,否则上游 11148;用户文本随后
+      for (const r of toolResults) out.push(r);
       if (texts.length) out.push({ role: 'user', content: texts.join('') });
     } else if (m.role === 'assistant') {
       // assistant 历史在网关扫描范围(#98):复述过指纹的回复会毒化后续每一轮;
@@ -1091,7 +1152,7 @@ function toChatMessagesAnthropic(systemText, messages, mutLevel = 0) {
       if (text) out.push({ role: 'system', content: text });
     }
   }
-  return out;
+  return repairToolPairing(out);
 }
 
 function toChatToolsAnthropic(tools) {
@@ -1545,7 +1606,12 @@ async function handleChatCompletions(req, res, body, signal) {
     json(res, 502, { error: { message: `${t?.tool ?? wireModel} 端点未就绪(缺 endpoint.json),先拉起端点` } });
     return;
   }
-  const upstream = { ...body, model: chatModel };
+  const upstream = {
+    ...body,
+    model: chatModel,
+    // Hermes 直发 chat 协议:同样要修 tool_calls/tool 结果配对,否则上游 11148
+    ...(Array.isArray(body.messages) ? { messages: repairToolPairing(body.messages) } : {}),
+  };
   let r;
   try {
     r = await fetch(`http://127.0.0.1:${ep.port}/v1/chat/completions`, {
