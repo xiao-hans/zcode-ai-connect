@@ -22,6 +22,10 @@
  */
 
 /** 公有云网关（与 auth.js / signer-session.js 的缺省值保持一致）。 */
+import http from 'node:http';
+import https from 'node:https';
+import { Readable } from 'node:stream';
+import zlib from 'node:zlib';
 import { DEFAULT_BASE_URL } from './auth.js';
 
 /** 企业 VPC 端点的判定标记：iss origin / 网关 origin 含此子域即视为 VPC。 */
@@ -78,19 +82,99 @@ export function isVpcEndpoint(endpoint) {
 }
 
 /**
- * VPC 网关普遍使用企业内网自签证书（千问官方桌面 App 自身即以
- * NODE_TLS_REJECT_UNAUTHORIZED=0 运行——%APPDATA%\QwenWorkCN\logs\main.log
- * 有对应 WARN 记录）。宿主进程（DSH）无法注入 NODE_EXTRA_CA_CERTS，
- * 因此与官方 App 行为对齐：命中 VPC 端点时一次性放行 TLS 校验。
+ * 只给这一跳 VPC HTTPS 关掉证书校验。keepAlive 关闭，避免测试进程被空闲套接字挂住。
+ * 公有云和其他主机继续走全局 fetch，进程级 NODE_TLS_REJECT_UNAUTHORIZED 不动。
+ */
+const insecureAgent = new https.Agent({ keepAlive: false, rejectUnauthorized: false });
+
+const HOP_BY_HOP = new Set([
+  'connection', 'keep-alive', 'proxy-connection', 'transfer-encoding', 'upgrade',
+  'content-encoding', 'content-length',
+]);
+
+function headerRecord(headers) {
+  const out = {};
+  const list = new Headers(headers ?? {});
+  for (const [key, value] of list) out[key] = value;
+  return out;
+}
+
+function decodedBody(res) {
+  const encoding = String(res.headers['content-encoding'] ?? '').toLowerCase();
+  if (encoding.includes('gzip')) return res.pipe(zlib.createGunzip());
+  if (encoding.includes('deflate')) return res.pipe(zlib.createInflate());
+  if (encoding.includes('br')) return res.pipe(zlib.createBrotliDecompress());
+  return res;
+}
+
+function responseHeaders(res) {
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(res.headers)) {
+    if (HOP_BY_HOP.has(key) || value === undefined) continue;
+    for (const item of Array.isArray(value) ? value : [value]) {
+      try { headers.append(key, String(item)); } catch { /* fetch 禁止的头 */ }
+    }
+  }
+  return headers;
+}
+
+/**
+ * VPC 网关这一跳的 fetch。证书校验只在这次请求上放行，不改全局 dispatcher，
+ * 也不碰 NODE_TLS_REJECT_UNAUTHORIZED。响应体按 content-encoding 解开，
+ * 使调用方拿到的字节与全局 fetch 一致。
  *
- * 只在**进程启动早期、首次 fetch 之前**调用才可靠（undici 在建连时读
- * 该环境变量）。resolveGatewayEndpoint 的所有调用方都在模块加载 /
- * 首次请求前执行，满足该前提。
+ * @param {string | URL} url
+ * @param {RequestInit} [init]
+ */
+export function fetchWithoutTlsVerify(url, init = {}) {
+  const target = new URL(url);
+  const secure = target.protocol === 'https:';
+  const transport = secure ? https : http;
+  const signal = init.signal;
+  if (signal?.aborted) {
+    return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error('The operation was aborted'));
+  }
+  const payload = init.body === undefined || init.body === null ? null : Buffer.from(init.body);
+  return new Promise((resolve, reject) => {
+    const req = transport.request({
+      protocol: target.protocol,
+      hostname: target.hostname,
+      port: target.port || (secure ? 443 : 80),
+      path: `${target.pathname}${target.search}`,
+      method: init.method ?? 'GET',
+      headers: headerRecord(init.headers),
+      agent: secure ? insecureAgent : undefined,
+      rejectUnauthorized: false,
+    }, (res) => {
+      const stream = decodedBody(res);
+      resolve(new Response(Readable.toWeb(stream), {
+        status: res.statusCode ?? 0,
+        headers: responseHeaders(res),
+      }));
+    });
+    const fail = (error) => reject(error);
+    req.on('error', fail);
+    if (signal) {
+      const onAbort = () => {
+        req.destroy(signal.reason instanceof Error ? signal.reason : new Error('The operation was aborted'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      req.on('close', () => signal.removeEventListener('abort', onAbort));
+    }
+    if (payload) req.end(payload);
+    else req.end();
+  });
+}
+
+/**
+ * VPC 网关普遍使用企业内网自签证书。只返回这一跳要用的 fetch：
+ * VPC 端点走 fetchWithoutTlsVerify，其余返回全局 fetch。
+ * 不设置 NODE_TLS_REJECT_UNAUTHORIZED，进程里其他 HTTPS 仍校验证书。
  *
  * @param {string} endpoint
+ * @returns {typeof fetch}
  */
 export function relaxTlsForVpc(endpoint) {
-  if (isVpcEndpoint(endpoint) && process.env.NODE_TLS_REJECT_UNAUTHORIZED === undefined) {
-    process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
-  }
+  if (!isVpcEndpoint(endpoint)) return globalThis.fetch;
+  return fetchWithoutTlsVerify;
 }

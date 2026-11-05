@@ -18,7 +18,8 @@
  *   node scripts/codex-responses-bridge.mjs status                 # 报告桥与四个端点状态
  *
  * 模型 id 带提供方前缀:wb/* trae/* qoder/* qw/*(四家存在同名模型,前缀消歧)。
- * 纯 Node 零依赖;只绑定 127.0.0.1;桥本身不鉴权(鉴权由各端点的 bearer 完成)。
+ * 纯 Node 零依赖;只绑定 127.0.0.1。桥不核对本机调用方。它从各端点 endpoint.json
+ * 读出 bearer 并附在转发请求上,所以打到桥的调用并不经过端点自己的鉴权。
  */
 import { spawn } from 'node:child_process';
 import { createServer } from 'node:http';

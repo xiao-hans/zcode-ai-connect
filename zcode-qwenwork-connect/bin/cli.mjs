@@ -11,7 +11,7 @@
 // the desktop app is signed out, open it once.
 
 import { randomBytes } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 
 const { defaultStateDir, configureStateDir, configureEndpoint, stateDir, endpointPath, DEFAULT_PORT } =
   await import(new URL('../src/config.js', import.meta.url).href)
@@ -38,6 +38,16 @@ const portArg = args.includes('--port') ? Number(args[args.indexOf('--port') + 1
 configureStateDir(defaultStateDir())
 mkdirSync(stateDir(), { recursive: true })
 
+function mask(value) {
+  if (typeof value !== 'string' || value === '') return '(none)'
+  return value.length <= 10 ? '***' : `${value.slice(0, 6)}…${value.slice(-4)} (${value.length} chars)`
+}
+
+function writePrivateFile(file, contents) {
+  writeFileSync(file, contents, { encoding: 'utf8', mode: 0o600 })
+  try { chmodSync(file, 0o600) } catch { /* 不支持该模式的平台尽力而为 */ }
+}
+
 // --- endpoint token (stable across restarts) --------------------------------
 function ensureToken() {
   const p = endpointPath()
@@ -45,13 +55,14 @@ function ensureToken() {
     try {
       const j = JSON.parse(readFileSync(p, 'utf8'))
       if (j.token && j.port) {
+        try { chmodSync(p, 0o600) } catch { /* 已有文件也收紧到仅当前用户可读 */ }
         configureEndpoint({ port: j.port, token: j.token })
         return j.token
       }
     } catch {}
   }
   const token = randomBytes(24).toString('base64url')
-  writeFileSync(p, JSON.stringify({ token, port: portArg, createdAt: new Date().toISOString() }, null, 2), 'utf8')
+  writePrivateFile(p, JSON.stringify({ token, port: portArg, createdAt: new Date().toISOString() }, null, 2))
   configureEndpoint({ port: portArg, token })
   return token
 }
@@ -134,7 +145,7 @@ async function main() {
     await server.start()
     console.log(`[zcode-qwenwork-connect] listening on http://127.0.0.1:${portArg}`)
     console.log(`[zcode-qwenwork-connect] OpenAI base: http://127.0.0.1:${portArg}/v1`)
-    console.log(`[zcode-qwenwork-connect] bearer: ${token}`)
+    console.log(`[zcode-qwenwork-connect] bearer: ${mask(token)}`)
     const shutdown = signal => {
       console.log(`\n[zcode-qwenwork-connect] ${signal} — shutting down`)
       server.close().then(() => process.exit(0))

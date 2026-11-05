@@ -240,17 +240,23 @@ export async function getAccountContext(opts = {}) {
   const loaded = await loadImplementation();
   if (loaded === null) throw notWired('getAccountContext()');
 
-  const credential = await getValidCredential(opts);
+  const { resolveGatewayEndpoint, relaxTlsForVpc } = await import('./endpoint.js');
+  // 调用方显式给了 VPC baseUrl 时，刷新请求也必须走同一跳的宽松 TLS，
+  // 但不能因此关掉进程里其他主机的证书校验。
+  const hinted = typeof opts.baseUrl === 'string' ? opts.baseUrl : '';
+  const credential = await getValidCredential({
+    ...opts,
+    fetchImpl: opts.fetchImpl ?? relaxTlsForVpc(hinted),
+  });
   const token = typeof credential?.token === 'string' ? credential.token : unwrapToken(credential);
   if (typeof loaded.rest?.fetchAccountOverview !== 'function') {
     throw notWired('fetchAccountOverview()');
   }
-  const { resolveGatewayEndpoint, relaxTlsForVpc } = await import('./endpoint.js');
   const baseUrl = opts.baseUrl ?? resolveGatewayEndpoint(
     typeof credential === 'object' && credential !== null && credential.token ? credential : { token },
   );
-  relaxTlsForVpc(baseUrl);
-  return loaded.rest.fetchAccountOverview(token, { ...opts, baseUrl });
+  const fetchImpl = opts.fetchImpl ?? relaxTlsForVpc(baseUrl);
+  return loaded.rest.fetchAccountOverview(token, { ...opts, baseUrl, fetchImpl });
 }
 
 /**

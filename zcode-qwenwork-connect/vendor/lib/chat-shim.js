@@ -125,6 +125,7 @@ export const UPSTREAM_HEADER_TIMEOUT_MS = 180_000;
  */
 async function fetchUpstreamWithRetry(session, bodyJson, modelKey, log, opts = {}) {
   const headerTimeoutMs = opts.headerTimeoutMs ?? UPSTREAM_HEADER_TIMEOUT_MS;
+  const doFetch = typeof opts.fetchImpl === 'function' ? opts.fetchImpl : globalThis.fetch;
   let lastError = null;
   for (let attempt = 1; attempt <= UPSTREAM_MAX_ATTEMPTS; attempt++) {
     // 每次尝试都重新签名：签名内含时间戳，重试时必须刷新，否则会被判过期。
@@ -145,7 +146,7 @@ async function fetchUpstreamWithRetry(session, bodyJson, modelKey, log, opts = {
         opts.signal === undefined
           ? headerAbort.signal
           : AbortSignal.any([opts.signal, headerAbort.signal]);
-      response = await fetch(signed.url, {
+      response = await doFetch(signed.url, {
         method: 'POST',
         headers: signed.headers,
         body: signed.body,
@@ -528,6 +529,8 @@ export function createChatShimHandler(deps) {
   let sessionPromise = null;
   /** 会话对应的 token，用于在凭据变更时失效。 */
   let sessionToken = null;
+  /** 只对当前网关放行 TLS 的 fetch；公有云保持全局 fetch。 */
+  let gatewayFetch = globalThis.fetch;
 
   /** 取（或重建）签名会话。token 变化时自动重建。 */
   async function getSession() {
@@ -542,7 +545,7 @@ export function createChatShimHandler(deps) {
     // 端点随凭据解析：VPC 租户（iss 含 .vpc.）自动切到租户网关，公有云
     // 租户保持缺省。deps.endpoint 显式传入时优先（测试/覆盖口）。
     const resolvedEndpoint = deps.endpoint ?? resolveGatewayEndpoint(credential);
-    relaxTlsForVpc(resolvedEndpoint);
+    gatewayFetch = relaxTlsForVpc(resolvedEndpoint);
     sessionPromise = signerFactory({
       credential,
       endpoint: resolvedEndpoint,
@@ -655,6 +658,7 @@ export function createChatShimHandler(deps) {
         });
         upstream = await fetchUpstreamWithRetry(session, bodyJson, modelKey, log, {
           signal: upstreamAbort.signal,
+          fetchImpl: gatewayFetch,
           ...(headerTimeoutMs === undefined ? {} : { headerTimeoutMs }),
         });
         trace('upstream-headers', { ms: Date.now() - reqT0, status: upstream.status, model: modelKey });

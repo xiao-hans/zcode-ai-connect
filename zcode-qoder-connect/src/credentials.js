@@ -22,7 +22,7 @@
 
 import { createDecipheriv } from 'node:crypto'
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
+import { chmodSync, existsSync, readFileSync, writeFileSync, unlinkSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 
@@ -42,6 +42,16 @@ export const SIGN_IN_HINT =
 
 export function patPath(stateDir) {
   return join(stateDir, 'pat.txt')
+}
+
+/** 凭据与端点 bearer 只应被当前用户读取。mode 在创建时生效，chmod 覆盖已存在的文件。 */
+export function writePrivateFile(file, contents) {
+  writeFileSync(file, contents, { encoding: 'utf8', mode: 0o600 })
+  try { chmodSync(file, 0o600) } catch { /* 不支持该模式的平台尽力而为 */ }
+}
+
+export function savePat(dir, pat) {
+  writePrivateFile(patPath(dir), pat)
 }
 
 /** DPAPI-unprotect the Chromium master key via PowerShell. */

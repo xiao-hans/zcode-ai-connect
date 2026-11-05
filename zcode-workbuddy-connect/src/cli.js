@@ -937,7 +937,7 @@ async function commandServe(args) {
   for (const { id, path: mount } of stores) {
     console.log(`[zcode-workbuddy-connect]   ${id.padEnd(3)} mount: ${url}${mount}/v1`)
   }
-  console.log(`[zcode-workbuddy-connect] bearer: ${token}`)
+  console.log(`[zcode-workbuddy-connect] bearer: ${mask(token)}`)
   console.log(`[zcode-workbuddy-connect] state dir: ${stateDir()}`)
 
   const shutdown = async signal => {
